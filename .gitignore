@@ -1,0 +1,9 @@
+# Build artifacts
+*.mojopkg
+*.mojoc
+*.o
+*.a
+.so
+.dylib
+__pycache__/
+.DS_Store
