@@ -57,7 +57,10 @@
 # Lifecycle: create() raises when ms_stack_alloc OR the heap allocation
 # fails (releasing what it acquired); destroy() (idempotent) frees the
 # synthetic stack AND the heap block.  No __del__: the driver owns the
-# lifecycle (calls destroy()), so value-copies can never double-free.  A
+# lifecycle (calls destroy()).  Single-owner semantics: exactly ONE destroy()
+# per live Fiber, on the OWNING handle -- destroying any COPY of the same
+# handle double-frees (Fiber is ImplicitlyCopyable; no __del__ guards aliases).
+# A
 # Fiber whose save areas were wired by the first resume() must not be
 # relocated while a switch is in flight (the sidecar and any in-flight entry
 # hold pointers into its slots) — the spike keeps the Fiber in one stable
@@ -90,6 +93,16 @@ def _c_free(p: BytePtr) abi("C"): ...
 # self_ctx/caller_ctx are the addresses of this Fiber's two save areas; `user`
 # is whatever payload create() was given.  An in-fiber entry yields with
 # ms_ctx_switch(fr[].self_ctx, fr[].caller_ctx) — exactly the S0 demo entry.
+def _ms_stack_alloc_bound(
+    bytes: Int,
+    out_base: UnsafePointer[BytePtr, MutUntrackedOrigin],
+    out_top: UnsafePointer[BytePtr, MutUntrackedOrigin],
+) raises -> Int32:
+    """Thin binding of ms_stack_alloc with a named-Int first argument
+    (see the b2 codegen workaround note above)."""
+    return ms_stack_alloc(bytes, out_base, out_top)
+
+
 struct FiberFrame:
     var self_ctx: BytePtr
     var caller_ctx: BytePtr
@@ -107,11 +120,17 @@ struct FiberFrame:
 struct Fiber(ImplicitlyCopyable, ImplicitlyDeletable):
     # ms_stack_alloc base (0 = not allocated; passed to ms_stack_free) and the
     # initial SP of the synthetic stack.
+    # Layout constants for the out-of-line heap block (single source of
+    # truth for create()'s malloc size AND the set_targets/accessor offsets).
+    comptime FRAME_BYTES = 24  # sizeof(FiberFrame): 3 BytePtr
+    comptime SCRATCH_BYTES = 16  # entry fn ptr + userdata ptr
+    comptime TAIL_BYTES = Self.FRAME_BYTES + Self.SCRATCH_BYTES
+
     var _stack: Int
     var _top: Int
     # Address of the out-of-line block: fiber ctx @0, caller ctx @MS_CTX_SIZE,
-    # FiberFrame sidecar @2*MS_CTX_SIZE, entry scratch @+24, userdata scratch
-    # @+32.  (0 = not allocated.)
+    # FiberFrame sidecar @2*MS_CTX_SIZE, entry scratch @+FRAME_BYTES,
+    # userdata scratch @+FRAME_BYTES+8.  (0 = not allocated.)
     var _block: Int
 
     # ms_ctx_make is deferred to the first resume() so the sidecar/userdata
@@ -137,9 +156,10 @@ struct Fiber(ImplicitlyCopyable, ImplicitlyDeletable):
     # Wire the entry/userdata addresses into the heap scratch (no aggregate
     # mutation; keeps the ctor scalar).
     def set_targets(mut self, entry: Int, ud: Int):
-        var ep = UnsafePointer[Int, MutAnyOrigin](unsafe_from_address=self._block + 2 * MS_CTX_SIZE + 24)
+        var base = self._block + 2 * MS_CTX_SIZE
+        var ep = UnsafePointer[Int, MutAnyOrigin](unsafe_from_address=base + Self.FRAME_BYTES)
         ep[] = entry
-        var up = UnsafePointer[Int, MutAnyOrigin](unsafe_from_address=self._block + 2 * MS_CTX_SIZE + 32)
+        var up = UnsafePointer[Int, MutAnyOrigin](unsafe_from_address=base + Self.FRAME_BYTES + 8)
         up[] = ud
 
     # -- queries -----------------------------------------------------------
@@ -199,8 +219,10 @@ struct Fiber(ImplicitlyCopyable, ImplicitlyDeletable):
     # -- teardown ----------------------------------------------------------
 
     # Idempotent: releases the synthetic stack (guard page included) and the
-    # heap block.  The driver owns the lifecycle — no auto-free destructor, so
-    # value-copies can never double-free.
+    # heap block.  Single-owner semantics: exactly ONE destroy() per live
+    # Fiber, on the OWNING handle.  Fiber is ImplicitlyCopyable (all-scalar
+    # handles), so destroying any COPY of the same handle double-frees — no
+    # __del__ protects aliases implicitly; the driver owns the lifecycle.
     def destroy(mut self):
         if self._stack != 0:
             ms_stack_free(self.stack_base())
@@ -220,20 +242,34 @@ struct Fiber(ImplicitlyCopyable, ImplicitlyDeletable):
 # (Fiber(stack, top, block) + set_targets) until the toolchain is upgraded —
 # re-test on upgrade.  The factory remains for API completeness (A0.6).
 #
+# CONDITIONAL-GO ITEM for SPIKE_REPORT (A0.4): the b2 codegen bug above is
+# NOT scoped to the factory -- ANY extern call lowered inside this module
+# (resume()'s ms_ctx_make/ms_ctx_switch, suspend(), destroy()'s free)
+# miscompiles under the current toolchain, JIT and AOT alike.  Until an
+# upgrade fixes modular/modular#6971:
+#   - resume/suspend/destroy MUST NOT be invoked through this module;
+#     consumers inline their bodies (see tests/t4_fiber.mojo, which passes
+#     3/3 using raw vendored calls).
+#   - tests/t4b_fiber_module_aot.mojo covers the extern-free wiring and
+#     lifecycle surface (create/accessors/alive/destroy-state flips).#
 # Allocates a guarded synthetic stack of `stack_bytes` (page-rounded + guard)
 # and the out-of-line block, wires entry + userdata into the scratch, then
 # fills `dst`.  Raises when an allocation fails (releasing what it acquired).
-def create(stack_bytes: Int, entry: BytePtr, userdata: BytePtr,
+def create(stack: Int, top: Int, entry: BytePtr, userdata: BytePtr,
            dst: UnsafePointer[Fiber, MutAnyOrigin]) raises:
-    var slots = stack_allocation[2, BytePtr]()
-    var rc = ms_stack_alloc(stack_bytes, slots, slots + 1)
-    if rc != 0:
-        raise Error("fiber.create: ms_stack_alloc failed")
+    """Bind an ALREADY-ALLOCATED synthetic stack into a new Fiber at dst.
 
-    var block = Int(_c_malloc(2 * MS_CTX_SIZE + 40))
+    b2-codegen note (modular/modular#6971 family): extern calls inside an
+    imported-module factory lower incorrectly (AOT and JIT).  Stack
+    allocation therefore lives with the CALLER (call ms_stack_alloc
+    directly in your module -- direct driver-side calls are proven safe);
+    this factory only does pointer arithmetic + scratch wiring.
+
+    Raises when the heap block for ctx save areas cannot be allocated.
+    """
+    var block = Int(_c_malloc(2 * MS_CTX_SIZE + Fiber.TAIL_BYTES))
     if block == 0:
-        ms_stack_free(slots[0])
         raise Error("fiber.create: heap allocation failed")
 
-    dst[0] = Fiber(Int(slots[]), Int((slots + 1)[]), block)
+    dst[0] = Fiber(stack, top, block)
     dst[].set_targets(Int(entry), Int(userdata))
