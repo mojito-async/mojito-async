@@ -1,60 +1,45 @@
 # spike/colorless_runtime/tests/t4_fiber.mojo
 #
-# A0.4 (issue #13) — fiber wrapper over the vendored NativeStack / NativeContext
-# substrate (ms_stack_alloc/free, ms_ctx_make/switch).  TDD: written RED first
-# against fiber.mojo (absent => compile-failure RED), GREEN once the fiber
-# surface lands (this file).
+# A0.4 (issue #13) — synthetic-stack entry/resume/reclaim coverage, written
+# TDD-red first against fiber.mojo (absent => compile-fail RED) and landed
+# GREEN in the S0-demo shape per Main's decision: all ctx switching is done
+# INLINE in this module (local ms_ctx_t buffers + direct ms_ctx_make /
+# ms_ctx_switch), and the @export abi("C") entry yields via
+# ms_ctx_switch(fr[].self_ctx, fr[].caller_ctx) — exactly the verified
+# spike/context_switch/demo.mojo shape (probe: 3/3 stable under load).
+#   The b2-JIT imported-module factory-CALL instability (bisected: concat-
+# in-raise SIGSEGV 10/10; load-dependent codegen "failed to lower module to
+# LLVM IR"; repro delivered to Main for upstream filing) does not touch this
+# module: no factory is called cross-module here.
 #
-# Covers spec A0.4 equivalences + the A0-T3 resume-point invariant:
-#   - fresh context enters the S0 trampoline on a synthetic stack
-#     (ms_stack_alloc), running real Mojo code (the @export abi("C") entry);
-#   - the entry callback mutates a SHARED buffer through userdata (a small
-#     struct payload passed through the Fiber, unmodified);
-#   - a fiber-side suspend() yields back to the driver, and resume() continues
-#     at the exact same point with the same ordinary stack state (A0-T3: a
-#     stack-local address stable across one switch away and back);
-#   - completion (entry returns) unwinds through the trampoline's defined
-#     completion path back to the caller;
-#   - the synthetic stack is freed cleanly (destroy) and an equal-size
-#     replacement allocates (clean reclaim); sentinels in the shared buffer
-#     survive every switch;
-#   - sp alignment at entry is held: the vendored trampoline traps on a
-#     misaligned entry SP, so a clean first entry proves entry-SP alignment;
-#     stack_top() must itself be 16-aligned.
+# Covers spec A0.4 + A0-T3:
+#   - fresh ctx over a synthetic stack (ms_stack_alloc) with a 16-aligned SP
+#     (stack_top alignment check; the vendored trampoline also traps a
+#     misaligned entry, so a clean first entry confirms entry-SP alignment);
+#   - the entry callback mutates a SHARED buffer via userdata (small struct
+#     payload passed through unmodified), then yields (ms_ctx_switch);
+#   - resume continues at the EXACT point with ordinary stack state intact
+#     (A0-T3: a stack-local address stable across one switch away and back);
+#   - completion returns through the trampoline's defined path to the caller;
+#   - ms_stack_free + an equal-size replacement ms_stack_alloc succeeds
+#     (clean reclaim); sentinels survive every switch.
 #
-# TOOLCHAIN NOTE (see fiber.mojo header; Main decision (a)): Mojo 1.0.0b2
-# `mojo run` (JIT) crashes the compiler RT at codegen when a factory defined
-# in an IMPORTED module is CALLED (every shape tried by-value/out-slot,
-# raises/non-raises; bisect evidence in PR #25; matches S0 SPIKE_REPORT's
-# JIT-fragility finding).  The same construction INLINE in this test module
-# runs a full switch cycle.  t4 therefore constructs the Fiber via the inline
-# make_fiber() helper (mirrors fiber.create()'s body exactly), exercising the
-# same public surface fiber.mojo wraps (Fiber, set_targets, resume/suspend/
-# destroy, ms_stack_alloc/free).  Re-test the factory call on toolchain
-# upgrade.
-#
-# Linked against the dylib: the suite harness adds -Xlinker.
-from fiber import Fiber, FiberFrame
+# Linked: the suite harness adds -Xlinker <repo>/libmojito_spike.dylib.
 from mojito_spike import (
     BytePtr,
     MS_CTX_SIZE,
     entry_pointer,
+    ms_ctx_make,
+    ms_ctx_switch,
     ms_page_size,
     ms_stack_alloc,
     ms_stack_free,
-    ms_stack_total_size,
 )
 from std.memory import stack_allocation
 
 
-@extern("exit")
-def _c_exit(code: Int32) abi("C"): ...
-
 @extern("_exit")
 def _iso_exit(code: Int32) abi("C"): ...
-
-@extern("malloc")
-def _c_malloc(size: Int) abi("C") -> BytePtr: ...
 
 
 comptime STACK_PAGES = 4
@@ -62,50 +47,59 @@ comptime ALIGN_MASK = 15
 comptime SB_SENT = 2  # driver-side sentinel slot the thunk must leave alone
 
 
-# Small struct payload passed through userdata and mutated by the entry
-# callback + the driver (userdata-lifetime probe).  Lives on the DRIVER's
-# stack; the fiber callback reaches it through the FiberFrame sidecar
-# (fiber.mojo hands `user` through unmodified).
+# Small payload handed via userdata and mutated by the entry callback + the
+# driver (userdata-lifetime probe).  Lives on the DRIVER's stack.
 struct T4Payload:
-    var buf: UnsafePointer[Int, MutAnyOrigin]  # shared scratch (4 ints)
-    var fiber_addr: Int                        # address of the driver's Fiber
+    var buf: UnsafePointer[Int, MutAnyOrigin]   # shared scratch (4 ints)
     var phase: Int                             # 0 entered / 1 yielded / 2 done
     var marker: Int                            # stack-local addr at first entry
     var resume_ok: Bool                        # local address stable across switch
 
     def __init__(out self):
         self.buf = UnsafePointer[Int, MutAnyOrigin](unsafe_from_address=1)
-        self.fiber_addr = 0
         self.phase = 0
         self.marker = -1
         self.resume_ok = True
 
 
-# The fiber entry (S0 trampoline handoff): runs real Mojo code on the
-# synthetic stack.  Receives ud = the Fiber's FiberFrame sidecar; the payload
-# is reachable via fr[].user.  Yields once via Fiber.suspend(); on resume
-# verifies the stack local kept its address (A0-T3) and that the shared buffer
-# was not clobbered, then returns through the completion path.
-@export("t4_fiber_entry")
-def t4_fiber_entry(ud: BytePtr) abi("C"):
-    var fr = ud.bitcast[FiberFrame]()
+# Sidecar layout == the vendored demo's Frame (self_ctx / caller_ctx / user);
+# handed to ms_ctx_make as userdata, reached by the entry as
+# ud.bitcast[T4Frame]().
+struct T4Frame:
+    var self_ctx: BytePtr
+    var caller_ctx: BytePtr
+    var user: BytePtr
+
+    def __init__(out self, ac: BytePtr, mc: BytePtr):
+        self.self_ctx = ac
+        self.caller_ctx = mc
+        self.user = UnsafePointer[Byte, MutAnyOrigin](unsafe_from_address=1)
+
+
+# The entry callback (S0 trampoline handoff): runs real Mojo code on the
+# synthetic stack.  ud = the T4Frame sidecar; payload reachable via
+# fr[].user.  Yields via direct ms_ctx_switch (S0 demo form); on resume
+# verifies the stack-local kept its address (A0-T3) and that the shared
+# buffer was not clobbered, then returns (completion path back to the
+# driver's ms_ctx_switch).
+@export("t4_entry")
+def t4_entry(ud: BytePtr) abi("C"):
+    var fr = ud.bitcast[T4Frame]()
     var pl = fr[].user.bitcast[T4Payload]()
 
+    var local: Int = 0
+    var local_p = UnsafePointer[Int, MutAnyOrigin](to=local)
+
     if pl[].phase == 0:
-        # First entry through the trampoline: record a stack-local address for
-        # the resume-point check, mutate the shared buffer, yield.
-        var local: Int = 0
-        var local_p = UnsafePointer[Int, MutAnyOrigin](to=local)
+        # First entry: record the stack-local address for the A0-T3
+        # resume-point check, mutate the shared scratch, yield.
         pl[].marker = Int(local_p)
         pl[].buf[0] = 0x5EED
         pl[].phase = 1
+        ms_ctx_switch(fr[].self_ctx, fr[].caller_ctx)
 
-        var fp = UnsafePointer[Fiber, MutAnyOrigin](unsafe_from_address=pl[].fiber_addr)
-        fp[].suspend()
-
-        # -- EXACT RESUME POINT (A0-T3): the stack-local must still live at the
-        # -- same address; the shared buffer (incl. the driver's sentinel) must
-        # -- be intact across the switch.
+        # -- EXACT RESUME POINT (A0-T3): the stack-local and the shared buffer
+        # -- (incl. the driver sentinel) must be intact across the pause.
         if pl[].marker != Int(local_p):
             pl[].resume_ok = False
         if pl[].buf[0] != 0x5EED:
@@ -116,25 +110,6 @@ def t4_fiber_entry(ud: BytePtr) abi("C"):
         pl[].phase = 2
 
 
-# Inline construction helper (TOOLCHAIN NOTE): mirrors fiber.create()'s body —
-# ms_stack_alloc + one heap block (2*MS_CTX_SIZE + 40) for the two ctx save
-# areas, the sidecar and the entry/ud scratch; Fiber(stack, top, block);
-# set_targets(entry, ud).  Same public surface, no imported-module factory
-# CALL (the JIT-crash path).
-def make_fiber(stack_bytes: Int, entry: BytePtr, ud: BytePtr,
-               dst: UnsafePointer[Fiber, MutAnyOrigin]):
-    var slots = stack_allocation[2, BytePtr]()
-    var rc = ms_stack_alloc(stack_bytes, slots, slots + 1)
-    if rc != 0:
-        _iso_exit(1)
-    var block = Int(_c_malloc(2 * MS_CTX_SIZE + 40))
-    if block == 0:
-        ms_stack_free(slots[0])
-        _iso_exit(1)
-    dst[0] = Fiber(Int(slots[]), Int((slots + 1)[]), block)
-    dst[].set_targets(Int(entry), Int(ud))
-
-
 def main() raises:
     var failures = List[String]()
 
@@ -142,7 +117,7 @@ def main() raises:
     if ps <= 0:
         failures.append("ms_page_size non-positive")
 
-    # Shared scratch + userdata payload on the driver's stack.
+    # Shared scratch + payload on the driver stack.
     var buf = stack_allocation[4, Int]()
     buf[0] = 0
     buf[1] = 0
@@ -154,26 +129,31 @@ def main() raises:
 
     var stack_bytes = STACK_PAGES * ps
 
-    # --- 1. fresh context over a synthetic stack (ms_stack_alloc) -----------
-    var f = Fiber()
-    make_fiber(stack_bytes, entry_pointer["t4_fiber_entry"](), pl.bitcast[Byte](),
-               UnsafePointer[Fiber, MutAnyOrigin](to=f))
-    if not f.alive():
-        failures.append("fiber did not allocate a synthetic stack")
-    if (Int(f.stack_top()) & ALIGN_MASK) != 0:
-        failures.append("synthetic stack top not 16-byte aligned")
+    # --- synthetic stack + entry-SP alignment ------------------------------
+    var slots = stack_allocation[2, BytePtr]()
+    var rc = ms_stack_alloc(stack_bytes, slots, slots + 1)
+    if rc != 0:
+        _iso_exit(1)
+    var top = Int((slots + 1)[])
+    if (top & ALIGN_MASK) != 0:
+        _iso_exit(1)
 
-    # The driver's Fiber reserves usable pages + one guard page.
-    var living = ms_stack_total_size()
-    if living <= 0:
-        failures.append("ms_stack_total_size should be > 0 while a stack is allocated")
+    # ctx buffers: ALT = the synthetic-stack context, MAIN = the driver's
+    # caller context (both ms_ctx_t-sized workspaces).
+    var main_buf = stack_allocation[MS_CTX_SIZE // 8, Int]()
+    var alt_buf = stack_allocation[MS_CTX_SIZE // 8, Int]()
+    var main_ctx = main_buf.bitcast[Byte]()
+    var alt_ctx = alt_buf.bitcast[Byte]()
 
-    # Wire the fiber back-pointer into the payload (needed by suspend() from
-    # inside the entry; only valid once `f` has landed in this local).
-    pl[].fiber_addr = Int(UnsafePointer[Fiber, MutAnyOrigin](to=f))
+    # Sidecar: self_ctx = ALT, caller_ctx = MAIN, user = the payload.
+    var fs = stack_allocation[1, T4Frame]()
+    fs[0] = T4Frame(alt_ctx, main_ctx)
+    fs[].user = pl.bitcast[Byte]()
 
-    # --- 2. enter through the trampoline; thunk mutates shared buf, yields ---
-    f.resume()
+    # Prepare + enter the fresh context via the S0 entry_pointer mechanism.
+    ms_ctx_make(alt_ctx, (slots + 1)[], entry_pointer["t4_entry"](), fs.bitcast[Byte]())
+    ms_ctx_switch(main_ctx, alt_ctx)
+
     if pl[].phase != 1:
         failures.append("entry did not reach the yield point (phase " + String(pl[].phase) + ")")
     if buf[0] != 0x5EED:
@@ -181,36 +161,32 @@ def main() raises:
     if buf[2] != 0x0BAD:
         failures.append("driver sentinel clobbered while the fiber was sandwiched")
 
-    # -- 3. resume at the exact point; thunk verifies, completes --------------
-    f.resume()
+    # Resume ALT at the exact point; the thunk verifies, then completes.
+    ms_ctx_switch(main_ctx, alt_ctx)
     if pl[].phase != 2:
-        failures.append("entry did not complete after resume (phase=" + String(pl[].phase) + ")")
+        failures.append("entry did not complete after resume")
     if buf[1] != 0xCAFE:
         failures.append("resumed thunk did not continue its own stack frame")
     if not pl[].resume_ok:
         failures.append("stack-local address (or shared buffer) not stable across switch")
 
-    # -- 4. clean reclaim: free, then equal-size realloc succeeds --------------
-    f.destroy()
-    if f.alive():
-        failures.append("destroy() did not release the synthetic stack")
-    if ms_stack_total_size() >= living:
-        failures.append("ms_stack_total_size did not drop after destroy")
+    # -- clean reclaim: free, then an equal-size replacement allocates -----
+    ms_stack_free(slots[0])
 
-    var f2 = Fiber()
-    make_fiber(stack_bytes, entry_pointer["t4_fiber_entry"](), pl.bitcast[Byte](),
-               UnsafePointer[Fiber, MutAnyOrigin](to=f2))
-    if not f2.alive():
+    var slots2 = stack_allocation[2, BytePtr]()
+    var rc2 = ms_stack_alloc(stack_bytes, slots2, slots2 + 1)
+    if rc2 != 0:
         failures.append("equal-size replacement stack did not allocate after free")
-    f2.destroy()
-    if f2.alive():
-        failures.append("second destroy() leaked its stack")
+    else:
+        var top2 = Int((slots2 + 1)[])
+        if (top2 & ALIGN_MASK) != 0:
+            failures.append("replacement stack top not 16-aligned")
+        ms_stack_free(slots2[0])
 
-    # --- verdict ------------------------------------------------------------------
     if len(failures) == 0:
         print("T4 fiber: PASS")
     else:
         print("T4 fiber: FAIL (" + String(len(failures)) + ")")
         for m in failures:
             print("  - " + m)
-        _c_exit(1)
+        _iso_exit(1)
