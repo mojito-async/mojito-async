@@ -5,6 +5,14 @@
 #
 # WHAT IS PROVEN HERE (spike-honest, per Main's lane brief)
 # ---------------------------------------------------------
+# RECURSION-DEPTH BUDGET (work-first policy): cooperative nesting consumes
+# driver/execute/thunk frames on the CURRENT stack per scheduling level.
+# On the main thread this is thousands of levels; on ms_stack_alloc'd
+# synthetic stacks (drivers use ~16 KiB) the budget is only tens of frames
+# and Mojo raises no StackOverflowError -- deep DAGs fail by smashing the
+# fiber stack.  Keep nesting shallow inside fibers; A0.10 instrumentation
+# should track live depth.
+
 # b2 toolchain bug modular/modular#6971: extern calls lowered inside an
 # IMPORTED module (JIT and AOT) miscompile — so ms_ctx_make/ms_ctx_switch/
 # ms_stack_alloc can NOT live in any call path of this module.  This module
@@ -181,7 +189,6 @@ def spawn[R: ResultValue](
 
 
 def execute[R: ResultValue, F: def(BytePtr) raises -> R](
-    rt: Runtime,
     mut h: JoinHandle[R],
     thunk: F,
     ud: BytePtr,
@@ -199,7 +206,6 @@ def execute[R: ResultValue, F: def(BytePtr) raises -> R](
     MID-FRAME and being resumed at the same point on the same thread — lives
     in the driver (tests/t2_worker_reuse_aot.mojo, t4_fiber.mojo shape).
     """
-    _ = rt
     if h.is_completed():
         raise Error("execute: task already completed")
     h.tcb()[].transition(TaskControlBlock.RUNNING)
