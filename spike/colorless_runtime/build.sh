@@ -74,7 +74,7 @@ if ! $CC -dynamiclib -o "$DYLIB" \
 fi
 echo "dylib built: $DYLIB"
 
-if [ "$1" = "build" ]; then
+if [ "${1:-}" = "build" ]; then
     exit 0
 fi
 
