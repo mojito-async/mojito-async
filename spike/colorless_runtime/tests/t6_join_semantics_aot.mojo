@@ -204,9 +204,9 @@ def main() raises:
                     _record(ctx, EV_A_PARK)
                     a_parked_cell[] = 1
                 else:
-                    _ = execute(rt, h_a, a_step2, ud)
+                    _ = execute(h_a, a_step2, ud)
             elif rec.task_id == h_b.id():
-                _ = execute(rt, h_b, b_step, ud)
+                _ = execute(h_b, b_step, ud)
             else:
                 failures.append("dequeued unknown task id")
         else:
@@ -277,7 +277,7 @@ def main() raises:
     # ==== A0-T5: join AFTER completion — no parking ==========================
     var tcb_c = TaskControlBlock[IRes]()
     var h_c = spawn(rt, UnsafePointer[TaskControlBlock[IRes], MutAnyOrigin](to=tcb_c), 0)
-    _ = execute(rt, h_c, c_step, ud)
+    _ = execute(h_c, c_step, ud)
     if not h_c.is_completed():
         failures.append("A0-T5: child not completed before join")
     h_c.begin_join()
@@ -296,7 +296,7 @@ def main() raises:
     # ==== A0-T8: child error propagates through join =========================
     var tcb_e = TaskControlBlock[IRes]()
     var h_e = spawn(rt, UnsafePointer[TaskControlBlock[IRes], MutAnyOrigin](to=tcb_e), 0)
-    _ = execute(rt, h_e, e_step, ud)
+    _ = execute(h_e, e_step, ud)
     if not h_e.is_completed():
         failures.append("A0-T8: failed child did not reach COMPLETED")
     if not h_e.is_failed():

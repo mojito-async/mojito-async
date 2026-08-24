@@ -104,7 +104,7 @@ def main() raises:
     # ==== A0-T7 scenario 1: abandoned result ==================================
     # execute(P): the producer's own bound instance dies inside the task
     # frame; the TCB stores a separate bound copy.
-    _ = execute(rt, h_p, p_step, ud)
+    _ = execute(h_p, p_step, ud)
     var after_exec = cnt_cell[]
     if after_exec != 1:
         failures.append(
@@ -148,7 +148,7 @@ def main() raises:
     # ==== A0-T6 scenario: one-shot join =======================================
     var tcb_q = TaskControlBlock[Probe]()
     var h_q = spawn(rt, UnsafePointer[TaskControlBlock[Probe], MutAnyOrigin](to=tcb_q), 0)
-    _ = execute(rt, h_q, q_step, ud)
+    _ = execute(h_q, q_step, ud)
     var before_join = cnt_cell[]
     if before_join != after_abandon + 1:
         failures.append(
