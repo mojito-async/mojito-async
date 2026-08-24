@@ -223,6 +223,15 @@ def main() raises:
     if jsonl_escape("a\"b\\c\nd") != "a\\\"b\\\\c\\nd":
         failures.append("escape missed quote/backslash/newline")
         n_fail += 1
+    # Control bytes must become \u00XX (RFC 8259), not raw bytes.
+    var ctl_in = String(Codepoint(0x01))
+    var ctl = jsonl_escape(ctl_in)
+    if ctl != "\\u0001":
+        failures.append("control char not \\u-escaped")
+        n_fail += 1
+    if jsonl_escape(String(Codepoint(0x1B))) != "\\u001b":
+        failures.append("ESC not \\u-escaped")
+        n_fail += 1
 
     var row = jsonl_row("ev1", 10, 2)
     if row != "{\"event\":\"ev1\",\"bytes\":10,\"count\":2}":
