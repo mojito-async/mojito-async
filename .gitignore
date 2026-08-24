@@ -2,9 +2,16 @@
 *.mojopkg
 *.mojoc
 *.o
+<<<<<<< HEAD
 *.dylib
 /build/
 spike/colorless_runtime/build/
 __pycache__/
+=======
+*.a
+.so
+.dylib
+/build/
+>>>>>>> ce0822f (RED(a0.2): harness + suite wiring + runtime skeleton + t1 (red) — #11)
 __pycache__/
 .DS_Store
