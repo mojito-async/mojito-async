@@ -174,7 +174,12 @@ def main() raises:
     sp5[0].unregister(rid1)
     sp5[0].request_cancel_all()
     expect(len(cancels) == 2, "hook fired once per surviving sibling")
-    expect(cancels[0] == 2 and cancels[1] == 3, "siblings 2,3 cancelled in order")
+    # Registry order carries no semantics (swap-remove on unregister), so
+    # assert SET semantics: both survivors cancelled exactly once.
+    var c0 = cancels[0]
+    var c1 = cancels[1]
+    var pair_ok = (c0 == 2 and c1 == 3) or (c0 == 3 and c1 == 2)
+    expect(pair_ok, "siblings 2,3 both cancelled (order-agnostic)")
 
     # Second pass fires only for still-live children.
     sp5[0].unregister(2)

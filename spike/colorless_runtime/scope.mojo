@@ -132,6 +132,12 @@ struct Scope[T: ResultValue, H: CancelHook](Movable, ImplicitlyDeletable):
         self._order_log = order_log
         self._parent = parent
         self._open_subscopes = 0
+        # Every construction path maintains the parent's open-subscope
+        # invariant (previously only make_nested_scope did): a directly
+        # constructed parent-linked scope is counted too, so the parent's
+        # close() refusal arithmetic can never go negative.
+        if self._parent:
+            self._parent.value()[]._open_subscopes += 1
 
     # --- queries -----------------------------------------------------------
 
@@ -168,8 +174,15 @@ struct Scope[T: ResultValue, H: CancelHook](Movable, ImplicitlyDeletable):
         Returns the assigned child handle."""
         if not self._open:
             var err = ChildrenStillLive(
-                "ChildrenStillLive: register into closed scope "
+                "ScopeClosed: register into closed scope "
                 + String(self._handle)
+            )
+            raise Error(err.message)
+        var prior = child[].scope_handle()
+        if prior != 0 and prior != self._handle:
+            var err = ChildrenStillLive(
+                "ChildrenStillLive: child already names scope "
+                + String(prior)
             )
             raise Error(err.message)
         var cid = self._next_child_id
@@ -189,17 +202,22 @@ struct Scope[T: ResultValue, H: CancelHook](Movable, ImplicitlyDeletable):
                 var tcb_ptr = self._child_ptrs[i]
                 if tcb_ptr[].scope_handle() != self._handle:
                     var err = ChildrenStillLive(
-                        "ChildrenStillLive: child "
+                        "UnknownChild: child "
                         + String(child_handle)
                         + " does not name scope "
                         + String(self._handle)
                     )
                     raise Error(err.message)
-                _ = self._child_ids.pop(i)
-                _ = self._child_ptrs.pop(i)
+                # Swap-remove: registry order carries no semantics (every
+                # survivor gets cancel-requested), so removal is O(1).
+                var last = len(self._child_ids) - 1
+                self._child_ids[i] = self._child_ids[last]
+                self._child_ptrs[i] = self._child_ptrs[last]
+                _ = self._child_ids.pop(last)
+                _ = self._child_ptrs.pop(last)
                 return
         var err = ChildrenStillLive(
-            "ChildrenStillLive: unregister of unknown child "
+            "UnknownChild: unregister of unknown child "
             + String(child_handle)
             + " from scope "
             + String(self._handle)
@@ -234,7 +252,7 @@ struct Scope[T: ResultValue, H: CancelHook](Movable, ImplicitlyDeletable):
         Double-close raises."""
         if not self._open:
             var err = ChildrenStillLive(
-                "ChildrenStillLive: double close of scope "
+                "DoubleClose: double close of scope "
                 + String(self._handle)
             )
             raise Error(err.message)
@@ -290,11 +308,17 @@ def make_nested_scope[T: ResultValue, H: CancelHook](
     parent: UnsafePointer[Scope[T, H], MutAnyOrigin],
     order_log: UnsafePointer[List[Int], MutAnyOrigin],
     has_log: Bool,
-) -> Scope[T, H]:
+) raises -> Scope[T, H]:
     """Nested scope: registers as an open subscope of `parent`, so the
     parent cannot close until this scope closes (inner-before-outer)."""
+    if not parent[].is_open():
+        var err = ChildrenStillLive(
+            "ChildrenStillLive: parent scope "
+            + String(parent[].handle())
+            + " already closed"
+        )
+        raise Error(err.message)
     var with_log = _opt_log(order_log, has_log)
     var with_parent = Optional[UnsafePointer[Scope[T, H], MutAnyOrigin]](parent)
     var s = Scope[T, H](hook, handle, with_log, with_parent)
-    parent[]._open_subscopes += 1
     return s^
