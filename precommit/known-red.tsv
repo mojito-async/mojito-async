@@ -1,4 +1,4 @@
-# Intentional TDD-red tests. Format: <test-name>\t<tracking-issue-url>
+# Intentional TDD-red tests. Format: <test-name>	<tracking-issue-url>
 #
 # precommit/gate.sh runs the suite on every commit. A failing test listed
 # here is expected (TDD: red test first, implementation lands in a later
@@ -6,4 +6,5 @@
 # logged. Remove the row as soon as the implementation turns the test green —
 # an unlisted failure blocks the commit.
 #
-# Rows are matched on the <test-name> printed by the suite.
+# Active rows (each lane removes its row when its test goes green):
+suite	https://github.com/mojito-async/mojito-async/issues/11
