@@ -1,0 +1,5 @@
+# Vendored upstream sources are copied byte-identical from mojito-sys and
+# are exempt from this repo's trailing-whitespace policy (upstream ms_ctx.c
+# carries a trailing space on one line; editing it would break the A0.1
+# "verbatim vendor" contract). Scope is the vendor tree only.
+spike/colorless_runtime/vendor/** whitespace=-trailing-space
