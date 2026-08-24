@@ -8,4 +8,3 @@
 #
 # Active rows (each lane removes its row when its test goes green):
 suite	https://github.com/mojito-async/mojito-async/issues/11
-suite	https://github.com/mojito-async/mojito-async/issues/16
