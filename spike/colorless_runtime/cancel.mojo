@@ -21,8 +21,8 @@
 #   - b2 only supports raising the builtin `Error`; CancellationError is a
 #     named message carrier so the raised condition stays nameable.
 #   - Parent links are UnsafePointer[CancelFlag, MutAnyOrigin] into a live
-#     parent (scope object or test local); presence tracked by `_has_parent`
-#     because b2 pointers carry no null check.
+#     parent (scope object or test local); presence tracked via
+#     Optional[UnsafePointer] (b2 pointers carry no null check).
 
 # ---------------------------------------------------------------------------
 # CancellationError (error model)
@@ -75,11 +75,13 @@ struct CancelFlag(ImplicitlyCopyable, ImplicitlyDeletable):
 
     var _requested: Bool
     var _observed: Bool
+    var _consumed_through: Bool
     var _parent: Optional[UnsafePointer[CancelFlag, MutAnyOrigin]]
 
     def __init__(out self):
         self._requested = False
         self._observed = False
+        self._consumed_through = False
         self._parent = Optional[UnsafePointer[CancelFlag, MutAnyOrigin]]()
 
     # --- requests ----------------------------------------------------------
@@ -103,15 +105,22 @@ struct CancelFlag(ImplicitlyCopyable, ImplicitlyDeletable):
 
     def checkpoint(mut self) raises:
         """Cooperative cancellation point.
-
         Silent when not requested.  When cancellation is observable (here or
         through an ancestor) raises CancellationError-as-Error and stamps
         the observation on THIS flag before raising.
         """
         if self.is_requested():
             self._observed = True
-            var err = CancellationError("checkpoint observed cancellation")
-            raise Error(err.message)
+            # Stamp every flag on the propagation chain so no ancestor can
+            # reset() away a cancellation that was already observed.
+            self._stamp_chain()
+            raise Error("CancellationError: checkpoint observed cancellation")
+
+    def _stamp_chain(mut self):
+        """Mark this flag consumed-through and recurse to ancestors."""
+        self._consumed_through = True
+        if self._parent:
+            self._parent.value()[]._stamp_chain()
 
     # --- reset -------------------------------------------------------------
 
@@ -122,7 +131,7 @@ struct CancelFlag(ImplicitlyCopyable, ImplicitlyDeletable):
         no reset after observe).  Note reset() clears only the LOCAL
         request; an ancestor's request keeps propagating down.
         """
-        if self._observed:
+        if self._observed or self._consumed_through:
             raise Error(
                 "CancellationError.reset: no reset after observe "
                 "(spike policy)"
