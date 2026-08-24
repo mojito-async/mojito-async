@@ -252,14 +252,25 @@ struct TaskControlBlock[T: ResultValue] (ImplicitlyCopyable, ImplicitlyDeletable
     def generation(self) -> Int:
         return self._generation
 
-    def wait_node(self) -> WaitNode:
-        return self._wait
+    # Returns the embedded node BY POINTER: callers (A0.7 Event wait-list,
+    # cancellation) stamp reason/next in place — a by-value return would
+    # mutate a discarded temporary.
+    def wait_node(mut self) -> UnsafePointer[WaitNode, MutAnyOrigin]:
+        return UnsafePointer[WaitNode, MutAnyOrigin](to=self._wait)
 
     def parent_id(self) -> Int:
         return self._parent
 
     def scope_handle(self) -> Int:
         return self._scope
+
+    # Links are populated by A0.6 spawn (parent) and A0.9 scope. Kept as
+    # plain Int handles for the spike (single worker, no dereference).
+    def set_parent_id(mut self, id: Int):
+        self._parent = id
+
+    def set_scope_handle(mut self, h: Int):
+        self._scope = h
 
     def is_completed(self) -> Bool:
         return self._state == TaskControlBlock.COMPLETED
@@ -283,5 +294,6 @@ struct TaskControlBlock[T: ResultValue] (ImplicitlyCopyable, ImplicitlyDeletable
                 "TaskControlBlock.take_result: no result (never marked or "
                 "already consumed)"
             )
+        var out = self._result
         self._has_result = False
-        return self._result
+        return out

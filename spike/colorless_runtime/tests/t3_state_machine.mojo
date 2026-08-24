@@ -147,6 +147,7 @@ def main() raises:
     assert_illegal(p2, TB.NEW, "RUNNING -> NEW")
     assert_illegal(p2, TB.RUNNABLE, "RUNNING -> RUNNABLE")
     assert_illegal(p2, TB.WAITING, "RUNNING -> WAITING")
+    assert_illegal(p2, TB.RUNNING, "RUNNING -> RUNNING")
 
     var fresh3 = tcb_at(TB.PARKING)
     var p3 = UnsafePointer[TB, MutAnyOrigin](to=fresh3)
@@ -233,7 +234,7 @@ def main() raises:
     g.transition(TB.WAITING)
     expect(g.generation() == 2, "generation bumped after first park commit")
     expect(
-        g.wait_node().generation() == 2,
+        g.wait_node()[].generation() == 2,
         "wait node stamps the claimed epoch",
     )
     g.transition(TB.RUNNABLE)  # readiness wake
