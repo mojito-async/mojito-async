@@ -59,13 +59,16 @@ def _clock_gettime(
 
 
 struct ClockSource(ImplicitlyCopyable, ImplicitlyDeletable):
-    """Monotonic nanosecond clock (spike: Darwin CLOCK_MONOTONIC via libc).
+    """Monotonic nanosecond clock (spike: Darwin CLOCK_MONOTONIC_RAW via libc).
 
     std.time in 1.0.0b2 has no clock API, hence the extern. now() never
-    goes backwards within a boot; resolution is ns.
+    goes backwards within a boot. CLOCK_MONOTONIC_RAW (=4) ticks ~42ns on
+    darwin/arm64 (mach_absolute_time timebase, unslewable); plain
+    CLOCK_MONOTONIC (=6) only advances in ~1us steps on this host.
+    Non-Darwin hosts would need the platform's monotonic id instead.
     """
 
-    comptime CLOCK_MONOTONIC = Int32(6)
+    comptime CLOCK_MONOTONIC = Int32(4)
     def __init__(out self):
         pass
 
@@ -97,6 +100,11 @@ struct LatencyTimer(ImplicitlyCopyable, ImplicitlyDeletable):
     based over a copy (fine at spike scale, deterministic).
 
     p50/p95 use index (n * pct) // 100 clamped to n-1 over ascending sort.
+
+    Overhead note: each start/stop pair performs two extern clock reads
+    plus bookkeeping inside the measured envelope (~100-200ns). For
+    sub-microsecond regions subtract this fixed cost or batch K iterations
+    per sample; raw p50/p95 are upper bounds for tiny regions.
     """
 
     comptime SAMPLE_CAPACITY = 256
@@ -295,7 +303,6 @@ def assert_zero_allocs(accounter: AllocAccounter, event: String) -> Bool:
 
 
 def make_alloc_accounter() -> AllocAccounter:
-    """Factory (b2 structs have no static methods)."""
     return AllocAccounter()
 
 
@@ -303,34 +310,33 @@ def make_alloc_accounter() -> AllocAccounter:
 # JSONL emitter
 # ---------------------------------------------------------------------------
 
-def jsonl_escape(s: String) -> String:
+def jsonl_escape(s: String) raises -> String:
     """Hand-rolled JSON string escaping: backslash, quote, control chars.
 
-    Byte-wise scan over the UTF-8 payload; ASCII control bytes outside the
-    named escapes are emitted as \\u00XX.
+    Codepoint-wise scan; ASCII control bytes outside the named escapes are
+    emitted as the 6-char sequence backslash-u-00XX per RFC 8259.
     """
     var out = String("")
-    var n = s.byte_length()
-    var i = 0
-    while i < n:
-        var c = s[byte=i]
-        if c == "\\":
+    var hexdigits = "0123456789abcdef"
+    for cp in s.codepoints():
+        var v = Int(cp)
+        if v == 92:
             out = out + "\\\\"
-        elif c == "\"":
+        elif v == 34:
             out = out + "\\\""
-        elif c == "\n":
+        elif v == 10:
             out = out + "\\n"
-        elif c == "\r":
+        elif v == 13:
             out = out + "\\r"
-        elif c == "\t":
+        elif v == 9:
             out = out + "\\t"
+        elif v < 0x20:
+            out = out + "\\u00" + hexdigits[byte=v >> 4] + hexdigits[byte=v & 0xF]
         else:
-            out = out + String(c)
-        i += 1
+            out = out + String(Codepoint(v))
     return out
 
-
-def jsonl_row(event: String, bytes: Int, count: Int) -> String:
+def jsonl_row(event: String, bytes: Int, count: Int) raises -> String:
     """One JSONL measurement object: {"event":..,"bytes":N,"count":N}."""
     return (
         "{\"event\":\"" + jsonl_escape(event) + "\",\"bytes\":"
@@ -347,4 +353,5 @@ def emit(jsonl_path: String, rows: List[String]) raises:
     var fh = FileHandle(jsonl_path, "w")
     for row in rows:
         fh.write(row + "\n")
-    _ = fh.close()
+    # b2 FileHandle.write/close return None and raise on I/O failure.
+    fh.close()
