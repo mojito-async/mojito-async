@@ -7,3 +7,4 @@
 # an unlisted failure blocks the commit.
 #
 # Rows are matched on the <test-name> printed by the suite.
+suite	https://github.com/mojito-async/mojito-async/issues/10
