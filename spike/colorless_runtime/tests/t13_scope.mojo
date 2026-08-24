@@ -71,9 +71,9 @@ def main() raises:
     var b = fresh_tcb()
     var c = fresh_tcb()
 
-    var ida = sp1[0].register(ptr(a), 0)
-    var idb = sp1[0].register(ptr(b), 0)
-    var idc = sp1[0].register(ptr(c), 0)
+    var ida = sp1[0].register(UnsafePointer[TB, MutAnyOrigin](to=a), 0)
+    var idb = sp1[0].register(UnsafePointer[TB, MutAnyOrigin](to=b), 0)
+    var idc = sp1[0].register(UnsafePointer[TB, MutAnyOrigin](to=c), 0)
     expect(ida == 1 and idb == 2 and idc == 3, "child handles assigned 1,2,3")
     expect(sp1[0].live_child_count() == 3, "three live children registered")
 
@@ -101,7 +101,7 @@ def main() raises:
 
     # 2. Parent-task-id round-trip through registration.
     var p = fresh_tcb()
-    var idp = sp1[0].register(ptr(p), 42)
+    var idp = sp1[0].register(UnsafePointer[TB, MutAnyOrigin](to=p), 42)
     expect(p.parent_id() == 42, "set_parent_id round-trips via register")
     sp1[0].unregister(idp)
 
@@ -165,9 +165,9 @@ def main() raises:
     var x1 = fresh_tcb()
     var x2 = fresh_tcb()
     var x3 = fresh_tcb()
-    var rid1 = sp5[0].register(ptr(x1), 0)
-    _ = sp5[0].register(ptr(x2), 0)
-    _ = sp5[0].register(ptr(x3), 0)
+    var rid1 = sp5[0].register(UnsafePointer[TB, MutAnyOrigin](to=x1), 0)
+    _ = sp5[0].register(UnsafePointer[TB, MutAnyOrigin](to=x2), 0)
+    _ = sp5[0].register(UnsafePointer[TB, MutAnyOrigin](to=x3), 0)
 
     # First child fails: it leaves the registry (its failure is terminal)
     # and the scope cancels every REMAINING sibling via the injected hook.
@@ -188,8 +188,8 @@ def main() raises:
     var sp6 = UnsafePointer[Scope[TInt, RecordingCancel], MutAnyOrigin](to=s6)
     var y1 = fresh_tcb()
     var y2 = fresh_tcb()
-    _ = sp6[0].register(ptr(y1), 0)
-    _ = sp6[0].register(ptr(y2), 0)
+    _ = sp6[0].register(UnsafePointer[TB, MutAnyOrigin](to=y1), 0)
+    _ = sp6[0].register(UnsafePointer[TB, MutAnyOrigin](to=y2), 0)
     sp6[0].drop_children()
     expect(sp6[0].live_child_count() == 0, "drop_children empties the registry")
     sp6[0].close()
