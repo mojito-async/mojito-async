@@ -190,6 +190,7 @@ struct Event(ImplicitlyCopyable, ImplicitlyDeletable):
     var _wakes_accepted: Int
     # bounded enqueue log (generations accepted, oldest first)
     var _log_n: Int
+    var _log_dropped: Int
     var _log_0: Int
     var _log_1: Int
     var _log_2: Int
@@ -209,6 +210,7 @@ struct Event(ImplicitlyCopyable, ImplicitlyDeletable):
         self._set_attempts = 0
         self._wakes_accepted = 0
         self._log_n = 0
+        self._log_dropped = 0
         self._log_0 = -1
         self._log_1 = -1
         self._log_2 = -1
@@ -260,9 +262,12 @@ struct Event(ImplicitlyCopyable, ImplicitlyDeletable):
             return False  # stale-generation wake: ignored
         if self._claimed_gen == cur:
             return False  # duplicate wake for this generation
+        # Enqueue FIRST (lossy ring cannot fail), THEN claim the generation:
+        # the WAKE path can never abort between claiming and resuming
+        # (modular review fold, PR #29).
+        self._log_enqueue(cur)
         self._claimed_gen = cur
         self._wakes_accepted += 1
-        self._log_enqueue(cur)
         return True
 
     def clear_latch(mut self):
@@ -320,9 +325,22 @@ struct Event(ImplicitlyCopyable, ImplicitlyDeletable):
 
     # --- internals ----------------------------------------------------------
 
-    def _log_enqueue(mut self, gen: Int) raises:
+    def _log_enqueue(mut self, gen: Int):
+        """Lossy diagnostic ring: at capacity the OLDEST entry is dropped
+        and _log_dropped counts the loss.  NEVER raises -- a diagnostics
+        buffer must not fail (or wedge) the WAKE path after the generation
+        has been claimed (modular review fold, PR #29)."""
         if self._log_n >= Self.LOG_CAPACITY:
-            raise Error("Event: enqueue log capacity exceeded")
+            # shift down, drop oldest
+            self._log_0 = self._log_1
+            self._log_1 = self._log_2
+            self._log_2 = self._log_3
+            self._log_3 = self._log_4
+            self._log_4 = self._log_5
+            self._log_5 = self._log_6
+            self._log_6 = self._log_7
+            self._log_n = Self.LOG_CAPACITY - 1
+            self._log_dropped += 1
         if self._log_n == 0:
             self._log_0 = gen
         elif self._log_n == 1:
@@ -354,6 +372,11 @@ def deliver_wake[T: ResultValue](
     resume the waiter: try_transition(WAITING -> RUNNABLE).
 
     Rejected deliveries (stale/duplicate generation) do NOT touch the TCB.
+
+    Return contract: True means "delivery ACCEPTED by the Event" (generation
+    claimed + enqueued); the caller owns the TCB resume transition.  A True
+    return does NOT by itself prove the waiter resumed -- callers that need
+    that guarantee check tp[].state() after the resume transition.
     """
     var accepted = ev.set()
     if accepted:
