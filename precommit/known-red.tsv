@@ -1,0 +1,9 @@
+# Intentional TDD-red tests. Format: <test-name>\t<tracking-issue-url>
+#
+# precommit/gate.sh runs the suite on every commit. A failing test listed
+# here is expected (TDD: red test first, implementation lands in a later
+# commit of the same PR) and does NOT block the commit; the failure is still
+# logged. Remove the row as soon as the implementation turns the test green —
+# an unlisted failure blocks the commit.
+#
+# Rows are matched on the <test-name> printed by the suite.
