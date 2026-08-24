@@ -150,6 +150,6 @@ def main() raises:
     if n_fail == 0:
         print("T5 FIFO queue: PASS")
     else:
-        print("T5 FIFO queue: FAIL (" + str(n_fail) + ")")
+        print("T5 FIFO queue: FAIL (" + String(n_fail) + ")")
         for f in failures:
             print("  - " + f)
