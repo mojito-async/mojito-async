@@ -26,8 +26,14 @@ struct Runtime:
     def __init__(out self):
         pass
 
-    # Run a colorless task (any ordinary def with no arguments, no result).
-    # Stub: raises until the scheduler exists. Never invokes `task`.
+    #
+    # NOTE (A0.6 handoff): this signature is a COMPILE-SURFACE PLACEHOLDER.
+    # Spec §13's final root API is a module-level result-returning
+    # run(Callable[() -> T]) raises -> T; the void/niladic generic here is
+    # the narrowest b2 shape that A0-T1 can compile against. A0.6 must
+    # generalize without breaking callers that ignore the return value.
+    # The run-reuse contract (single run per Runtime? shutdown idempotency?)
+    # is also open and owned by A0.4.
     def run[T: def() -> None](self, task: T) raises:
         _ = task  # deliberately unused while run() is a stub
         raise Error("runtime.run: not implemented yet (A0.4/A0.6)")

@@ -51,6 +51,7 @@ if [ -n "$conflicts" ]; then
 fi
 
 # ---------------------------------------------------------------- Tier 1 ----
+# run_check: PASS (0) | FAIL-env (>=2, never allow-listed) | RED (1 + row) | FAIL
 run_check() { # <name> <command...>
     name=$1
     shift
@@ -58,6 +59,10 @@ run_check() { # <name> <command...>
     st=$?
     if [ "$st" -eq 0 ]; then
         printf '%-38s PASS\n' "$name"
+    elif [ "$st" -ge 2 ]; then
+        printf '%-38s FAIL (exit %s: environment/harness error, not TDD-red)\n' "$name" "$st"
+        printf '%s\n' "$out" | tail -n 8 | sed 's/^/    | /'
+        failures=$((failures + 1))
     elif grep -q "^$name	" "$KNOWN_RED"; then
         printf '%-38s RED (known-red, TDD)\n' "$name"
         printf '%s\n' "$out" | tail -n 4 | sed 's/^/    | /'

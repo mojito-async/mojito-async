@@ -69,16 +69,20 @@ matrix=""
 for t in $MOJO_TESTS; do
     name=$(basename "$t" .mojo)
     out=$("$MOJO" run -Xlinker "$DYLIB" -I "$SPIKE_DIR" -I "$BINDING_DIR" "$t" 2>&1)
-    if printf '%s' "$out" | grep -q "FAIL"; then
-        row="$name FAIL"
-        failures=$((failures + 1))
-    elif printf '%s' "$out" | grep -q "RED"; then
-        row="$name RED (known-red, TDD)"
-        reds=$((reds + 1))
-    elif printf '%s' "$out" | grep -q "PASS"; then
+    st=$?
+    if [ "$st" -eq 0 ] && printf '%s' "$out" | grep -q "PASS"; then
         row="$name PASS"
+    elif printf '%s' "$out" | grep -q "RED"; then
+        # RED requires exit 1; exit 0 with RED text is a driver bug (FAIL).
+        if [ "$st" -eq 1 ]; then
+            row="$name RED (known-red, TDD)"
+            reds=$((reds + 1))
+        else
+            row="$name FAIL (RED text but exit $st)"
+            failures=$((failures + 1))
+        fi
     else
-        row="$name FAIL (no PASS/RED/FAIL verdict)"
+        row="$name FAIL (exit $st; no PASS/RED verdict)"
         failures=$((failures + 1))
     fi
     matrix="$matrix$row

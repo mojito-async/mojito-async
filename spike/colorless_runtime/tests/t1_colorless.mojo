@@ -10,9 +10,14 @@
 # confirms the plumbing (compile + surface); green lands with A0.4/A0.6 when
 # run() executes `ordinary_step` end-to-end and this prints PASS.
 #
-# Verdict convention (suite matrix): print exactly one of PASS / RED / FAIL.
-# The driver always exits 0; run.sh classifies by the printed verdict.
+# Verdict convention (suite matrix): print exactly one of PASS / RED / FAIL
+# and exit 0 for PASS, 1 for RED/FAIL (run.sh requires exit 0 for PASS and
+# exit 1 for RED; anything else is a driver bug).
 from runtime import Runtime, create
+
+
+@extern("exit")
+def _c_exit(code: Int32) abi("C"): ...
 
 
 # A colorless task: no async, no await, no Future. Just ordinary def code.
@@ -35,6 +40,8 @@ def main() raises:
             # Expected red state for A0.2: colorless task compiles and reaches
             # the stub error path. The scheduler is simply not implemented.
             print("RED: colorless task compiled; run() is a stub yet (A0.4/A0.6)")
+            _c_exit(1)
         else:
             print("FAIL: unexpected error: " + msg)
+            _c_exit(1)
     rt.shutdown()
