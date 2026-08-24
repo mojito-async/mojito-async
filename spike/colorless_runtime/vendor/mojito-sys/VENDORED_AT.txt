@@ -1,0 +1,22 @@
+Vendored mojito-sys S0 substrate — spike/colorless_runtime/vendor/mojito-sys/
+
+Source repository: github.com/mojito-async/mojito-sys
+Source tree:       spike/context_switch/ (frozen S0 substrate, A0.1 lane)
+Source commit:     0ad48315bebc1fcb02834074afbff6e59173cdb1
+Frozen contract:   8454212 (S0 SPIKE_REPORT: GO — feasibility proven, all 14 tests green)
+Vendored on:       2026-08-24T04:04:28Z
+
+Files (copied verbatim, byte-identical to the source commit above):
+  include/mojito_spike.h   # frozen v2 ms_ctx_t layout (168 B: x19-x30, d8-d15, sp)
+  native_stack.c           # ms_stack_alloc/free with PROT_NONE guard page
+  aarch64_switch.S         # ms_ctx_make/ms_ctx_switch (Apple arm64; #if !__APPLE__ guard)
+  ms_ctx.c                 # compile-time layout asserts + sentinel probe (guarded off)
+  mojito_spike.mojo        # Mojo 1.0.0b2 bindings (entry_pointer, ms_* externs)
+
+The substrate is UNCHANGED since the frozen contract commit 8454212:
+`git diff 8454212 <source commit> -- spike/context_switch/` is empty (only the
+post-GO precommit-gates commits landed in mojito-sys, touching no substrate
+files). This vendor snapshot is consumed by the A0 spike lanes; it is NOT
+modified here — boundary rule (docs/A0_PLAN.md): the spike uses only this
+vendored surface (ms_stack_alloc/free, ms_ctx_make/switch), never raw
+mmap/pthread/asm.
