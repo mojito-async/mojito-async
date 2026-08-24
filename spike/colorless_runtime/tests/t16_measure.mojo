@@ -140,21 +140,18 @@ def main() raises:
 
     # Fixed capacity: filling past the documented cap must raise, never grow.
     var cap_ok = False
-    var cap_err = ""
     try:
         while True:
             timer.start()
             _ = timer.stop()
-    except e:
+    except:
         cap_ok = True
-        cap_err = str(e)
     if not cap_ok:
         failures.append("capacity overflow did not raise")
         n_fail += 1
     if timer.count() != timer.capacity():
         failures.append("capacity bookkeeping wrong after overflow")
         n_fail += 1
-    _ = cap_err
 
     # stop() without start() raises.
     var nostart_ok = False
