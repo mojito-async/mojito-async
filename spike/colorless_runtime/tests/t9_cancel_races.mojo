@@ -46,12 +46,11 @@ def expect(cond: Bool, what: String) raises:
 
 
 
-def raises_cancellation(flag: CancelFlag) raises:
-    """checkpoint() must raise when the flag observes cancellation."""
+def raises_cancellation(fp: UnsafePointer[CancelFlag, MutAnyOrigin]) raises:
+    """Checkpoint() must raise when the flag observes cancellation."""
     var raised = False
-    var f = flag
     try:
-        f.checkpoint()
+        fp[].checkpoint()
     except Error:
         raised = True
     expect(raised, "checkpoint() did not raise on requested flag")
@@ -89,10 +88,10 @@ def main() raises:
     # ------------------------------------------------------------------
     var obs2 = make_cancel_flag()
     obs2.request()
-    raises_cancellation(obs2)
+    raises_cancellation(UnsafePointer[CancelFlag, MutAnyOrigin](to=obs2))
     expect(obs2.observed(), "raising checkpoint stamps the observation")
     # Observation is sticky: a second checkpoint still raises.
-    raises_cancellation(obs2)
+    raises_cancellation(UnsafePointer[CancelFlag, MutAnyOrigin](to=obs2))
 
     # ------------------------------------------------------------------
     # 5. reset(): allowed BEFORE any observation; forbidden AFTER.
@@ -108,7 +107,7 @@ def main() raises:
 
     var rst2 = make_cancel_flag()
     rst2.request()
-    rst2.checkpoint()  # observes -> raises
+    raises_cancellation(UnsafePointer[CancelFlag, MutAnyOrigin](to=rst2))
     var reset_raised = False
     try:
         rst2.reset()
@@ -127,7 +126,7 @@ def main() raises:
     parent.request()
     expect(child.is_requested(), "child observes requested parent")
     expect(not parent.observed(), "child observation is stamped on the CHILD")
-    raises_cancellation(child)
+    raises_cancellation(UnsafePointer[CancelFlag, MutAnyOrigin](to=child))
     expect(child.observed(), "child stamped its own observation")
 
     # Grandchild chains transitively.
@@ -180,15 +179,17 @@ def main() raises:
     expect(dwc.slept(), "pipeline did sleep before the wakes")
     expect(dwc.wake_attempts() == 2, "two wake attempts were made")
     expect(dwc.wakes_accepted() == 1, "generation guard rejected the second")
-
-    # Same guard across boundaries: COMMIT wake + WAKE-boundary wake.
+    # The guard is shared by every delivery path: mixing WAKE and SET_READY
+    # inside one boundary still yields exactly one accepted edge.
     var dw2 = make_hook_script()
     script_add(dw2, HookPoint.COMMIT, HookAction.WAKE)
-    script_add(dw2, HookPoint.WAKE, HookAction.WAKE)
+    script_add(dw2, HookPoint.COMMIT, HookAction.SET_READY)
+    script_add(dw2, HookPoint.COMMIT, HookAction.WAKE)
     var dwc2 = RaceContext(make_cancel_flag())
     run_park_pipeline(dwc2, dw2)
-    expect(dwc2.wake_attempts() == 2, "cross-boundary attempts counted")
-    expect(dwc2.wakes_accepted() == 1, "cross-boundary duplicate rejected")
+    expect(dwc2.wake_attempts() == 3, "every delivery counted as attempt")
+    expect(dwc2.wakes_accepted() == 1, "guard accepted only the first edge")
+    expect(dwc2.winners.exactly_one_winner(), "still exactly one winner")
 
     # ------------------------------------------------------------------
     # 10. Cancel-vs-ready race: BOTH sides fire inside one pipeline ->
