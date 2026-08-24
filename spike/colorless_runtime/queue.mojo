@@ -8,24 +8,21 @@
 # std.collections.Deque gives us an allocation-free popleft() on a ring
 # buffer, with amortized copy-free growth on push.
 #
-# Dup-enqueue protection: push(t) raises if an element equal to t is already
-# queued. The guard is a linear O(n) contains() scan over the live elements —
-# documented as spike-appropriate (a correct, boring guard for a small
-# runnable/scheduling queue; O(1) dedup needs a hash structure that a spike
-# does not justify). pop() raises on an empty queue; clear() drops the queue
-# and leaves it reusable (a subsequent pop re-raises).
+# Dup-enqueue protection: REVIEW-REMOVED — value-equality scanning cannot
+# express task-identity enqueue-once (A0.6 WAKE); identity dedup belongs to
+# the scheduler/Event generation claim (A0.7). FifoQueue is a payload-neutral
+# FIFO (Movable only). pop() raises on an empty queue; clear() drains and
+# leaves the queue reusable (subsequent pop re-raises); drained capacity is
+# retained (high-water mark) — deliberate for the spike, noted for A0.10.
 #
-# Type parameters (b2-callable, monotone-increasing):
-#   Movable             - Deque stores its elements; pop transfers one out.
-#   ImplicitlyDeletable - Deque droppped on clear/scope exit.
-#   Equatable           - the dup-enqueue == scan.
-#   ImplicitlyCopyable  - the contains() probe compares by value.
-# SizedRaising         - enables the builtin len().
+#
+# ImplicitlyCopyable is required only because b2 `def` parameters are
+# passed by value (copy) at the call boundary; the push/pop storage path
+# itself is move-based (Deque append moves, popleft moves out). No element
+# is ever compared or copied inside the queue.
 from std.collections import Deque
 
-struct FifoQueue[
-    T: Movable & ImplicitlyDeletable & Equatable & ImplicitlyCopyable
-](SizedRaising):
+struct FifoQueue[T: Movable & ImplicitlyDeletable & ImplicitlyCopyable](Sized):
     var data: Deque[Self.T]
 
     def __init__(out self):
@@ -37,19 +34,7 @@ struct FifoQueue[
     def is_empty(self) -> Bool:
         return len(self.data) == 0
 
-    # Linear dup-enqueue guard (spike-appropriate; see module docstring).
-    def _contains(self, t: Self.T) -> Bool:
-        var n = len(self.data)
-        var i = 0
-        while i < n:
-            if self.data[i] == t:
-                return True
-            i += 1
-        return False
-
-    def push(mut self, t: Self.T) raises:
-        if self._contains(t):
-            raise Error("FifoQueue: duplicate enqueue rejected (element already queued)")
+    def push(mut self, t: Self.T):
         self.data.append(t)
 
     def pop(mut self) raises -> Self.T:

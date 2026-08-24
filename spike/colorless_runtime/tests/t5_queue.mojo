@@ -2,8 +2,8 @@
 #
 # Spec §100 A0.5: struct FifoQueue[T] with push/pop/len/is_empty/clear on a
 # single worker (NO lock-free structures, NO work stealing, NO scheduler).
-# Dup-enqueue protection raises; the guard is a linear O(n) contains scan
-# (documented as spike-appropriate).
+# The queue is payload-neutral (review fold): equal values enqueue freely;
+# identity enqueue-once belongs to the scheduler/Event claim (A0.6/A0.7).
 #
 # This file is TDD-RED first (compile/run reflects an absent queue.mojo),
 # then green once queue.mojo lands. Pure `mojo run`, no dylib.
@@ -60,29 +60,24 @@ def main() raises:
         failures.append("len/is_empty wrong")
         n_fail += 1
 
-    # ---- clear -------------------------------------------------------
-    q2.clear()
-    var clear_ok = q2.is_empty() and len(q2) == 0
-    if not clear_ok:
-        failures.append("clear left elements")
-        n_fail += 1
-
-    # ---- dup-enqueue raises (linear contains guard) ------------------
+    # ---- dup values queue fine (queue is payload-neutral; identity
+    # ---- enqueue-once belongs to the scheduler/Event claim, A0.6/A0.7)
     var qd = FifoQueue[Int]()
     qd.push(7)
-    var dup_ok = False
-    try:
-        qd.push(7)
-    except:
-        dup_ok = True
-    # Distinct values still queue fine.
-    qd.push(8)
-    var distinct_ok = len(qd) == 2
+    qd.push(7)
+    var dup_ok = len(qd) == 2
+    qd.pop()
+    var distinct_ok = len(qd) == 1
     if not dup_ok:
-        failures.append("duplicate enqueue did not raise")
+        failures.append("equal values did not both queue")
         n_fail += 1
     if not distinct_ok:
-        failures.append("distinct enqueue after dup-check failed")
+        failures.append("pop after equal-value push wrong")
+        n_fail += 1
+    # Re-enqueue after pop is legal (drained element reusable).
+    qd.push(7)
+    if len(qd) != 2:
+        failures.append("re-enqueue after pop failed")
         n_fail += 1
 
     # ---- struct elements round trip -----------------------------------
@@ -98,16 +93,18 @@ def main() raises:
         failures.append("struct element order corrupted")
         n_fail += 1
 
-    # ---- struct dup-enqueue raises --------------------------------------
-    var qmd = FifoQueue[Item]()
-    qmd.push(Item(9, 9))
-    var struct_dup = False
-    try:
-        qmd.push(Item(9, 9))
-    except:
-        struct_dup = True
-    if not struct_dup:
-        failures.append("struct dup-enqueue did not raise")
+    # ---- interleaved push/pop wrap-around ------------------------------
+    var qw = FifoQueue[Item]()
+    for i in range(64):
+        qw.push(Item(i, i))
+    var wrap_ok = True
+    for i in range(200000):
+        var v = qw.pop()
+        if v.a != i:
+            wrap_ok = False
+        qw.push(Item(i + 64, 0))
+    if not wrap_ok:
+        failures.append("interleaved push/pop wrap corrupted order")
         n_fail += 1
 
     # ---- 100k push/pop stress of small structs ----------------------------
