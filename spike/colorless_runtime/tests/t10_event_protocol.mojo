@@ -45,7 +45,7 @@
 #
 # Pure Mojo: `mojo run -I spike/colorless_runtime` with no dylib.
 
-from event import ParkOutcome, SpikeTcb
+from event import Event, ParkOutcome, SpikeTcb
 from event_scenarios import (
     scn_cancel_only,
     scn_commit_window_early_wake,
@@ -224,5 +224,16 @@ def main() raises:
     expect(not sK.slept, "cancelled before sleeping")
     expect(sK.state == SpikeTcb.RUNNING, "still RUNNING")
     expect(sK.enqueue_len == 0, "no enqueue on the cancel path")
+    # ------------------------------------------------------------------
+    # 11. Diagnostic ring overflow: lossy drop-oldest, WAKE never fails.
+    # ------------------------------------------------------------------
+    var evR = Event()
+    var g = 100
+    while g < 112:
+        evR._log_enqueue(g)
+        g += 1
+    expect(evR._log_n == 8, "ring capped at LOG_CAPACITY")
+    expect(evR._log_dropped == 4, "4 oldest entries dropped")
+    expect(evR.enqueued_gen(7) == 111, "newest entry retained at tail")
 
     print("T10 event park/wake protocol: PASS")
