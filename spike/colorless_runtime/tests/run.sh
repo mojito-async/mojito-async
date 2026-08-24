@@ -41,11 +41,17 @@ CC=${CC:-cc}
 
 MOJO_TESTS=""
 if [ -d "$SCRIPT_DIR" ]; then
-    MOJO_TESTS=$(ls "$SCRIPT_DIR"/t*_*.mojo 2>/dev/null | sort)
+    # _aot.mojo drivers are excluded here; they are built+run in the AOT loop
+    # below (the b2 JIT cannot lower their imports -- modular/modular#6971).
+    MOJO_TESTS=$(ls "$SCRIPT_DIR"/t*_*.mojo 2>/dev/null | grep -v "_aot\.mojo$" | sort)
 fi
 C_TESTS=$(ls "$SCRIPT_DIR"/t*_*_main.c 2>/dev/null || true)
+# AOT drivers: t*_aot.mojo are `mojo build`-compiled then executed.  Needed
+# when a driver imports a module whose extern calls crash the b2 JIT
+# (modular/modular#6971) but work fine AOT.
+AOT_TESTS=$(ls "$SCRIPT_DIR"/t*_aot.mojo 2>/dev/null || true)
 
-if [ -z "$MOJO_TESTS" ] && [ -z "$C_TESTS" ]; then
+if [ -z "$MOJO_TESTS" ] && [ -z "$C_TESTS" ] && [ -z "$AOT_TESTS" ]; then
     echo "ERROR: no test drivers under $SCRIPT_DIR (no t*_*.mojo, no tN_*_main.c)"
     exit 2
 fi
@@ -84,6 +90,35 @@ for t in $MOJO_TESTS; do
     else
         row="$name FAIL (exit $st; no PASS/RED verdict)"
         failures=$((failures + 1))
+    fi
+    matrix="$matrix$row
+"
+    echo "== $name"
+    printf '%s\n' "$out" | tail -n 6 | sed 's/^/   | /'
+done
+
+# --- AOT mojo drivers -------------------------------------------------------
+mkdir -p "$BUILD_DIR" || true
+for t in $AOT_TESTS; do
+    name=$(basename "$t" .mojo)
+    bin="$BUILD_DIR/$name"
+    if ! "$MOJO" build "$t" -o "$bin" \
+        -I "$SPIKE_DIR" -I "$BINDING_DIR" \
+        -Xlinker "$DYLIB" >"$BUILD_DIR/$name.build.log" 2>&1; then
+        row="$name FAIL (AOT build error)"
+        failures=$((failures + 1))
+    else
+        out=$("$bin" 2>&1)
+        st=$?
+        if [ "$st" -eq 0 ] && printf '%s' "$out" | grep -q "PASS"; then
+            row="$name PASS"
+        elif printf '%s' "$out" | grep -q "RED"; then
+            row="$name RED (known-red, TDD)"
+            reds=$((reds + 1))
+        else
+            row="$name FAIL (exit $st; no PASS/RED verdict)"
+            failures=$((failures + 1))
+        fi
     fi
     matrix="$matrix$row
 "
