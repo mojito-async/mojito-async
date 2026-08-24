@@ -1,5 +1,9 @@
 # A0.1 — vendored mojito-sys substrate + contract verification (issue #10)
 
+Suite entry point (handoff to A0.2): `precommit/run-suite.sh` (owned by
+A0.2) SHALL invoke `spike/colorless_runtime/tests/run.sh` when present;
+run.sh may call this lane's `build.sh` to produce the dylib first.
+
 Lane A0.1 of the A0 spike: vendors the **frozen** mojito-sys S0 substrate
 (byte-identical, SHA-pinned) and proves the C-level contract it is built
 on. Everything here is self-contained; it does NOT touch the repo-root
@@ -41,7 +45,7 @@ cc -O2 -g -Wall -Wextra -I vendor/mojito-sys/include \
    -c vendor/mojito-sys/ms_ctx.c -o build/ms_ctx.o
 cc -I vendor/mojito-sys/include -c vendor/mojito-sys/aarch64_switch.S \
    -o build/aarch64_switch.o
-cc -dynamiclib -o ../../../libmojito_spike.dylib \
+cc -dynamiclib -o ../../libmojito_spike.dylib \
    build/native_stack.o build/ms_ctx.o build/aarch64_switch.o
 ```
 

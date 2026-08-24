@@ -78,14 +78,11 @@ if [ "${1:-}" = "build" ]; then
     exit 0
 fi
 
-echo ""
-echo "== contract_verify (C-level, no dylib)"
-$CC $CFLAGS -I"$VENDOR/include" \
+if $CC $CFLAGS -I"$VENDOR/include" \
     -DAARCH64_SWITCH_S="\"$VENDOR/aarch64_switch.S\"" \
     "$TESTS/contract_verify.c" \
     "$VENDOR/native_stack.c" "$VENDOR/ms_ctx.c" "$VENDOR/aarch64_switch.S" \
-    -o "$BUILD/contract_verify" > "$BUILD/verify.log" 2>&1
-if [ -f "$BUILD/contract_verify" ]; then
+    -o "$BUILD/contract_verify" > "$BUILD/verify.log" 2>&1; then
     out=$("$BUILD/contract_verify" 2>&1)
     st=$?
     report contract_verify "$st" "$(printf '%s\n' "$out" | tail -n 1)"
@@ -93,6 +90,21 @@ if [ -f "$BUILD/contract_verify" ]; then
 else
     report contract_verify 1 "compilation failed; see build/verify.log"
     printf '%s\n' "$(cat "$BUILD/verify.log" 2>/dev/null)" | tail -n 8 | sed 's/^/    | /'
+fi
+
+echo ""
+echo "== sentinel probe (ms_ctx_make/ms_ctx_switch register preservation)"
+if $CC $CFLAGS -I"$VENDOR/include" -DMS_CTX_SENTINEL_PROBE -DMS_CTX_SENTINEL_PROBE_MAIN \
+        "$VENDOR/ms_ctx.c" "$VENDOR/aarch64_switch.S" \
+        -o "$BUILD/sentinel_probe" > "$BUILD/sentinel.log" 2>&1; then
+    out=$("$BUILD/sentinel_probe" 2>&1)
+    st=$?
+    if [ "$st" -eq 0 ] && printf '%s' "$out" | grep -q "ALL SENTINELS PRESERVED"; then
+        report sentinel_probe 0
+    else
+        report sentinel_probe 1 "$(printf '%s\n' "$out" | tail -n 1)"
+    fi
+    printf '%s\n' "$out" | tail -n 6 | sed 's/^/    | /'
 fi
 
 echo ""
