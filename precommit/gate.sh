@@ -43,7 +43,7 @@ if [ -n "$blocked" ]; then
 fi
 
 conflicts=$(git grep --cached -n -E '^(<<<<<<< |>>>>>>> )' -- \
-    '*.mojo' '*.c' '*.S' '*.h' '*.sh' '*.md' 2>/dev/null || true)
+    '*.mojo' '*.c' '*.S' '*.h' '*.sh' '*.md' '.gitignore' '*.yml' '*.yaml' '*.json' '*.rb' '*.toml' 2>/dev/null || true)
 if [ -n "$conflicts" ]; then
     say "Tier 0 FAIL: unresolved conflict markers in staged content:"
     printf '%s\n' "$conflicts" | sed 's/^/  | /'
