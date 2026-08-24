@@ -1,0 +1,4 @@
+#!/bin/sh
+# mojito pre-commit hook — installed with:
+#   git config core.hooksPath .githooks     (or: precommit/install-hooks.sh)
+exec "$(git rev-parse --show-toplevel)/precommit/gate.sh"
