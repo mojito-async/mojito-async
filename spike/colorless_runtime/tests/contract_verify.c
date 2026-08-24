@@ -22,12 +22,14 @@
  *      -o build/contract_verify
  *   ./build/contract_verify
  */
-
 #include "mojito_spike.h"
 
 #include <stddef.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
 
 /* ------------------------------------------------------------------ */
 /* Frozen v2 layout (aarch64_switch.S immediate offsets depend on it)  */
@@ -93,15 +95,24 @@ static void test_stack_alloc_layout(void) {
 }
 
 /* aarch64_switch.S `#if !__APPLE__` guard must exist verbatim in the
- * vendored source; read the file and require both lines. */
+ * vendored source; read the whole file and require both lines. */
 static void test_asm_guard(void) {
     FILE *f = fopen(AARCH64_SWITCH_S, "rb");
     if (f == NULL) {
         CHECK(0, "aarch64_switch.S readable at AARCH64_SWITCH_S");
         return;
     }
-    char buf[4096];
-    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    long len;
+    fseek(f, 0, SEEK_END);
+    len = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    char *buf = malloc((size_t)len + 1);
+    if (buf == NULL) {
+        fclose(f);
+        CHECK(0, "alloc for full aarch64_switch.S read");
+        return;
+    }
+    size_t n = fread(buf, 1, (size_t)len, f);
     fclose(f);
     buf[n] = '\0';
     CHECK(strstr(buf, "#if !defined(__APPLE__)") != NULL,
@@ -109,10 +120,42 @@ static void test_asm_guard(void) {
     CHECK(strstr(buf, "#error \"aarch64_switch.S targets Apple arm64 (Mach-O) only\"")
               != NULL,
           "aarch64_switch.S guard #error present");
-    CHECK(strstr(buf, "MS_CTX_FPS_OFF") != NULL,
-          "aarch64_switch.S pins fps offset (96)");
-    CHECK(strstr(buf, "MS_CTX_SP_OFF") != NULL,
-          "aarch64_switch.S pins sp offset (160)");
+    /* Pin the .set VALUES, not just the identifiers: a self-consistent
+     * edit moving MS_CTX_SP_OFF to 96 would otherwise pass every check
+     * while silently corrupting the saved sp. */
+    CHECK(strstr(buf, "MS_CTX_FPS_OFF, 96") != NULL,
+          "aarch64_switch.S pins fps offset to 96");
+    CHECK(strstr(buf, "MS_CTX_SP_OFF, 160") != NULL,
+          "aarch64_switch.S pins sp offset to 160");
+    free(buf);
+}
+
+/* The allocator maps [base, base+page) as PROT_NONE. Geometry checks
+ * alone cannot see protection (removing the guard page changes no
+ * returned value), so query the mapping directly — read-only, no
+ * allocation, macOS-arm64-only test. */
+static void test_stack_guard_protection(void) {
+    long ps = ms_page_size();
+    void *base = NULL, *top = NULL;
+    if (ms_stack_alloc((size_t)2 * (size_t)ps, &base, &top) != 0) {
+        CHECK(0, "guard probe: ms_stack_alloc succeeds");
+        return;
+    }
+    mach_vm_address_t addr = (mach_vm_address_t)(uintptr_t)base;
+    mach_vm_size_t size = 0;
+    vm_region_basic_info_data_64_t info;
+    mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
+    mach_port_t obj;
+    kern_return_t kr =
+        mach_vm_region(mach_task_self(), &addr, &size,
+                       VM_REGION_BASIC_INFO_64,
+                       (vm_region_info_t)&info, &count, &obj);
+    CHECK(kr == KERN_SUCCESS, "guard probe: mach_vm_region query on base");
+    if (kr == KERN_SUCCESS) {
+        CHECK((info.protection & (VM_PROT_READ | VM_PROT_WRITE)) == 0,
+              "guard page below base has no read/write protection");
+    }
+    ms_stack_free(base);
 }
 
 int main(void) {
@@ -120,6 +163,7 @@ int main(void) {
     test_page_size();
     test_stack_alloc_layout();
     test_asm_guard();
+    test_stack_guard_protection();
     printf("contract_verify: %d checks, %d failed\n",
            g_checks_total, g_checks_failed);
     return g_checks_failed == 0 ? 0 : 1;
