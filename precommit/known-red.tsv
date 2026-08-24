@@ -7,7 +7,3 @@
 # an unlisted failure blocks the commit.
 #
 # Active rows (each lane removes its row when its test goes green):
-suite	https://github.com/mojito-async/mojito-async/issues/11
-t2_worker_reuse_aot	https://github.com/mojito-async/mojito-async/issues/15
-t6_join_semantics_aot	https://github.com/mojito-async/mojito-async/issues/15
-t7_result_lifetime_aot	https://github.com/mojito-async/mojito-async/issues/15
