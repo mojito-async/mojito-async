@@ -253,3 +253,12 @@ struct TaskControlBlock[T: ResultValue](ImplicitlyCopyable, ImplicitlyDeletable)
         var out = self._result
         self._has_result = False
         return out
+
+# ---------------------------------------------------------------------------
+# Error predicates (decode the documented message prefixes)
+# ---------------------------------------------------------------------------
+
+def is_illegal_transition(e: Error) -> Bool:
+    """True when `e` is an IllegalTransitionError (message begins with the
+    stable "IllegalTransitionError:" prefix)."""
+    return "IllegalTransitionError:" in String(e)

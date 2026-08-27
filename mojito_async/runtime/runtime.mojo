@@ -68,6 +68,7 @@ struct Runtime:
     var _tasks_started: Int
     var _tasks_completed: Int
     var _enqueued: Int
+    var _skipped: Int
 
     def __init__(out self):
         self._ready = FifoQueue[TaskRecord]()
@@ -77,6 +78,7 @@ struct Runtime:
         self._tasks_started = 0
         self._tasks_completed = 0
         self._enqueued = 0
+        self._skipped = 0
 
     # --- root-task execution (A0-T1) ----------------------------------------
 
@@ -142,6 +144,14 @@ struct Runtime:
 
     def enqueued(self) -> Int:
         return self._enqueued
+    def note_skipped(mut self):
+        """Count a popped RUNNABLE record that was skipped (its TCB was not
+        RUNNABLE — stale duplicate) by the scheduler loop."""
+        self._skipped += 1
+
+    def skipped(self) -> Int:
+        """Number of stale/duplicate records the scheduler loop skipped."""
+        return self._skipped
 
     def scope_handle(self) -> Int:
         return self._scope

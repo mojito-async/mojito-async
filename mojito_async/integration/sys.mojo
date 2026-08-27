@@ -27,19 +27,6 @@ comptime BytePtr = UnsafePointer[Byte, MutAnyOrigin]
 # Concrete ResultValue slots (single-instantiation targets for the tests)
 # ---------------------------------------------------------------------------
 
-struct NilValue(ResultValue):
-    """Void stand-in for the root TCB's result slot (like spike `Nil`).
-
-    TaskControlBlock[T] requires T: ResultValue (copyable, deletable,
-    default-constructible); b2 has no unit type usable there, so the root
-    task's TCB carries NilValue and never marks a result."""
-
-    var _tag: Int
-
-    def __init__(out self):
-        self._tag = 0
-
-
 struct IntResult(ResultValue):
     """Concrete Int result slot for unit-style tasks."""
 

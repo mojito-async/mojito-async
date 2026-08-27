@@ -9,6 +9,36 @@
 # semantics in place.
 
 
+struct Duration:
+    """A monotonic duration: UInt64 ticks in nanoseconds (the unit the A1.4
+    timer lane will park on).  Provides from_millis/to_millis consistent with
+    the existing Deadline (which is expressed in milliseconds)."""
+
+    var _ticks: UInt64
+
+    def __init__(out self):
+        self._ticks = 0
+
+    def __init__(out self, ticks: UInt64):
+        self._ticks = ticks
+
+    def ticks(self) -> UInt64:
+        return self._ticks
+
+    def to_millis(self) -> Int:
+        return Int(self._ticks // 1000000)
+
+    def is_zero(self) -> Bool:
+        return self._ticks == 0
+
+
+
+# Module-level factory (b2 has no static methods): milliseconds -> Duration
+# (1 ms = 1_000_000 ns ticks).
+def from_millis(ms: Int) -> Duration:
+    return Duration(UInt64(ms) * 1000000)
+
+
 struct Deadline:
     """A monotonic deadline expressed in milliseconds."""
 

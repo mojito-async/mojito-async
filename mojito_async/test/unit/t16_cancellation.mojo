@@ -17,6 +17,7 @@
 from mojito_async.cancellation import (
     CancelFlag,
     CancellationToken,
+    is_cancellation,
     make_cancel_flag,
     make_child_flag,
 )
@@ -45,9 +46,8 @@ def main() raises:
         token.checkpoint()
     except e:
         raised = True
-        var m = String(e)
-        if "CancellationError" not in m:
-            red("checkpoint error lacks CancellationError tag: " + m)
+        if not is_cancellation(e):
+            red("is_cancellation did not decode the checkpoint error")
     if not raised:
         red("checkpoint did not raise when requested")
     if not token.observed():
