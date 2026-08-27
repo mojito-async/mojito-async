@@ -163,3 +163,12 @@ def make_child_flag(
     var child = CancelFlag()
     child.set_parent(parent)
     return child
+
+# ---------------------------------------------------------------------------
+# Error predicates (decode the documented message prefixes)
+# ---------------------------------------------------------------------------
+
+def is_cancellation(e: Error) -> Bool:
+    """True when `e` is a CancellationError raised by a checkpoint (message
+    begins with the stable "CancellationError:" prefix)."""
+    return "CancellationError:" in String(e)

@@ -6,7 +6,7 @@ set -u
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 REPO_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/../.." && pwd)
 MOJO=${MOJO:-mojo}
-TESTS=$(ls "$SCRIPT_DIR"/unit/t1[1-6]_*.mojo 2>/dev/null || true)
+TESTS=$(ls "$SCRIPT_DIR"/unit/t1[1-8]_*.mojo 2>/dev/null || true)
 [ -z "$TESTS" ] && echo "ERROR: no A1.1 tests under $SCRIPT_DIR/unit" && exit 2
 command -v "$MOJO" >/dev/null 2>&1 || { echo "ERROR: mojo not found"; exit 2; }
 failures=0; matrix=""

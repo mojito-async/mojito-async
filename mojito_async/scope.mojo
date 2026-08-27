@@ -204,37 +204,35 @@ struct Scope[R: ResultValue, H: CancelHook](Movable, ImplicitlyDeletable):
         whose outcome is settled (consume-once take_result), then closes the
         scope.
 
-        Refuses (ChildrenStillLive) while a genuinely-live child remains: one
-        that has not yet reached COMPLETED, or one that is still referenced by
-        an open direct subscope.  So "close() refuses with live children"
-        holds (spec A0-T13), while settled children are drained (joined)
-        rather than required pre-drained.  Double-close raises.  Records the
-        close into the shared order log (when participating).
+        TWO-PHASE (validate-then-consume):
+          Phase 1 - VALIDATE: every registered child must be COMPLETED and no
+          open direct subscope may remain; on ANY violation raise
+          ChildrenStillLive BEFORE consuming anything (nothing is joined, no
+          result is taken, the scope stays open -- a caller can fix the
+          violation and retry).
+          Phase 2 - CONSUME: take_result on each settled child (the scope is
+          the final joiner for children never individually reaped), then mark
+          closed and drop all child references.
 
-        Consumption discipline: a registered child that completed is consumed
-        HERE via its embedded TCB result slot (the scope is the final joiner
-        for children never individually reaped); the corresponding parent
-        JoinHandle must not ALSO take_result (consume-once is enforced by the
-        TCB; a second take raises).
+        Double-close raises.  Records the close into the shared order log
+        (when participating).  `rt` is RESERVED for the engine-driven join of
+        a later lane (when close() may drive pending children to completion);
+        A1.1 validates instead of driving, so it is unused here.
         """
+        # ---- Phase 1: validate (no consumption on failure) -----------------
         if not self._open:
             var err = ChildrenStillLive(
                 "DoubleClose: double close of scope " + String(self._handle)
             )
             raise Error(err.message)
-        # JOIN step: consume settled children; live (unfinished) refuses.
         for i in range(len(self._child_ptrs)):
-            var c = self._child_ptrs[i]
-            if not c[].is_completed():
+            if not self._child_ptrs[i][].is_completed():
                 var err = ChildrenStillLive(
                     "ChildrenStillLive: scope "
                     + String(self._handle)
                     + " exit refused with an unfinished live child"
                 )
                 raise Error(err.message)
-            # Consume-once: if a result was produced and not yet taken, join.
-            if c[].has_result_pending():
-                _ = c[].take_result()
         if self._open_subscopes != 0:
             var err = ChildrenStillLive(
                 "ChildrenStillLive: scope "
@@ -244,6 +242,11 @@ struct Scope[R: ResultValue, H: CancelHook](Movable, ImplicitlyDeletable):
                 + " open subscopes"
             )
             raise Error(err.message)
+        # ---- Phase 2: consume settled results (join), then close -----------
+        for i in range(len(self._child_ptrs)):
+            var c = self._child_ptrs[i]
+            if c[].has_result_pending():
+                _ = c[].take_result()
         self._open = False
         self.drop_children()
         if self._order_log:
@@ -299,3 +302,12 @@ def make_nested_scope[R: ResultValue, H: CancelHook](
     var with_parent = Optional[UnsafePointer[Scope[R, H], MutAnyOrigin]](parent)
     var s = Scope[R, H](hook, handle, with_log, with_parent)
     return s^
+
+# ---------------------------------------------------------------------------
+# Error predicates (decode the documented message prefixes)
+# ---------------------------------------------------------------------------
+
+def is_children_still_live(e: Error) -> Bool:
+    """True when `e` is a ChildrenStillLive refusal (message begins with the
+    stable "ChildrenStillLive:" prefix)."""
+    return "ChildrenStillLive:" in String(e)
