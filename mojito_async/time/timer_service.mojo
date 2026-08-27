@@ -16,7 +16,7 @@
 # Extern-free; the wake path allocates nothing beyond the heap's owned
 # storage: touching exactly the embedded TCBs + the runnable queue.
 from mojito_async.integration.sys import BytePtr
-from mojito_async.runtime.runtime import Runtime
+from mojito_async.runtime.runtime import Nil, Runtime
 from mojito_async.runtime.scheduler import resume_current, scheduler_loop
 from mojito_async.runtime.task_control_block import ResultValue, TaskControlBlock
 from mojito_async.task import JoinHandle
@@ -65,5 +65,5 @@ def drive_step[
     waiters woken.  The driver/virtual-clock owner advances `now` between
     steps (spec §76.5 virtual time)."""
     var served = scheduler_loop(rt, dispatcher, ud)
-    var woke = service_timers(rt, heap, now)
+    var woke = service_timers[R](rt, heap, now)
     return served + woke

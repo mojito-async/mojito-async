@@ -31,7 +31,7 @@ from mojito_async.time.clock import MonotonicClock
 from mojito_async.time.deadline import Duration
 from mojito_async.time.sleep import sleep, sleep_current
 from mojito_async.time.timer_heap import TimerHeap
-from mojito_async.time.timer_service import service_timers
+from mojito_async.time.timer_service import drive_step, service_timers
 
 
 def red(what: String) raises -> None:
@@ -188,8 +188,10 @@ def main() raises:
     if not heap.is_empty():
         red("expired timer left in heap")
 
-    # ---- drive 2: A resumes and completes ----------------------------------
-    var served2 = scheduler_loop(rt, dispatch, ud)
+    # ---- drive 2: A resumes and completes (via the composed drive_step) ----
+    var served2 = drive_step[type_of(dispatch), IntResult](
+        rt, dispatch, ud, heap, sc.clock.now()
+    )
     if served2 != 1:
         red("second drive served " + String(served2) + " records, expected 1")
     if not h_a.is_completed():
