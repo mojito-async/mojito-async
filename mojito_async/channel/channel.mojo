@@ -1,39 +1,40 @@
 # mojito_async/channel/channel.mojo
 #
 # A1.3 channel (issue #35) — bounded Channel[T]: ring buffer + sender/receiver
-# wait queues + closed flags (spec §39-41).
+# wait queues + closed flags (spec §39-41), Sender/Receiver split, close
+# semantics (spec §41), fast paths §40.1 / slow paths §40.2.
 #
-# TDD RED SCAFFOLD: the full public surface is present and typed exactly as
-# the implementation commit will ship it; every operation raises a precise
-# "not implemented" error so the acceptance suites compile, run, and print
-# RED against this scaffold.  The implementation commit replaces the bodies
-# (never the signatures).
-#
-# Design notes (b2 — Mojo 1.0.0b2):
-#   - `def`-only, module factories (no static methods).
-#   - The Channel struct is PURE DATA: ring Deque[T], sender/receiver wait
-#     queues, a deferred wake list, and the closed flags/slot counts.  It
-#     NEVER reconstructs task handles from raw addresses — the b2 compiler
+# Mojo 1.0.0b2 design notes (verified by the lane probes):
+#   - `def`-only, module factories (no static methods), no hidden allocation
+#     on the fast paths (the ring and the wait queues are caller-owned
+#     Deques; parks allocate nothing).
+#   - The Channel struct is PURE DATA: ring Deque[T], FIFO sender/receiver
+#     wait queues (WaitRecord = tcb_addr + task_id), a deferred wake list
+#     (_to_wake), the closed flags and the live slot counts.  It NEVER
+#     reconstructs task handles from raw addresses — the b2 compiler
 #     miscompiles `unsafe_from_address` reconstruction inside generic struct
-#     methods (verified by probe).  Parks use the canonical A1.1
-#     `_suspend_current(mut rt, h)` on the PASSED-IN handle; wakes are
-#     DEFERRED: a signal moves a WaitRecord (tcb_addr + task_id) from a wait
-#     queue into `_to_wake`, and the embedding DRIVER (a plain, concrete
-#     function that knows the task's result type) drains `_to_wake` and
-#     resumes each waiter via `resume_current` (the canonical wake path,
-#     issue #39 single-source park/wake).
-#   - send()/recv() are one-shot colorless operations: attempt now; if the
-#     channel forces a wait, register the waiter and park ONCE
-#     (`_suspend_current`, no OS-thread block).  On resume the embedding
-#     driver re-enters the task, which re-invokes send()/recv() with the same
-#     pending item (there are no fibers in A1.1 — suspension happens between
+#     methods (probes 7/10), so no transition is performed inside a method.
+#     Parks use the canonical A1.1 `_suspend_current(mut rt, h)` on the
+#     PASSED-IN JoinHandle of the CURRENT task; wakes are DEFERRED: a signal
+#     moves a WaitRecord into `_to_wake`, and the embedding DRIVER (a plain
+#     concrete function that knows the task's result type) drains `_to_wake`
+#     and resumes each waiter via `resume_current` — the canonical wake path
+#     (single source, issue #39).
+#   - send/recv are one-shot colorless operations: attempt now; if the
+#     channel forces a wait, register the waiter and park ONCE.  On resume
+#     the driver re-enters the task, which re-invokes send()/recv() with the
+#     same pending item (A1.1 has no fibers — suspension happens between
 #     dispatcher slices).  register_* dedupe by task_id.
-#   - Close semantics (spec §41): closing the LAST sender marks the send side
-#     closed and moves EVERY parked receiver into `_to_wake` (they drain the
-#     buffer, then recv() returns None); closing the LAST receiver marks the
-#     receive side closed, drops buffered values, moves every parked sender
-#     into `_to_wake` (their send() then raises "ChannelError: send on closed
-#     channel").
+#   - Algorithm (spec §40): producers buffer into the ring when it is not
+#     full and, per buffered item, wake the OLDEST parked receiver (FIFO);
+#     consumers pop the ring and, per item, wake the OLDEST parked sender.
+#     A task parks only when the ring blocks it.  Close (spec §41): closing
+#     the LAST sender marks the send side closed and moves EVERY parked
+#     receiver into `_to_wake` — they drain the remaining values, then recv()
+#     returns None (closed observable).  Closing the LAST receiver marks the
+#     receive side closed, drops the buffered values, and moves EVERY parked
+#     sender into `_to_wake` — their resumed send() raises "ChannelError:
+#     send on closed channel".
 from std.collections import Deque
 from mojito_async.runtime.runtime import Runtime
 from mojito_async.runtime.scheduler import _suspend_current
@@ -82,7 +83,10 @@ struct Channel[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable](
       _senders / _receivers — live slot counts (close when the last drops).
 
     Single worker, fully deterministic: no mutex, no atomics; the wait
-    queues and buffer are only mutated by the one running worker slice.
+    queues and buffer are only mutated by the one running worker slice.  A
+    task parks ONLY via the canonical `_suspend_current` on its own handle;
+    every wake is a deferred WaitRecord the driver executes via
+    `resume_current` (no transition inside this struct).
     """
 
     var _items: Deque[Self.T]
@@ -149,12 +153,15 @@ struct Channel[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable](
     # --- handle split --------------------------------------------------------
 
     def sender(mut self) raises -> Sender[Self.T]:
+        """Split a new Sender handle.  Refuses once the send side is closed."""
         if self._send_closed:
             raise Error("ChannelError: send side already closed; cannot split a sender")
         self._senders += 1
         return Sender[Self.T](UnsafePointer[Channel[Self.T], MutAnyOrigin](to=self))
 
     def receiver(mut self) raises -> Receiver[Self.T]:
+        """Split a new Receiver handle.  Refuses once the receive side is
+        closed."""
         if self._recv_closed:
             raise Error("ChannelError: receive side already closed; cannot split a receiver")
         self._receivers += 1
@@ -163,43 +170,150 @@ struct Channel[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable](
     # --- non-blocking core (spec §40.1 fast paths) ----------------------------
 
     def try_send(mut self, item: Self.T) raises -> Bool:
-        raise Error("ChannelError: try_send not implemented yet (A1.3 TDD red)")
+        """Non-blocking send (spec §40.1): buffers when the ring has room;
+        returns False when the ring is full OR the channel is closed (the
+        item is NOT consumed).  Never parks, never registers a waiter."""
+        if self._recv_closed or self._send_closed:
+            return False
+        if self.is_full():
+            return False
+        self._items.append(item)
+        if len(self._recv_waiters) > 0:
+            var w = self._recv_waiters[0]
+            _ = self._recv_waiters.popleft()
+            self._to_wake.append(w)
+        return True
 
     def try_recv(mut self) raises -> Optional[Self.T]:
-        raise Error("ChannelError: try_recv not implemented yet (A1.3 TDD red)")
+        """Non-blocking receive (spec §40.1): moves the OLDEST buffered value
+        out and wakes the OLDEST parked sender (deferred); returns None when
+        the ring is empty.  Never parks.  On a closed channel it keeps
+        draining buffered values (spec §41) — only emptiness yields None."""
+        if len(self._items) > 0:
+            var v = self._items.popleft()
+            if len(self._send_waiters) > 0:
+                var w = self._send_waiters[0]
+                _ = self._send_waiters.popleft()
+                self._to_wake.append(w)
+            return Optional[Self.T](v)
+        return Optional[Self.T]()
 
     # --- blocking slow paths (spec §40.2) -------------------------------------
 
     def send[R: ResultValue](
         mut self, mut rt: Runtime, h: JoinHandle[R], item: Self.T
     ) raises:
-        raise Error("ChannelError: send not implemented yet (A1.3 TDD red)")
+        """One-shot send of the current task (issued by a Sender).
+
+        Fast path: ring not full — buffer the item, and if a receiver is
+        parked (it parked on an empty ring) wake the OLDEST one (deferred):
+        the item is delivered through the ring and the waiter consumes it on
+        re-entry.  Slow path: ring full — register this task as a sender
+        waiter (FIFO, deduped by id), then park via the canonical
+        `_suspend_current`.  On resume the driver re-enters the task with the
+        SAME pending item; if the channel closed meanwhile the re-entry
+        raises here.
+        """
+        if self._recv_closed or self._send_closed:
+            raise Error("ChannelError: send on closed channel")
+        if not self.is_full():
+            self._items.append(item)
+            if len(self._recv_waiters) > 0:
+                var w = self._recv_waiters[0]
+                _ = self._recv_waiters.popleft()
+                self._to_wake.append(w)
+            return
+        self.register_sender(h)
+        _suspend_current(rt, h)
 
     def recv[R: ResultValue](
         mut self, mut rt: Runtime, h: JoinHandle[R]
     ) raises -> Optional[Self.T]:
-        raise Error("ChannelError: recv not implemented yet (A1.3 TDD red)")
+        """One-shot receive of the current task (issued by a Receiver).
 
-    # --- waiter registration (dedupe by task id) ------------------------------
+        Fast path (§40.1): ring non-empty — move the OLDEST value out and
+        wake the OLDEST parked sender (deferred).  Closed-and-empty: return
+        None (close observable).  Slow path (§40.2): register this task as a
+        receiver waiter (FIFO, deduped by id) and park via the canonical
+        `_suspend_current`; on resume the driver re-enters and the fresh call
+        takes the fast path or observes close.
+        """
+        if len(self._items) > 0:
+            var v = self._items.popleft()
+            if len(self._send_waiters) > 0:
+                var w = self._send_waiters[0]
+                _ = self._send_waiters.popleft()
+                self._to_wake.append(w)
+            return Optional[Self.T](v)
+        if self._send_closed or self._recv_closed:
+            return Optional[Self.T]()
+        self.register_receiver(h)
+        _suspend_current(rt, h)
+        return Optional[Self.T]()
+
+    # --- waiter registration (FIFO, dedupe by task id) -------------------------
 
     def register_sender[R: ResultValue](mut self, h: JoinHandle[R]) raises:
-        raise Error("ChannelError: register_sender not implemented yet (A1.3 TDD red)")
+        for i in range(len(self._send_waiters)):
+            if self._send_waiters[i].task_id == h.id():
+                return  # already parked as a sender; never double-register
+        self._send_waiters.append(WaitRecord(Int(h.tcb()), h.id()))
 
     def register_receiver[R: ResultValue](mut self, h: JoinHandle[R]) raises:
-        raise Error("ChannelError: register_receiver not implemented yet (A1.3 TDD red)")
+        for i in range(len(self._recv_waiters)):
+            if self._recv_waiters[i].task_id == h.id():
+                return  # already parked as a receiver; never double-register
+        self._recv_waiters.append(WaitRecord(Int(h.tcb()), h.id()))
 
     # --- deferred wakes (driver drains these) ----------------------------------
 
     def pop_to_wake(mut self) raises -> WaitRecord:
-        raise Error("ChannelError: pop_to_wake not implemented yet (A1.3 TDD red)")
+        """Pop the oldest deferred wake.  Returns the (0,0) sentinel record
+        when the list is empty (Deque.pop on empty raises; a sentinel keeps
+        the driver drain total)."""
+        if len(self._to_wake) == 0:
+            return WaitRecord(0, 0)
+        var w = self._to_wake[0]
+        _ = self._to_wake.popleft()
+        return w
 
     # --- close slots (spec §41) ------------------------------------------------
 
     def close_sender_slot(mut self) raises:
-        raise Error("ChannelError: close_sender_slot not implemented yet (A1.3 TDD red)")
+        """One Sender dropped its slot.  When the LAST sender closes, the
+        send side closes and every parked receiver is moved to the deferred
+        wake list: they drain the remaining buffered values, then recv()
+        returns None.  Idempotent."""
+        if self._senders > 0:
+            self._senders -= 1
+        if self._senders != 0:
+            return
+        if self._send_closed:
+            return
+        self._send_closed = True
+        while len(self._recv_waiters) > 0:
+            var w = self._recv_waiters[0]
+            _ = self._recv_waiters.popleft()
+            self._to_wake.append(w)
 
     def close_receiver_slot(mut self) raises:
-        raise Error("ChannelError: close_receiver_slot not implemented yet (A1.3 TDD red)")
+        """One Receiver dropped its slot.  When the LAST receiver closes, the
+        receive side closes, the buffered values are dropped, and every
+        parked sender is moved to the deferred wake list: their resumed
+        send() raises "ChannelError: send on closed channel".  Idempotent."""
+        if self._receivers > 0:
+            self._receivers -= 1
+        if self._receivers != 0:
+            return
+        if self._recv_closed:
+            return
+        self._recv_closed = True
+        while len(self._items) > 0:
+            _ = self._items.popleft()
+        while len(self._send_waiters) > 0:
+            var w = self._send_waiters[0]
+            _ = self._send_waiters.popleft()
+            self._to_wake.append(w)
 
 
 # ---------------------------------------------------------------------------
@@ -212,7 +326,9 @@ struct Sender[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable](
     """Send half of a bounded channel (spec §39).  Single-owner BY CONVENTION
     (b2 handles are implicitly copyable): exactly one handle per slot calls
     close(); the channel's slot count tracks live senders so the send side
-    closes when the LAST sender closes (spec §41)."""
+    closes when the LAST sender closes (spec §41).  `_closed` latches the
+    handle-level close: after close(), this handle stops sending and its
+    second close() is a no-op."""
 
     var _chan: UnsafePointer[Channel[Self.T], MutAnyOrigin]
     var _closed: Bool
@@ -240,6 +356,9 @@ struct Sender[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable](
         self._chan[].send(rt, h, item)
 
     def close(mut self) raises:
+        """Drop this sender's slot.  When the LAST sender closes, the send
+        side closes and parked receivers are woken (they drain, then observe
+        close).  Idempotent per handle."""
         if self._closed:
             return
         self._closed = True
@@ -275,6 +394,9 @@ struct Receiver[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable](
         return self._chan[].recv(rt, h)
 
     def close(mut self) raises:
+        """Drop this receiver's slot.  When the LAST receiver closes, the
+        receive side closes, buffered values are dropped, and parked senders
+        are woken (their resumed send raises).  Idempotent per handle."""
         if self._closed:
             return
         self._closed = True
