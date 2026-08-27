@@ -54,7 +54,10 @@ comptime MODE_RECVPARK = Int(1)
 comptime MODE_CHAIN = Int(2)
 comptime MODE_PINGPONG = Int(3)
 
-# Scene buf slot layout (Int slots; event log owns slots [0, EVENTS)).
+# ~265 events: four slices per item — send, park, recv, park), so the two
+# regions can never collide.
+comptime EVENTS = Int(512)
+comptime EVENTS_BASE = Int(512)
 comptime S_N = Int(160)
 comptime S_P_ID = Int(168)
 comptime S_C_ID = Int(176)
@@ -66,13 +69,15 @@ comptime S_C_COUNT = Int(216)
 comptime S_MODE = Int(224)
 comptime S_M = Int(232)
 comptime S_C_TOTAL = Int(240)
-comptime EVENTS = Int(160)
+comptime S_C_TARGET = Int(248)
 
 
 struct Scene(ImplicitlyCopyable, ImplicitlyDeletable):
     var chan: UnsafePointer[Channel[Int], MutAnyOrigin]
     var tx: Sender[Int]
     var rx: Receiver[Int]
+    var p_tcb: UnsafePointer[TB, MutAnyOrigin]
+    var c_tcb: UnsafePointer[TB, MutAnyOrigin]
     var seq: UnsafePointer[Int, MutAnyOrigin]
     var n: UnsafePointer[Int, MutAnyOrigin]
     var p_id: UnsafePointer[Int, MutAnyOrigin]
@@ -85,11 +90,14 @@ struct Scene(ImplicitlyCopyable, ImplicitlyDeletable):
     var mode: UnsafePointer[Int, MutAnyOrigin]
     var M: UnsafePointer[Int, MutAnyOrigin]
     var c_total: UnsafePointer[Int, MutAnyOrigin]
+    var c_target: UnsafePointer[Int, MutAnyOrigin]
 
     def __init__(out self):
         self.chan = UnsafePointer[Channel[Int], MutAnyOrigin](unsafe_from_address=1)
         self.tx = Sender[Int](UnsafePointer[Channel[Int], MutAnyOrigin](unsafe_from_address=1))
         self.rx = Receiver[Int](UnsafePointer[Channel[Int], MutAnyOrigin](unsafe_from_address=1))
+        self.p_tcb = UnsafePointer[TB, MutAnyOrigin](unsafe_from_address=1)
+        self.c_tcb = UnsafePointer[TB, MutAnyOrigin](unsafe_from_address=1)
         self.seq = UnsafePointer[Int, MutAnyOrigin](unsafe_from_address=1)
         self.n = UnsafePointer[Int, MutAnyOrigin](unsafe_from_address=1)
         self.p_id = UnsafePointer[Int, MutAnyOrigin](unsafe_from_address=1)
@@ -102,11 +110,12 @@ struct Scene(ImplicitlyCopyable, ImplicitlyDeletable):
         self.mode = UnsafePointer[Int, MutAnyOrigin](unsafe_from_address=1)
         self.M = UnsafePointer[Int, MutAnyOrigin](unsafe_from_address=1)
         self.c_total = UnsafePointer[Int, MutAnyOrigin](unsafe_from_address=1)
+        self.c_target = UnsafePointer[Int, MutAnyOrigin](unsafe_from_address=1)
 
 
 def wire(buf: UnsafePointer[Int, MutAnyOrigin], sc: UnsafePointer[Scene, MutAnyOrigin]) raises:
     """Point the Scene's slots into the caller's buf."""
-    sc[].seq = UnsafePointer[Int, MutAnyOrigin](unsafe_from_address=Int(buf))
+    sc[].seq = UnsafePointer[Int, MutAnyOrigin](unsafe_from_address=Int(buf) + EVENTS_BASE * 8)
     sc[].n = UnsafePointer[Int, MutAnyOrigin](unsafe_from_address=Int(buf) + S_N * 8)
     sc[].p_id = UnsafePointer[Int, MutAnyOrigin](unsafe_from_address=Int(buf) + S_P_ID * 8)
     sc[].c_id = UnsafePointer[Int, MutAnyOrigin](unsafe_from_address=Int(buf) + S_C_ID * 8)
@@ -118,6 +127,7 @@ def wire(buf: UnsafePointer[Int, MutAnyOrigin], sc: UnsafePointer[Scene, MutAnyO
     sc[].mode = UnsafePointer[Int, MutAnyOrigin](unsafe_from_address=Int(buf) + S_MODE * 8)
     sc[].M = UnsafePointer[Int, MutAnyOrigin](unsafe_from_address=Int(buf) + S_M * 8)
     sc[].c_total = UnsafePointer[Int, MutAnyOrigin](unsafe_from_address=Int(buf) + S_C_TOTAL * 8)
+    sc[].c_target = UnsafePointer[Int, MutAnyOrigin](unsafe_from_address=Int(buf) + S_C_TARGET * 8)
     buf[S_N] = 0
     buf[S_P_PHASE] = 0
     buf[S_P_ITEM] = 1
@@ -125,6 +135,7 @@ def wire(buf: UnsafePointer[Int, MutAnyOrigin], sc: UnsafePointer[Scene, MutAnyO
     buf[S_C_PHASE] = 0
     buf[S_C_COUNT] = 0
     buf[S_C_TOTAL] = 0
+    buf[S_C_TARGET] = 0
 
 
 def rec(sc: UnsafePointer[Scene, MutAnyOrigin], ev: Int):
@@ -174,7 +185,7 @@ def consumer_slice(
     if sc[].c_phase[] == 0:
         rec(sc, EV_C_START)
         sc[].c_phase[] = 1
-    while sc[].c_count[] < sc[].M[]:
+    while sc[].c_count[] < sc[].c_target[]:
         var v = sc[].rx.recv(rt, h)
         if h.state() == TaskControlBlock.WAITING:
             rec(sc, EV_C_PARK)
@@ -206,12 +217,14 @@ def drain(mut rt: Runtime, sc: UnsafePointer[Scene, MutAnyOrigin]) raises:
 
 def dispatch(mut rt: Runtime, tcb_addr: Int, tid: Int, ud: BytePtr) raises -> Int:
     var sc = ud.bitcast[Scene]()
-    var h = _handle(tcb_addr, tid)
+    var h: JoinHandle[IntResult]
     if tid == sc[].p_id[]:
+        h = JoinHandle[IntResult](sc[].p_tcb, tid)
         producer_slice(rt, h, sc)
         drain(rt, sc)
         return 1
     if tid == sc[].c_id[]:
+        h = JoinHandle[IntResult](sc[].c_tcb, tid)
         consumer_slice(rt, h, sc)
         drain(rt, sc)
         return 1
@@ -236,7 +249,7 @@ def count_ev(sc: UnsafePointer[Scene, MutAnyOrigin], ev: Int) -> Int:
 def main() raises:
     # ---- mode 0: backpressure parks the sender (prefilled cap-1) -------------
     var rt0 = create()
-    var buf0 = stack_allocation[256, Int]()
+    var buf0 = stack_allocation[1024, Int]()
     var ch0 = make_channel[Int](1)
     if not ch0.try_send(0):
         red("mode0: prefill failed")
@@ -250,12 +263,15 @@ def main() raises:
     wire(buf0, scp0)
     buf0[S_MODE] = MODE_BACPRE
     buf0[S_M] = 1
+    buf0[S_C_TARGET] = 2
     var ud0 = scp0.bitcast[Byte]()
     var t_p0 = TB.create()
     var t_c0 = TB.create()
     # producer FIRST: with the buffer full it must park on its first attempt
     var h_p0 = spawn(rt0, UnsafePointer[TB, MutAnyOrigin](to=t_p0), 0)
     var h_c0 = spawn(rt0, UnsafePointer[TB, MutAnyOrigin](to=t_c0), 0)
+    scp0[].p_tcb = UnsafePointer[TB, MutAnyOrigin](to=t_p0)
+    scp0[].c_tcb = UnsafePointer[TB, MutAnyOrigin](to=t_c0)
     scp0[].p_id[] = h_p0.id()
     scp0[].c_id[] = h_c0.id()
     var served0 = scheduler_loop(rt0, dispatch, ud0)
@@ -269,7 +285,7 @@ def main() raises:
         red("mode0: leftover waiters")
     if rt0.pending() != 0 or ch0.to_wake_len() != 0:
         red("mode0: leftover runnables/wakes")
-    if buf0[0] != EV_P_START or buf0[1] != EV_P_PARK:
+    if buf0[EVENTS_BASE + 0] != EV_P_START or buf0[EVENTS_BASE + 1] != EV_P_PARK:
         red("mode0: producer must park on the full buffer as the 2nd event")
     if seq_find(scp0, EV_P_PARK) > seq_find(scp0, EV_C_RECV):
         red("mode0: park must precede any consumption")
@@ -283,7 +299,7 @@ def main() raises:
 
     # ---- mode 1: receiver parks on empty; sender handoff wakes it ------------
     var rt1 = create()
-    var buf1 = stack_allocation[256, Int]()
+    var buf1 = stack_allocation[1024, Int]()
     var ch1 = make_channel[Int](1)
     var tx1 = ch1.sender()
     var rx1 = ch1.receiver()
@@ -295,12 +311,15 @@ def main() raises:
     wire(buf1, scp1)
     buf1[S_MODE] = MODE_RECVPARK
     buf1[S_M] = 1
+    buf1[S_C_TARGET] = 1
     var ud1 = scp1.bitcast[Byte]()
     var t_p1 = TB.create()
     var t_c1 = TB.create()
     # consumer FIRST so it parks on the empty channel before the producer runs
     var h_c1 = spawn(rt1, UnsafePointer[TB, MutAnyOrigin](to=t_c1), 0)
     var h_p1 = spawn(rt1, UnsafePointer[TB, MutAnyOrigin](to=t_p1), 0)
+    scp1[].p_tcb = UnsafePointer[TB, MutAnyOrigin](to=t_p1)
+    scp1[].c_tcb = UnsafePointer[TB, MutAnyOrigin](to=t_c1)
     scp1[].p_id[] = h_p1.id()
     scp1[].c_id[] = h_c1.id()
     var served1 = scheduler_loop(rt1, dispatch, ud1)
@@ -308,7 +327,7 @@ def main() raises:
         red("mode1 served " + String(served1) + ", expected 3 slices")
     if not (h_p1.is_completed() and h_c1.is_completed()):
         red("mode1: not both tasks completed")
-    if buf1[0] != EV_C_START or buf1[1] != EV_C_PARK:
+    if buf1[EVENTS_BASE + 0] != EV_C_START or buf1[EVENTS_BASE + 1] != EV_C_PARK:
         red("mode1: consumer must park on the empty channel first")
     if seq_find(scp1, EV_C_PARK) >= seq_find(scp1, EV_P_SENT):
         red("mode1: park after send (lost-wakeup shape)")
@@ -324,7 +343,7 @@ def main() raises:
 
     # ---- mode 2: CHAIN — exact park counts over M=3 items (capacity 1) ------
     var rt2 = create()
-    var buf2 = stack_allocation[256, Int]()
+    var buf2 = stack_allocation[1024, Int]()
     var ch2 = make_channel[Int](1)
     var tx2 = ch2.sender()
     var rx2 = ch2.receiver()
@@ -336,11 +355,14 @@ def main() raises:
     wire(buf2, scp2)
     buf2[S_MODE] = MODE_CHAIN
     buf2[S_M] = 3
+    buf2[S_C_TARGET] = 3
     var ud2 = scp2.bitcast[Byte]()
     var t_p2 = TB.create()
     var t_c2 = TB.create()
     var h_c2 = spawn(rt2, UnsafePointer[TB, MutAnyOrigin](to=t_c2), 0)
     var h_p2 = spawn(rt2, UnsafePointer[TB, MutAnyOrigin](to=t_p2), 0)
+    scp2[].p_tcb = UnsafePointer[TB, MutAnyOrigin](to=t_p2)
+    scp2[].c_tcb = UnsafePointer[TB, MutAnyOrigin](to=t_c2)
     scp2[].p_id[] = h_p2.id()
     scp2[].c_id[] = h_c2.id()
     var served2 = scheduler_loop(rt2, dispatch, ud2)
@@ -366,7 +388,7 @@ def main() raises:
 
     # ---- mode 3: PINGPONG — M=64 items, capacity 1, one scheduler drive ------
     var rt3 = create()
-    var buf3 = stack_allocation[512, Int]()
+    var buf3 = stack_allocation[1024, Int]()
     var ch3 = make_channel[Int](1)
     var tx3 = ch3.sender()
     var rx3 = ch3.receiver()
@@ -378,11 +400,14 @@ def main() raises:
     wire(buf3, scp3)
     buf3[S_MODE] = MODE_PINGPONG
     buf3[S_M] = 64
+    buf3[S_C_TARGET] = 64
     var ud3 = scp3.bitcast[Byte]()
     var t_p3 = TB.create()
     var t_c3 = TB.create()
     var h_c3 = spawn(rt3, UnsafePointer[TB, MutAnyOrigin](to=t_c3), 0)
     var h_p3 = spawn(rt3, UnsafePointer[TB, MutAnyOrigin](to=t_p3), 0)
+    scp3[].p_tcb = UnsafePointer[TB, MutAnyOrigin](to=t_p3)
+    scp3[].c_tcb = UnsafePointer[TB, MutAnyOrigin](to=t_c3)
     scp3[].p_id[] = h_p3.id()
     scp3[].c_id[] = h_c3.id()
     var served3 = scheduler_loop(rt3, dispatch, ud3)

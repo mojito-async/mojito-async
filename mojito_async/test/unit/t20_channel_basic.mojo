@@ -143,7 +143,7 @@ def main() raises:
     if nothing:
         red("try_recv on an empty channel must return None")
     # FIFO drain
-    if not ch.is_send_closed() or ch.is_recv_closed() or ch.is_closed():
+    if ch.is_send_closed() or ch.is_recv_closed() or ch.is_closed():
         red("fresh channel must be open")
     var v1 = ch.try_recv()
     var v2 = ch.try_recv()
@@ -221,8 +221,8 @@ def main() raises:
     var total = 0
     for i in range(12):
         total += buf[i]
-    if total != 1218:
-        red("MPSC sum " + String(total) + " != 1218")
+    if total != 2418:
+        red("MPSC sum " + String(total) + " != 2418")
     # per-producer FIFO subsequence: tags 100/200/300 increment by 1 each
     for p in range(3):
         var tag = (p + 1) * 100
@@ -241,7 +241,8 @@ def main() raises:
     var r4 = h4.join()
     if r1.v != 100 or r2.v != 200 or r3.v != 300:
         red("producer results wrong")
-    if r4.v != 1218:
+    if r4.v != 2418:
         red("consumer result wrong: " + String(r4.v))
+
 
     print("T20 channel basic: PASS")
