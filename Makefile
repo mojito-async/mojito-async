@@ -15,6 +15,7 @@ BUILD   := build
 DYLIB   := libmojito_spike.dylib
 MOJO    ?= mojo
 RUNSH   := spike/colorless_runtime/tests/run.sh
+A11SH   := mojito_async/test/run.sh
 
 CSRCS := $(wildcard $(SPIKE)/*.c)
 SSRCS := $(wildcard $(SPIKE)/*.S)
@@ -51,6 +52,7 @@ $(DYLIB): $(OBJS)
 test:
 	@$(if $(HAS_SOURCES),$(MAKE) $(DYLIB),echo "make test: vendor substrate $(SPIKE) absent yet (A0.1 owns vendor/); skipping dylib build.")
 	@MOJO="$(MOJO)" CC="$(CC)" ./$(RUNSH)
+	@MOJO="$(MOJO)" ./$(A11SH)
 
 clean:
 	rm -rf $(BUILD) $(DYLIB)
