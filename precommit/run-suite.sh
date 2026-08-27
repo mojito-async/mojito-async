@@ -30,3 +30,11 @@ if ! make -s >/dev/null 2>&1; then
 fi
 
 "$RUNSH"
+
+# --- A1.1 runtime suite (issue #33) — additional run_check on the same gate ---
+A11SH="mojito_async/test/run.sh"
+if [ ! -x "$A11SH" ]; then
+    echo "precommit/run-suite.sh: $A11SH missing; A1.1 suite coverage LOST."
+    exit 3
+fi
+"$A11SH" || exit 1
