@@ -1,10 +1,13 @@
 #!/bin/sh
-# mojito-async A1.1+A1.5 acceptance harness (issues #33, #37).
+# mojito-async A1 acceptance suite (runtime #33, sync #34, channel #35,
+# timer #36, stress #37).
 #
 # Runs:
-#   - the A1.1 runtime unit drivers in test/unit/ (t11_*.mojo..t18_*.mojo);
+#   - the A1 unit drivers in test/unit/ (t[0-9][0-9]_*.mojo — runtime
+#     t11..t18, sync t21_mutex/t22_semaphore, channel t20..t22, timer
+#     t19..t22; later A-lanes add tNN_* drivers that this glob picks up);
 #   - the A1.5 stress suites in test/stress/ (t*_stress.mojo, issue #37);
-#   - the AOT stress driver test/stress/t*_aot.mojo (`mojo build` + execute:
+#   - the AOT stress drivers test/stress/t*_aot.mojo (`mojo build` + execute:
 #     the 100k-lifecycle suite needs local libc externs — getrusage/malloc —
 #     kept in the *_aot driver per modular/modular#6971).
 #
@@ -19,7 +22,7 @@ BUILD_DIR="$REPO_ROOT/build"
 MOJO=${MOJO:-mojo}
 command -v "$MOJO" >/dev/null 2>&1 || { echo "ERROR: mojo not found"; exit 2; }
 
-UNIT_TESTS=$(ls "$SCRIPT_DIR"/unit/t1[1-8]_*.mojo 2>/dev/null || true)
+UNIT_TESTS=$(ls "$SCRIPT_DIR"/unit/t[0-9][0-9]_*.mojo 2>/dev/null || true)
 # _aot.mojo drivers are excluded here; they are built+run in the AOT loop.
 STRESS_TESTS=$(ls "$SCRIPT_DIR"/stress/t*_*.mojo 2>/dev/null | grep -v "_aot\.mojo$" | sort || true)
 AOT_TESTS=$(ls "$SCRIPT_DIR"/stress/t*_aot.mojo 2>/dev/null || true)
@@ -45,21 +48,21 @@ run_one() { # <name> <out> <exit>
     echo "== $name"; printf '%s\n' "$out" | tail -n 2 | sed 's/^/   | /'
 }
 
-# --- A1.1 unit drivers -------------------------------------------------------
+# --- A1 unit drivers -----------------------------------------------------------
 for t in $UNIT_TESTS; do
     name=$(basename "$t" .mojo)
     out=$("$MOJO" run -I "$REPO_ROOT" "$t" 2>&1); st=$?
     run_one "$name" "$out" "$st"
 done
 
-# --- A1.5 stress drivers (JIT) -----------------------------------------------
+# --- A1.5 stress drivers (JIT) --------------------------------------------------
 for t in $STRESS_TESTS; do
     name=$(basename "$t" .mojo)
     out=$("$MOJO" run -I "$REPO_ROOT" "$t" 2>&1); st=$?
     run_one "$name" "$out" "$st"
 done
 
-# --- A1.5 stress AOT driver (getrusage/malloc externs stay in-driver) --------
+# --- A1.5 stress AOT driver (getrusage/malloc externs stay in-driver) -----------
 mkdir -p "$BUILD_DIR" || true
 for t in $AOT_TESTS; do
     name=$(basename "$t" .mojo)
@@ -77,7 +80,7 @@ for t in $AOT_TESTS; do
 done
 
 echo ""
-echo "mojito-async A1.1 runtime + A1.5 stress test matrix (issues #33, #37)"
+echo "mojito-async A1 acceptance matrix (runtime #33, sync #34, channel #35, timer #36, stress #37)"
 printf '%b' "$matrix" | sed 's/^/  /'
 echo ""
 [ "$failures" -ne 0 ] && { echo "RESULT: $failures FAILURE(S)"; exit 1; }
