@@ -211,7 +211,7 @@ def seq_find(sc: UnsafePointer[Scene, MutAnyOrigin], ev: Int) -> Int:
 
 def main() raises:
     # ---- S1: close-last-sender drains; receive side observes close -------------
-    var s1 = make_channel[Int](2)
+    var s1 = make_channel[Int](3)
     var sx1 = s1.sender()
     var sx2 = s1.sender()
     var rx1 = s1.receiver()
@@ -287,6 +287,7 @@ def main() raises:
         red("S2: send side must close on last sender close")
     if ch2.recv_waiters_len() != 0 or ch2.to_wake_len() != 2:
         red("S2: close must move BOTH parked receivers to the wake list")
+    drain(rt2, scp2)
     var served_b = scheduler_loop(rt2, dispatch, ud2)
     if served_b != 2:
         red("S2: second drive served " + String(served_b) + ", expected 2 (resumed receivers)")
@@ -341,6 +342,7 @@ def main() raises:
         red("S3: closing the last receiver must drop the buffered value")
     if ch3.send_waiters_len() != 0 or ch3.to_wake_len() != 1:
         red("S3: close must move the blocked sender to the wake list")
+    drain(rt3, scp3)
     var served_b3 = scheduler_loop(rt3, dispatch, ud3)
     if served_b3 != 1:
         red("S3: resumed producer slice missing")
