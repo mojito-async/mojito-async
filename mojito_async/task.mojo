@@ -109,7 +109,10 @@ struct JoinHandle[R: ResultValue](ImplicitlyCopyable, ImplicitlyDeletable):
 
     def begin_join(mut self) raises:
         """One-shot gate.  Raises on ANY second consumption attempt: double
-        join, or join after abandon."""
+        join, or join after abandon.  ALSO refuses a child that has not yet
+        reached COMPLETED — WITHOUT marking the handle joined — so a join
+        attempted early does not burn the handle: once the child completes, a
+        later join still works (the pending state is not consumed)."""
         if self._joined:
             raise Error(
                 "JoinHandle.join: double join rejected (one-shot, spec INV-4)"
@@ -117,6 +120,11 @@ struct JoinHandle[R: ResultValue](ImplicitlyCopyable, ImplicitlyDeletable):
         if self._abandoned:
             raise Error(
                 "JoinHandle.join: result already abandoned; cannot join"
+            )
+        if not self.is_completed():
+            raise Error(
+                "JoinHandle.join: child not COMPLETED yet — drive the "
+                "scheduler first; the pending join was NOT consumed"
             )
         self._joined = True
 
@@ -244,9 +252,11 @@ def wake[R: ResultValue](mut rt: Runtime, h: JoinHandle[R]) raises:
 
 def abandon[R: ResultValue](mut h: JoinHandle[R]) raises:
     """Deterministic single destruction of an UNCONSUMED completed result.
-    Replaces the TCB cell with a fresh TCB: the old value's destructor fires
+    Validates the child is COMPLETED BEFORE marking the handle abandoned, so
+    a failed validation leaves the handle fully usable (not burned).  Then
+    replaces the TCB cell with a fresh TCB: the old value's destructor fires
     exactly once; a second abandon (or join-after-abandon) raises."""
-    h.mark_abandoned()
     if not h.is_completed():
         raise Error("JoinHandle.abandon: child not COMPLETED")
+    h.mark_abandoned()
     h.tcb()[] = TaskControlBlock[R]()

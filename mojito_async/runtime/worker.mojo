@@ -13,9 +13,9 @@
 #
 # Extern-free, allocation-discipline kept: the Worker holds no task storage;
 # every TaskControlBlock cell is caller-allocated.
+from mojito_async.integration.sys import BytePtr
 from mojito_async.runtime.runtime import Runtime, create
 from mojito_async.runtime.scheduler import scheduler_loop
-from mojito_async.integration.sys import BytePtr
 
 
 struct Worker:
@@ -36,15 +36,18 @@ struct Worker:
 
     # --- entry points -------------------------------------------------------
 
-    def run_root[T: def() -> None](mut self, task: T) raises:
-        """Execute the ROOT task synchronously on this worker (runtime.run)."""
+    def run_root[T: def() raises -> None](mut self, task: T) raises:
+        """Execute the ROOT task synchronously on this worker (runtime.run):
+        full TCB lifecycle on the calling thread, errors preserved and
+        re-raised."""
         self._runtime.run(task)
 
-    def drive[F: def(Int, Int, BytePtr) raises -> Int](
+    def drive[F: def(mut Runtime, Int, Int, BytePtr) raises -> Int](
         mut self, dispatcher: F, ud: BytePtr
     ) raises -> Int:
-        """Single-worker scheduler loop: runs the runnable queue to quiet.
-        Returns the number of records driven."""
+        """Single-worker scheduler loop: drives the runnable queue to quiet
+        with the given statically-known dispatcher (same bound as
+        scheduler_loop).  Returns the number of records served."""
         return scheduler_loop(self._runtime, dispatcher, ud)
 
     def shutdown(mut self) -> None:
