@@ -60,13 +60,19 @@
 from std.atomic import Atomic, Ordering
 from std.time import sleep
 from mojito_async.integration.sys import BytePtr
+from mojito_async.runtime.idle import IDLE_PAIR_ASSERT
+from mojito_async.runtime.tls import (
+    bind_current_scope,
+    bind_current_task,
+    bind_current_worker,
+    clear_worker_tls,
+)
 from mojito_async.runtime.worker import Worker
 from mojito_async.vendor.mojito_sys import (
     NativeTlsKey,
     monotonic_now_ns,
     native_event_wait_until,
     pthread_getspecific,
-    pthread_setspecific,
     spawn_native_thread,
     tls_get,
 )
@@ -94,9 +100,9 @@ comptime IDLE_PARK_SLICE_NS = Int(2_000_000_000)  # 2 s backstop
 # must match idle.mojo's ACCT_* comptime offsets exactly).
 comptime IDLE_ACCT_IDLE = Int(0)
 comptime IDLE_ACCT_PENDING = Int(8)
-comptime IDLE_ACCT_PARK = Int(16)
-comptime IDLE_ACCT_WAKE = Int(24)
-comptime IDLE_ACCT_SPUR = Int(32)
+comptime IDLE_ACCT_PARK = Int(64)
+comptime IDLE_ACCT_WAKE = Int(72)
+comptime IDLE_ACCT_SPUR = Int(80)
 
 
 struct WorkerEntryCell(ImplicitlyCopyable, ImplicitlyDeletable, Movable):
@@ -319,7 +325,7 @@ def seam_run_unit(cell: BytePtr):
     observation slice.  NON-RAISING (b2 try-in-abiC drop workaround; a full
     observation slice just trips unit_ok).  Issue #68 replaces this whole
     unit source with queue-driven scheduler slices; the current_worker read
-    is the only part that stays."""
+    and the announced-unit completion (below) are the parts that stay."""
     var c = cell.bitcast[WorkerEntryCell]()
     var me = tls_get(c[].cw)
     if Int(me) != Int(c[].worker):
@@ -330,6 +336,18 @@ def seam_run_unit(cell: BytePtr):
     c[].obs[c[].obs_done] = c[].worker_id
     c[].obs_done += 1
     c[].units_left -= 1
+    # A2.6/M7 (issue #72): the drained seam unit COMPLETES one announced
+    # unit — seed_seam_units announced per_worker units per worker and every
+    # drain must pair (producer wake protocol, idle.mojo header).  NON-
+    # RAISING (abi("C") path; b2 drops try/except calls here): a debug-build
+    # underflow (drain below the announced floor — old pending < 1 before
+    # the -1) flags unit_ok instead of raising, mirroring idle.mojo's
+    # complete_work pair-mismatch detection on the worker side.
+    var pending_before = Atomic[DType.int64].fetch_add[ordering=Ordering.SEQUENTIAL](
+        _idle_cell(c[].acct, IDLE_ACCT_PENDING), -1
+    )
+    if IDLE_PAIR_ASSERT and pending_before - 1 < 0:
+        c[].unit_ok = False
 
 
 def mjs_pool_entry_main(ud: BytePtr) abi("C"):
@@ -337,27 +355,28 @@ def mjs_pool_entry_main(ud: BytePtr) abi("C"):
     see EMBEDDING RULE above).  Runs on the NEW OS thread:
       1. TLS (spec §22/§69) established AT ENTRY — current_worker := this
          worker's cell, current_task / current_scope := the cleared sentinel
-         — via the RAW externs (coarse, entry-only).
+         — through runtime/tls.mojo's bind_* accessors (coarse, entry-only;
+         non-raising Bool returns, so a failure flags the entry cell instead
+         of raising through the C boundary).
       2. the E2-OWNED seam loop (pool_worker_loop, NON-raising — b2
          1.0.0b2 compiles-out calls inside try/except inside abi("C") defs,
          probed in this lane, so the entry has NO try/except at all).
-      3. TLS slots CLEARED at exit + flags exited + loop_ok so join_all()
-         can audit the shutdown."""
+      3. TLS slots CLEARED at exit through runtime/tls.mojo's clear_worker_tls
+         + flags exited + loop_ok so join_all() can audit the shutdown."""
     var cell = ud.bitcast[WorkerEntryCell]()
     # b2 cannot construct a NULL BytePtr (non-nullable), so the "cleared / no
     # runtime bound" TLS value is the address-1 sentinel the codebase uses as
     # a null-equivalent; the accessors treat Int(p) <= 1 as "absent".
     var cleared = BytePtr(unsafe_from_address=1)
-    var rc = pthread_setspecific(cell[].cw.raw(), cell[].worker)
-    if rc != 0:
+    if not bind_current_worker(cell[].cw, cell[].worker):
         cell[].entry_ok = False
         cell[].exited = True
         return
-    if pthread_setspecific(cell[].ct.raw(), cleared) != 0:
+    if not bind_current_task(cell[].ct, cleared):
         cell[].entry_ok = False
         cell[].exited = True
         return
-    if pthread_setspecific(cell[].cs.raw(), cleared) != 0:
+    if not bind_current_scope(cell[].cs, cleared):
         cell[].entry_ok = False
         cell[].exited = True
         return
@@ -365,11 +384,10 @@ def mjs_pool_entry_main(ud: BytePtr) abi("C"):
     cell[].entry_ok = Int(back) == Int(cell[].worker)
     pool_worker_loop(ud)
     # A2.6 (issue #72): clear ALL three TLS slots at exit (spec §22/§69) so
-    # the OS-worker-local pointers never dangle past the trampoline.
-    _ = pthread_setspecific(cell[].cw.raw(), cleared)
-    _ = pthread_setspecific(cell[].ct.raw(), cleared)
-    _ = pthread_setspecific(cell[].cs.raw(), cleared)
-    cell[].loop_ok = True
+    # the OS-worker-local pointers never dangle past the trampoline.  The
+    # exit clear result feeds loop_ok (a failed clear = unclean exit).
+    var clear_ok = clear_worker_tls(cell[].cw, cell[].ct, cell[].cs)
+    cell[].loop_ok = clear_ok
     cell[].exited = True
 
 # ---------------------------------------------------------------------------
