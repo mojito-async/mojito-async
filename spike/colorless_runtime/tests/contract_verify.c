@@ -32,16 +32,19 @@
 #include <mach/mach_vm.h>
 
 /* ------------------------------------------------------------------ */
-/* Frozen v2 layout (aarch64_switch.S immediate offsets depend on it)  */
+/* Layout v3 (issue #101 A2.0 M:N rework — aarch64_switch.S immediate
+ *   offsets depend on it): 12 GPRs + 8 FP lows + sp + return_to.      */
 /* ------------------------------------------------------------------ */
-_Static_assert(sizeof(ms_ctx_t) == 168,
-               "ms_ctx_t must be 12 regs + 8 fps + sp = 168 bytes");
+_Static_assert(sizeof(ms_ctx_t) == 176,
+               "ms_ctx_t must be 12 regs + 8 fps + sp + return_to = 176 bytes");
 _Static_assert(offsetof(ms_ctx_t, regs) == 0,
                "regs[] must be at offset 0: asm stores x19..x30 @0..88");
 _Static_assert(offsetof(ms_ctx_t, fps) == 96,
                "fps[] must be at offset 96: asm stp/ldp d8-d15 @96..159");
 _Static_assert(offsetof(ms_ctx_t, sp) == 160,
                "sp must be at offset 160: asm str/ldr x16, [x1,#160]");
+_Static_assert(offsetof(ms_ctx_t, return_to) == 168,
+               "return_to must be at offset 168: asm O(1) in-ctx switch-back link");
 
 /* aarch64_switch.S targets Apple arm64 only (`#if !__APPLE__` #error).
  * Mirror that guard at C compile time so this test can never pass on a
