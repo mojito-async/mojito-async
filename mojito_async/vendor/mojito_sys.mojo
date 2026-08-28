@@ -342,8 +342,103 @@ def tls_get(key: NativeTlsKey) -> BytePtr:
     return pthread_getspecific(key._key)
 
 
-def tls_set(key: NativeTlsKey, value: BytePtr) raises:
-    """Bind `value` to this OS thread's slot for `key` (address 0 clears)."""
-    var rc = pthread_setspecific(key._key, value)
-    if rc != 0:
-        raise Error(String(rc))
+# ---------------------------------------------------------------------------
+# A2.6 (issue #72) — NativeEvent: the S3.5 OS-worker sleep/wake primitive.
+# The vendored S0 substrate exported NO event API, so this lane implements
+# it in-repo (vendor/mojito-sys/ms_event.c, auto-picked-up by the root
+# Makefile's source wildcards; byte-identical in the spike/prod trees).
+#
+# Semantics (S3.5, issue #72, spec §17/§21): AUTO-RESET + BREADTH-ONE (one
+# signal wakes at most ONE parked waiter), at most ONE token pending, STICKY
+# when nobody waits (a signal leaves a token a future waiter consumes
+# immediately — closes the lost-wakeup race), COALESCING (N signals while a
+# token is pending deliver one token), and CLOCK_MONOTONIC wait_until.  The
+# predicate loop (re-check token on every condvar wake) lives INSIDE the C so
+# wait_until returns ok ONLY on a consumed token — a spurious wake never
+# surfaces as a fake ready (spec §17 win).
+#
+# Handle model: ms_event_create() returns an opaque Int handle (0 == OOM);
+# the pool owns the backing and destroys it at finalize().  Mojo carries the
+# handle as an Int (b2 pointers are non-nullable; 0 is the null sentinel).
+# ---------------------------------------------------------------------------
+
+@extern("ms_event_create")
+def ms_event_create() abi("C") -> Int:
+    ...
+
+
+@extern("ms_event_destroy")
+def ms_event_destroy(handle: Int) abi("C"):
+    ...
+
+
+@extern("ms_event_signal")
+def ms_event_signal(handle: Int) abi("C"):
+    ...
+
+
+@extern("ms_event_wait")
+def ms_event_wait(handle: Int) abi("C") -> Int:
+    ...
+
+
+@extern("ms_event_wait_until")
+def ms_event_wait_until(handle: Int, deadline_ns: Int) abi("C") -> Int:
+    ...
+
+
+@extern("ms_monotonic_ns")
+def ms_monotonic_ns() abi("C") -> Int:
+    ...
+
+
+# NativeEvent — one OS-worker sleep/wake event (the per-pool idle park
+# target).  Value type: holding the handle does not own the backing; the
+# pool destroys it (ms_event_destroy).  Deadline computations use
+# ms_monotonic_ns().
+struct NativeEvent(ImplicitlyCopyable, ImplicitlyDeletable, Movable):
+    var _handle: Int
+
+    def __init__(out self):
+        self._handle = 0
+
+    def handle(self) -> Int:
+        return self._handle
+
+    def alive(self) -> Bool:
+        return self._handle != 0
+
+
+def make_native_event() raises -> NativeEvent:
+    """Create one NativeEvent (raises on allocation failure)."""
+    var e = NativeEvent()
+    e._handle = ms_event_create()
+    if e._handle == 0:
+        raise Error(String(1))  # single conversion (b2 extern-raise crash note)
+    return e
+
+
+def native_event_destroy(mut e: NativeEvent):
+    """Destroy the event's backing (idempotent; no waiters may be blocked —
+    call only after the pool joined every worker)."""
+    ms_event_destroy(e._handle)
+    e._handle = 0
+
+
+def native_event_signal(e: NativeEvent):
+    """Signal the event: set the sticky token + wake at most one waiter
+    (breadth-one; coalesces while a token is pending)."""
+    ms_event_signal(e._handle)
+
+
+def native_event_wait_until(handle: Int, deadline_ns: Int) -> Bool:
+    """Block until `deadline_ns` (absolute CLOCK_MONOTONIC); True iff a token
+    was CONSUMED (the C predicate loop means a spurious wake never returns
+    True).  False = timed out with no token (caller re-checks + re-parks).
+    `handle` is the opaque ms_event handle (Int; 0 = null, returns False)."""
+    return ms_event_wait_until(handle, deadline_ns) != 0
+
+
+def monotonic_now_ns() -> Int:
+    """Current CLOCK_MONOTONIC time in nanoseconds (deadline base)."""
+    return ms_monotonic_ns()
