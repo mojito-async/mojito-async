@@ -3,27 +3,62 @@
 # A1.1 runtime (issue #33) — structured-concurrency scope with a
 # JOIN-INTEGRATED close.
 #
-# Productionized from spike/colorless_runtime/scope.mojo (A0.9, issue #18).
-# A1.1 extends the A0 "drained-registry-only" close into a *join-integrated*
-# close (spec §112 Epic B / C7): close() now JOINS any registered child whose
-# outcome is settled (consume-once take of its COMPLETED result) instead of
-# requiring the registry to be pre-drained; it REFUSES (ChildrenStillLive,
-# spec A0-T13/T14) only while a genuinely-live (not-yet-COMPLETED) child or an
-# open direct subscope remains.  The spike's nested-scope ordering
-# (inner-before-outer, parent refuses close while a subscope is open) and the
-# `drop_children` abort escape hatch are kept verbatim.
+# A3.2 (issue #61) — #42 DECISION (ADR-015, full text lands with the A3
+# merge): Scope becomes NON-GENERIC.  Summary of the adopted strategy:
 #
-# Failure policy flows through an INJECTED CancelHook (trait slot); real
-# cancellation is in cancellation.mojo (A1.1 exposes the token; the tree
-# propagation is later).
+#   * `struct Scope` (NO type parameters) with typed access ONLY at typed
+#     call sites: `scope.spawn[T](rt, tcb, parent_id) -> JoinHandle[T]`
+#     per child (spec §8 spelling), `scope.register[T](...)`,
+#     `scope.lookup[T](...) -> ptr TCB_Prefix`, `scope.close_typed[T](...)`.
+#   * The registry ADDRESS-ERASES children into TaskRecord{addr, id, tag}
+#     cells (the proven house TaskRecord pattern); tag = the child's
+#     comptime ScopeChild.TAG, stamped at the (typed) registration boundary.
+#   * Any boundary cast is COMPTIME-TAG-CHECKED: lookup[T] / close_typed[T]
+#     verify record.tag == T.TAG and raise the deterministic
+#     `ScopeTagMismatch` (message prefix "ScopeTagMismatch:") otherwise.
+#   * close() is ERASED VALIDATE-ONLY (decision pt 4): it checks every child
+#     COMPLETED through the R-free TCB_Prefix (see
+#     runtime/task_control_block.mojo: the prefix struct is the layout
+#     guarantee for erased access — first member at offset 0, T-typed result
+#     TAIL), then marks closed and drops the registry; it NEVER consumes an
+#     untyped result.  HOMOGENEOUS scopes keep the join-integrated typed
+#     reap through close_typed[T] (tag-checked, consume-once).  MIXED scopes
+#     close validate-only and reap by parent handles — documented.
+#   * Failure policy seam: `request_cancel_all()` drives the erased prefix —
+#     RUNNING children are transitioned CANCELLED, WAITING children are
+#     woken via wake_claim; NEW/RUNNABLE children are untouched (their
+#     cancellation requires the #54 flag tree).  Best-effort (never raises
+#     on a child the machine cannot cancel); the full tree propagation is
+#     lane #54.
+#   * Spec §66 (results not Copyable) is DECOUPLED from this decision
+#     (un-landable under any strategy on b2; future work).
+#
+# A1.1 semantics carried forward: close REFUSES (ChildrenStillLive, spec
+# A0-T13/T14) while a genuinely-live (not-yet-COMPLETED) child or an open
+# direct subscope remains; the nested-scope ordering (inner-before-outer,
+# parent refuses close while a subscope is open) and the `drop_children`
+# abort escape hatch are kept verbatim.
+#
+# NEW root ergonomic (spec §13/§113, issue #61): `with_scope(rt, body, ud)`
+# — creates the root scope, runs `body(rt, scope, ud)`, closes (joins) it on
+# normal return, and on a body error propagates the FIRST error after
+# cancellation-requesting siblings (§8.2 default policy).  b2 has no `with`
+# context manager or TLS, so the runtime is threaded explicitly; the §113
+# prototype shape is transcribed onto this surface (see t29_with_scope).
 #
 # Mojo 1.0.0b2 dialect: `def` only; no static methods -> module factories
 # make_scope / make_nested_scope; Scope holds List fields so it is NOT
 # ImplicitlyCopyable — callers operate through UnsafePointer; absent optional
 # pointers are Optional (b2 pointers carry no null).
 from std.collections import List
+from mojito_async.integration.sys import BytePtr
 from mojito_async.runtime.runtime import Runtime
-from mojito_async.runtime.task_control_block import ResultValue, TaskControlBlock
+from mojito_async.runtime.join_handle import JoinHandle
+from mojito_async.runtime.task_control_block import (
+    ScopeChild,
+    TCB_Prefix,
+    TaskControlBlock,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -41,59 +76,80 @@ struct ChildrenStillLive:
 
 
 # ---------------------------------------------------------------------------
-# CancelHook — injected cancellation callback (failure policy seam)
+# ScopeTagMismatch (error model — the #42 negative test)
 # ---------------------------------------------------------------------------
 
-trait CancelHook(ImplicitlyCopyable, Movable, ImplicitlyDeletable):
-    """Injection point for the sibling cancellation policy (spec A0-T14)."""
+struct ScopeTagMismatch:
+    """Named error model for a comptime-tag-checked boundary cast that named
+    the WRONG child type: `lookup[T]`/`close_typed[T]` on a registry entry
+    recorded under a different ScopeChild.TAG.  Deterministic (#42 pt 3)."""
 
-    def request_cancel(mut self, scope_handle: Int, child_handle: Int) raises:
-        ...
+    var message: String
+
+    def __init__(out self, msg: String):
+        self.message = msg
 
 
 # ---------------------------------------------------------------------------
-# Scope
+# ScopeChild is defined in runtime/task_control_block.mojo (re-exported here
+# via the import above) so leaf ResultValue types can conform without
+# importing scope.mojo (avoids a scope.mojo <-> integration/sys.mojo cycle).
 # ---------------------------------------------------------------------------
 
-struct Scope[R: ResultValue, H: CancelHook](Movable, ImplicitlyDeletable):
-    """Structured-concurrency scope owning a child-task registry.
+# ---------------------------------------------------------------------------
+# TaskRecord — erased registry cell (the house pattern)
+# ---------------------------------------------------------------------------
 
-    `_child_ids` / `_child_ptrs` parallel lists (registry allocates only on
-    register growth).  `_open` gates register/close; `_parent` link and
+struct TaskRecord(ImplicitlyCopyable, Movable, ImplicitlyDeletable):
+    """Address-erased child cell: the TCB's raw address, the runtime task id
+    (registry key), and the comptime tag of the child's STATIC type.  Typed
+    access (join/reap/lookup) happens ONLY at typed call sites; every cast
+    across the erased boundary is tag-checked.  Trivially copyable (three
+    scalar Ints, no owned resource) — swap-remove in unregister()/close()
+    copies cells by value, same as the pre-#42 parallel-list registry."""
+
+    var addr: Int
+    var id: Int
+    var tag: Int
+
+    def __init__(out self, a: Int, i: Int, t: Int):
+        self.addr = a
+        self.id = i
+        self.tag = t
+
+
+# ---------------------------------------------------------------------------
+# Scope — non-generic structured-concurrency scope
+# ---------------------------------------------------------------------------
+
+struct Scope(Movable, ImplicitlyDeletable):
+    """Structured-concurrency scope owning an ADDRESS-ERASED child registry
+    (#42 decision): `_children` TaskRecord cells append only on register
+    growth.  `_open` gates register/close; `_parent` link and
     `_open_subscopes` enforce inner-before-outer.  `_order_log` records close
-    order for tests/diagnostics.  Handles start at 1 and increment per scope
-    (0 = "no child").
+    order for tests/diagnostics.  No type parameters: typed access is
+    per-call-site (`spawn[T]`, `register[T]`, `lookup[T]`, `close_typed[T]`).
     """
 
     var _handle: Int
     var _open: Bool
-    var _next_child_id: Int
-    var _child_ids: List[Int]
-    var _child_ptrs: List[UnsafePointer[TaskControlBlock[Self.R], MutAnyOrigin]]
-    # Injected failure-policy callback.
-    var _hook: Self.H
+    var _children: List[TaskRecord]
     # Close-order log shared with sibling scopes (records handle on close).
     var _order_log: Optional[UnsafePointer[List[Int], MutAnyOrigin]]
     # Parent-scope link (empty when root).
-    var _parent: Optional[UnsafePointer[Self, MutAnyOrigin]]
+    var _parent: Optional[UnsafePointer[Scope, MutAnyOrigin]]
     # Open direct subscopes.
     var _open_subscopes: Int
 
     def __init__(
         out self,
-        hook: Self.H,
         handle: Int,
         order_log: Optional[UnsafePointer[List[Int], MutAnyOrigin]],
-        parent: Optional[UnsafePointer[Self, MutAnyOrigin]],
+        parent: Optional[UnsafePointer[Scope, MutAnyOrigin]],
     ):
         self._handle = handle
         self._open = True
-        self._next_child_id = 1
-        self._child_ids = List[Int]()
-        self._child_ptrs = List[
-            UnsafePointer[TaskControlBlock[Self.R], MutAnyOrigin]
-        ]()
-        self._hook = hook
+        self._children = List[TaskRecord]()
         self._order_log = order_log
         self._parent = parent
         self._open_subscopes = 0
@@ -109,11 +165,11 @@ struct Scope[R: ResultValue, H: CancelHook](Movable, ImplicitlyDeletable):
         return self._open
 
     def live_child_count(self) -> Int:
-        return len(self._child_ids)
+        return len(self._children)
 
     def is_registered(self, child_handle: Int) -> Bool:
-        for i in range(len(self._child_ids)):
-            if self._child_ids[i] == child_handle:
+        for i in range(len(self._children)):
+            if self._children[i].id == child_handle:
                 return True
         return False
 
@@ -122,19 +178,28 @@ struct Scope[R: ResultValue, H: CancelHook](Movable, ImplicitlyDeletable):
 
     def has_live_unfinished(self) -> Bool:
         """True when a registered child is not yet COMPLETED (genuinely live;
-        the close() join would have nothing to consume)."""
-        for i in range(len(self._child_ptrs)):
-            if not self._child_ptrs[i][].is_completed():
+        the close() join would have nothing to consume).  Erased read: the
+        R-free prefix is the same struct for every T."""
+        for i in range(len(self._children)):
+            var pre = UnsafePointer[TCB_Prefix, MutAnyOrigin](
+                unsafe_from_address=self._children[i].addr
+            )
+            if not pre[].is_completed():
                 return True
         return False
 
-    # --- registry ----------------------------------------------------------
+    # --- registry (typed boundary stamps tag + addr; erased storage) -------
 
-    def register(
+    def register[T: ScopeChild](
         mut self,
-        child: UnsafePointer[TaskControlBlock[Self.R], MutAnyOrigin],
+        child: UnsafePointer[TaskControlBlock[T], MutAnyOrigin],
+        task_id: Int,
         parent_task_id: Int,
     ) raises -> Int:
+        """Register a child under its RUNTIME task id (the registry key).
+        Refuses a closed scope and a child that already names another scope.
+        Returns the task id (so the caller's JoinHandle id == registry key —
+        is_registered(handle.id()) is exact, not coincidental)."""
         if not self._open:
             var err = ChildrenStillLive(
                 "ScopeClosed: register into closed scope "
@@ -148,85 +213,148 @@ struct Scope[R: ResultValue, H: CancelHook](Movable, ImplicitlyDeletable):
                 + String(prior)
             )
             raise Error(err.message)
-        var cid = self._next_child_id
-        self._next_child_id += 1
         child[].set_scope_handle(self._handle)
         child[].set_parent_id(parent_task_id)
-        self._child_ids.append(cid)
-        self._child_ptrs.append(child)
-        return cid
+        self._children.append(TaskRecord(Int(child), task_id, T.TAG))
+        return task_id
 
-    def unregister(mut self, child_handle: Int) raises:
-        for i in range(len(self._child_ids)):
-            if self._child_ids[i] == child_handle:
-                var tcb_ptr = self._child_ptrs[i]
-                if tcb_ptr[].scope_handle() != self._handle:
+    def unregister(mut self, child_id: Int) raises:
+        """Remove a child by its runtime task id (swap-remove).  Validates
+        the child still names THIS scope; refuses unknown children."""
+        for i in range(len(self._children)):
+            if self._children[i].id == child_id:
+                var pre = UnsafePointer[TCB_Prefix, MutAnyOrigin](
+                    unsafe_from_address=self._children[i].addr
+                )
+                if pre[].scope_handle() != self._handle:
                     var err = ChildrenStillLive(
                         "UnknownChild: child "
-                        + String(child_handle)
+                        + String(child_id)
                         + " does not name scope "
                         + String(self._handle)
                     )
                     raise Error(err.message)
-                var last = len(self._child_ids) - 1
-                self._child_ids[i] = self._child_ids[last]
-                self._child_ptrs[i] = self._child_ptrs[last]
-                _ = self._child_ids.pop(last)
-                _ = self._child_ptrs.pop(last)
+                var last = len(self._children) - 1
+                self._children[i] = self._children[last]
+                _ = self._children.pop(last)
                 return
         var err = ChildrenStillLive(
             "UnknownChild: unregister of unknown child "
-            + String(child_handle)
+            + String(child_id)
             + " from scope "
             + String(self._handle)
         )
         raise Error(err.message)
 
-    # --- failure policy ----------------------------------------------------
+    # --- typed spawn (per-child, spec §8) ----------------------------------
+
+    def spawn[T: ScopeChild](
+        mut self,
+        mut rt: Runtime,
+        tcb: UnsafePointer[TaskControlBlock[T], MutAnyOrigin],
+        parent_id: Int,
+    ) raises -> JoinHandle[T]:
+        """SCOPE-AWARE spawn (issue #40/#61): AUTO-REGISTERS the child in
+        this scope and enqueues it as a NEW RUNNABLE task; returns the TYPED
+        single-owner JoinHandle[T] (typed access at the typed call site, #42
+        pt 2).  INV-3 inspection: registration is STRUCTURAL here — the child
+        cannot become a task without also becoming a member of this scope,
+        because register() (the registry's single owner) stamps scope_handle
+        and parent on the child, refuses a CLOSED scope (ScopeClosed), and
+        refuses a child that already names a DIFFERENT scope.  Work-first:
+        spawn only REGISTERS the child as runnable; its first entry happens
+        when execute() or a scheduler trampoline reaches it."""
+        if rt.is_shutdown():
+            raise Error("mojito_async.scope.spawn: runtime is shut down")
+        tcb[].transition(TaskControlBlock.RUNNABLE)
+        var id = rt.next_id()
+        _ = self.register[T](tcb, id, parent_id)
+        rt.enqueue(Int(tcb), id)
+        return JoinHandle[T](tcb, id)
+
+    # --- typed boundary cast (comptime-tag-checked) ------------------------
+
+    def lookup[T: ScopeChild](
+        mut self, child_id: Int
+    ) raises -> UnsafePointer[TCB_Prefix, MutAnyOrigin]:
+        """The comptime-tag-checked ERASED read: resolve a child's R-free
+        prefix by id.  The tag recorded at registration MUST equal T.TAG —
+        any wrong-type cast raises ScopeTagMismatch deterministically (the
+        #42 negative test) instead of misreading memory."""
+        for i in range(len(self._children)):
+            if self._children[i].id == child_id:
+                if self._children[i].tag != T.TAG:
+                    var err = ScopeTagMismatch(
+                        "ScopeTagMismatch: child "
+                        + String(child_id)
+                        + " recorded under tag "
+                        + String(self._children[i].tag)
+                        + ", lookup named tag "
+                        + String(T.TAG)
+                    )
+                    raise Error(err.message)
+                return UnsafePointer[TCB_Prefix, MutAnyOrigin](
+                    unsafe_from_address=self._children[i].addr
+                )
+        var err = ChildrenStillLive(
+            "UnknownChild: lookup of unknown child "
+            + String(child_id)
+            + " from scope "
+            + String(self._handle)
+        )
+        raise Error(err.message)
+
+    # --- failure policy seam (erased; #54 lands the flag tree) -------------
 
     def request_cancel_all(mut self) raises:
-        for i in range(len(self._child_ids)):
-            self._hook.request_cancel(self._handle, self._child_ids[i])
+        """Request cancellation of every currently-registered child through
+        the ERASED R-free prefix (#42 pt 2): RUNNING children are
+        transitioned CANCELLED; WAITING children are woken (wake_claim,
+        WAITING -> RUNNABLE) so their next checkpoint observes the request;
+        NEW/RUNNABLE children are LEFT UNTOUCHED (the machine has no edge to
+        cancel them, and their cancellation needs the #54 flag tree).
+        Best-effort — a child the machine cannot cancel is skipped, never an
+        error: this is the §8.2 failure-policy seam with_scope drives on a
+        body error."""
+        for i in range(len(self._children)):
+            var pre = UnsafePointer[TCB_Prefix, MutAnyOrigin](
+                unsafe_from_address=self._children[i].addr
+            )
+            var st = pre[].state()
+            if st == TaskControlBlock.RUNNING:
+                try:
+                    pre[].transition(TaskControlBlock.CANCELLED)
+                except Error:
+                    _ = 0  # best-effort: never fail the sweep on a race
+            elif st == TaskControlBlock.WAITING:
+                _ = pre[].wake_claim()
 
     # --- containment -------------------------------------------------------
 
     def drop_children(mut self):
         """Containment escape hatch: drop every child reference without
         individual unregistration (abort paths / scope teardown)."""
-        while len(self._child_ids) > 0:
-            _ = self._child_ids.pop(len(self._child_ids) - 1)
-            _ = self._child_ptrs.pop(len(self._child_ptrs) - 1)
+        while len(self._children) > 0:
+            _ = self._children.pop(len(self._children) - 1)
 
-    # --- close (join-integrated) -------------------------------------------
+    # --- close (erased validate-only + typed reap variant) ------------------
 
-    def close(mut self, mut rt: Runtime) raises:
-        """A1.1 JOIN-INTEGRATED close (spec): joins every registered child
-        whose outcome is settled (consume-once take_result), then closes the
-        scope.
-
-        TWO-PHASE (validate-then-consume):
-          Phase 1 - VALIDATE: every registered child must be COMPLETED and no
-          open direct subscope may remain; on ANY violation raise
-          ChildrenStillLive BEFORE consuming anything (nothing is joined, no
-          result is taken, the scope stays open -- a caller can fix the
-          violation and retry).
-          Phase 2 - CONSUME: take_result on each settled child (the scope is
-          the final joiner for children never individually reaped), then mark
-          closed and drop all child references.
-
-        Double-close raises.  Records the close into the shared order log
-        (when participating).  `rt` is RESERVED for the engine-driven join of
-        a later lane (when close() may drive pending children to completion);
-        A1.1 validates instead of driving, so it is unused here.
-        """
-        # ---- Phase 1: validate (no consumption on failure) -----------------
+    def _validate_exit(mut self) raises:
+        """Shared validations: scope open, every registered child COMPLETED
+        (erased prefix), no open direct subscope.  On ANY violation raise
+        ChildrenStillLive BEFORE consuming anything (nothing is joined, no
+        result is taken, the scope stays open — a caller can fix the
+        violation and retry)."""
         if not self._open:
             var err = ChildrenStillLive(
                 "DoubleClose: double close of scope " + String(self._handle)
             )
             raise Error(err.message)
-        for i in range(len(self._child_ptrs)):
-            if not self._child_ptrs[i][].is_completed():
+        for i in range(len(self._children)):
+            var pre = UnsafePointer[TCB_Prefix, MutAnyOrigin](
+                unsafe_from_address=self._children[i].addr
+            )
+            if not pre[].is_completed():
                 var err = ChildrenStillLive(
                     "ChildrenStillLive: scope "
                     + String(self._handle)
@@ -242,17 +370,60 @@ struct Scope[R: ResultValue, H: CancelHook](Movable, ImplicitlyDeletable):
                 + " open subscopes"
             )
             raise Error(err.message)
-        # ---- Phase 2: consume settled results (join), then close -----------
-        for i in range(len(self._child_ptrs)):
-            var c = self._child_ptrs[i]
-            if c[].has_result_pending():
-                _ = c[].take_result()
+
+    def _close_bookkeeping(mut self):
         self._open = False
         self.drop_children()
         if self._order_log:
             self._order_log.value()[].append(self._handle)
         if self._parent:
             self._parent.value()[]._subscope_closed()
+
+    def close(mut self, mut rt: Runtime) raises:
+        """ERASED VALIDATE-ONLY close (#42 decision pt 4): verify the scope
+        is open, every registered child is COMPLETED, and no open direct
+        subscope remains (two-phase validate-then-consume; on ANY violation
+        nothing is consumed and the scope stays open).  Then mark closed and
+        drop the registry.  The scope's registry is erased, so close()
+        NEVER consumes results: callers reap typed results through their
+        JoinHandles (or use close_typed[T] on homogeneous scopes for the
+        join-integrated typed reap).  `rt` is RESERVED for the engine-driven
+        join of a later lane."""
+        self._validate_exit()
+        self._close_bookkeeping()
+
+    def close_typed[T: ScopeChild](mut self, mut rt: Runtime) raises:
+        """TYPED join-integrated close for HOMOGENEOUS scopes (#42 pt 4):
+        validate as close(), then tag-check EVERY registered child against
+        T.TAG — ANY mismatch raises ScopeTagMismatch BEFORE anything is
+        consumed (the #42 negative test) — then consume-once take_result of
+        each settled child through the typed boundary.  The scope is the
+        final joiner for children never individually reaped."""
+        self._validate_exit()
+        for i in range(len(self._children)):
+            if self._children[i].tag != T.TAG:
+                var err = ScopeTagMismatch(
+                    "ScopeTagMismatch: typed reap of scope "
+                    + String(self._handle)
+                    + " named tag "
+                    + String(T.TAG)
+                    + " but child "
+                    + String(self._children[i].id)
+                    + " is recorded under tag "
+                    + String(self._children[i].tag)
+                    + " (mixed scope: validate-only close + reap-by-handle)"
+                )
+                raise Error(err.message)
+        for i in range(len(self._children)):
+            var pre = UnsafePointer[TCB_Prefix, MutAnyOrigin](
+                unsafe_from_address=self._children[i].addr
+            )
+            if pre[].has_result_pending():
+                var tc = UnsafePointer[TaskControlBlock[T], MutAnyOrigin](
+                    unsafe_from_address=self._children[i].addr
+                )
+                _ = tc[].take_result()
+        self._close_bookkeeping()
 
     def _subscope_closed(mut self):
         self._open_subscopes -= 1
@@ -271,24 +442,22 @@ def _opt_log(
     return Optional[UnsafePointer[List[Int], MutAnyOrigin]]()
 
 
-def make_scope[R: ResultValue, H: CancelHook](
-    hook: H,
+def make_scope(
     handle: Int,
     order_log: UnsafePointer[List[Int], MutAnyOrigin],
     has_log: Bool,
-) -> Scope[R, H]:
+) -> Scope:
     """Root scope: no parent link, zero open subscopes."""
-    var no_parent = Optional[UnsafePointer[Scope[R, H], MutAnyOrigin]]()
-    return Scope[R, H](hook, handle, _opt_log(order_log, has_log), no_parent)
+    var no_parent = Optional[UnsafePointer[Scope, MutAnyOrigin]]()
+    return Scope(handle, _opt_log(order_log, has_log), no_parent)
 
 
-def make_nested_scope[R: ResultValue, H: CancelHook](
-    hook: H,
+def make_nested_scope(
     handle: Int,
-    parent: UnsafePointer[Scope[R, H], MutAnyOrigin],
+    parent: UnsafePointer[Scope, MutAnyOrigin],
     order_log: UnsafePointer[List[Int], MutAnyOrigin],
     has_log: Bool,
-) raises -> Scope[R, H]:
+) raises -> Scope:
     """Nested scope: registers an open subscope of `parent`, so the parent
     cannot close until this scope closes (inner-before-outer)."""
     if not parent[].is_open():
@@ -299,9 +468,61 @@ def make_nested_scope[R: ResultValue, H: CancelHook](
         )
         raise Error(err.message)
     var with_log = _opt_log(order_log, has_log)
-    var with_parent = Optional[UnsafePointer[Scope[R, H], MutAnyOrigin]](parent)
-    var s = Scope[R, H](hook, handle, with_log, with_parent)
+    var with_parent = Optional[UnsafePointer[Scope, MutAnyOrigin]](parent)
+    var s = Scope(handle, with_log, with_parent)
     return s^
+
+
+# ---------------------------------------------------------------------------
+# with_scope — the §13/§113 root ergonomic (issue #61)
+# ---------------------------------------------------------------------------
+
+def with_scope[
+    F: def(mut Runtime, UnsafePointer[Scope, MutAnyOrigin], BytePtr) raises -> None
+](mut rt: Runtime, body: F, ud: BytePtr) raises:
+    """Create the ROOT scope, run `body(rt, scope, ud)`, and join it.
+
+    Root-scope ergonomics (spec §13/§113): the b2 surface for the spec's
+    `with Scope() as scope:` prototype — b2 has no context manager and no
+    TLS, so with_scope threads the runtime explicitly and the body receives
+    BOTH the mutable runtime and the root scope pointer.
+
+    Failure policy (§8.2 default, issue #61 acceptance): when the body
+    raises, with_scope RECORDS the primary error, cancellation-requests the
+    registered siblings (request_cancel_all — erased prefix, best-effort),
+    and then closes the scope; if the close REFUSES (live children cannot be
+    driven to completion in-library on b2 — the embedding scheduler loop is
+    the driver's job), the registry is dropped (abort escape hatch).  The
+    PRIMARY error is ALWAYS re-raised untouched — teardown errors never mask
+    it.  On normal return the scope is closed (validate-only; the body's own
+    joins reaped the results) and ChildrenStillLive surfaces if the body
+    leaked live children.
+    """
+    if rt.is_shutdown():
+        raise Error("with_scope: runtime is shut down")
+    var h = rt.scope_handle()
+    if h == 0:
+        h = rt.next_id()
+        rt.set_scope_handle(h)
+    var order_log = List[Int]()
+    var s = make_scope(h, UnsafePointer[List[Int], MutAnyOrigin](to=order_log), False)
+    var sp = UnsafePointer[Scope, MutAnyOrigin](to=s)
+    var err = ""
+    try:
+        body(rt, sp, ud)
+    except e:
+        err = String(e)
+        try:
+            sp[].request_cancel_all()
+        except Error:
+            _ = 0  # best-effort: never mask the primary error
+        try:
+            sp[].close(rt)
+        except Error:
+            sp[].drop_children()
+        raise Error(err)
+    sp[].close(rt)
+
 
 # ---------------------------------------------------------------------------
 # Error predicates (decode the documented message prefixes)
@@ -311,3 +532,9 @@ def is_children_still_live(e: Error) -> Bool:
     """True when `e` is a ChildrenStillLive refusal (message begins with the
     stable "ChildrenStillLive:" prefix)."""
     return "ChildrenStillLive:" in String(e)
+
+
+def is_scope_tag_mismatch(e: Error) -> Bool:
+    """True when `e` is a ScopeTagMismatch (message begins with the stable
+    "ScopeTagMismatch:" prefix)."""
+    return "ScopeTagMismatch:" in String(e)

@@ -1,13 +1,17 @@
 # mojito_async/cancellation_adapter.mojo
 #
-# A1.2-cancel (issue #41) — handle<->flag adapter for the scope failure
+# A1.2-cancel (issue #41) — handle<->flag adapter for a scope's failure
 # policy seam.
 #
-# Scope.CancelHook fires request_cancel(scope_handle, child_handle) with Int
-# handles, but cancellation.mojo builds CancelFlag/CancellationToken trees
-# keyed by UnsafePointer[CancelFlag].  The adapter closes that air gap so the
-# "first failed child cancels siblings" failure policy can reach the flag
-# tree through the shipped primitives.
+# A3.2 (#42 decision, issue #61) DECOUPLES this adapter from Scope: the
+# non-generic Scope's request_cancel_all() now drives the ERASED TCB_Prefix
+# directly (RUNNING -> CANCELLED, WAITING woken) and has no injected-hook
+# seam.  This module stands ALONE as a handle<->flag adapter over
+# cancellation.mojo's CancelFlag/CancellationToken trees — useful for a
+# caller that wants (scope handle, child handle) pairs (e.g. the real task
+# ids a Scope's register[T]() hands out) to resolve to CancelFlag cells and
+# drive tree-propagated requests.  Full flag-tree wiring INTO Scope is lane
+# #54 (decision pt 5).
 #
 # Two pieces, both CALLER-OWNED (b2: no module-level mutable globals, no
 # statics):
@@ -19,12 +23,10 @@
 #   child checkpoint).  The registry never allocates CancelFlag cells —
 #   callers own the flags and pass their pointers in.
 #
-#   CancelFlagHook — a CancelHook implementation (scope.mojo's injected
-#   failure-policy callback) whose request_cancel(scope_handle,
-#   child_handle) resolves the child flag in the registry and calls
-#   request() on it (tree propagation through the child flag's parent link).
-#   Unknown scope / unknown child REFUSE deterministically with documented
-#   message prefixes.
+#   CancelFlagHook — request_cancel(scope_handle, child_handle) resolves the
+#   child flag in the registry and calls request() on it (tree propagation
+#   through the child flag's parent link).  Unknown scope / unknown child
+#   REFUSE deterministically with documented message prefixes.
 #
 #   Registration is SYMMETRIC: register_child mutates the caller's child flag
 #   (links it under the scope flag); unregister_child / unregister_scope
@@ -44,7 +46,6 @@
 # builtin `Error` raises.
 
 from mojito_async.cancellation import CancelFlag
-from mojito_async.scope import CancelHook
 
 
 # ---------------------------------------------------------------------------
@@ -220,14 +221,15 @@ struct CancelFlagRegistry(Movable, ImplicitlyDeletable):
 
 
 # ---------------------------------------------------------------------------
-# CancelFlagHook — CancelHook impl resolving handles to flags
+# CancelFlagHook — standalone handle-resolving cancel callback (#42:
+# decoupled from Scope; see module header)
 # ---------------------------------------------------------------------------
 
-struct CancelFlagHook(CancelHook, Movable, ImplicitlyDeletable):
-    """A scope.mojo CancelHook that resolves (scope, child) handles to the
-    registered child flag and requests it (cancelling that child, and —
-    through the child's parent link — propagating downward into the child's
-    own descendants).  Refuses unknown handles."""
+struct CancelFlagHook(Movable, ImplicitlyDeletable):
+    """Resolves (scope, child) handles to the registered child flag and
+    requests it (cancelling that child, and — through the child's parent
+    link — propagating downward into the child's own descendants).  Refuses
+    unknown handles."""
 
     var _registry: UnsafePointer[CancelFlagRegistry, MutAnyOrigin]
 
@@ -252,7 +254,7 @@ def make_cancel_flag_registry() -> CancelFlagRegistry:
 def make_cancel_flag_hook(
     registry: UnsafePointer[CancelFlagRegistry, MutAnyOrigin],
 ) -> CancelFlagHook:
-    """A CancelHook adapter bound to `registry`.  request_cancel(scope,
+    """A cancel-adapter bound to `registry`.  request_cancel(scope,
     child) fires the registered child flag."""
     return CancelFlagHook(registry)
 
