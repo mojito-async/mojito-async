@@ -53,6 +53,11 @@ from mojito_async.runtime.fiber_seam import (
     fiber_resume_current,
     fiber_suspend_current,
     fiber_yield_now,
+    make_seam_slot,
+    seam_bind_slot,
+    seam_destroy_slot,
+    seam_drive,
+    seam_mark_completed,
     seam_park_switch,
     seam_slot_stride,
 )
@@ -112,6 +117,9 @@ struct T26Scene(ImplicitlyCopyable, ImplicitlyDeletable):
     var ok_a: UnsafePointer[Int, MutUntrackedOrigin]
     var ok_y: UnsafePointer[Int, MutUntrackedOrigin]
     var pay_a: UnsafePointer[Int, MutUntrackedOrigin]
+    var a_n: UnsafePointer[Int, MutUntrackedOrigin]
+    var b_n: UnsafePointer[Int, MutUntrackedOrigin]
+    var y_n: UnsafePointer[Int, MutUntrackedOrigin]
     var slot_a: UnsafePointer[SeamSlot, MutAnyOrigin]
     var slot_b: UnsafePointer[SeamSlot, MutAnyOrigin]
     var slot_y: UnsafePointer[SeamSlot, MutAnyOrigin]
@@ -128,6 +136,9 @@ struct T26Scene(ImplicitlyCopyable, ImplicitlyDeletable):
         self.ok_a = self.log
         self.ok_y = self.log
         self.pay_a = self.log
+        self.a_n = self.log
+        self.b_n = self.log
+        self.y_n = self.log
         self.slot_a = UnsafePointer[SeamSlot, MutAnyOrigin](unsafe_from_address=1)
         self.slot_b = self.slot_a
         self.slot_y = self.slot_a
@@ -251,9 +262,11 @@ def dispatch(mut rt: Runtime, tcb_addr: Int, tid: Int, ud: BytePtr) raises -> In
     var sc = ud.bitcast[T26Scene]()
     if tid == sc[].a_tid[]:
         var ha = _handle(tcb_addr, tid)
+        sc[].a_n[] = sc[].a_n[] + 1
         claim_running(ha)
         seam_drive(rt, sc[].slot_a)
-        if sc[].slot_a[].finished:
+        if sc[].a_n[] >= 2:
+            seam_mark_completed(sc[].slot_a)
             ha.tcb()[].transition(TaskControlBlock.COMPLETED)
             ha.tcb()[].mark_result(IntResult(211))
         else:
@@ -261,22 +274,26 @@ def dispatch(mut rt: Runtime, tcb_addr: Int, tid: Int, ud: BytePtr) raises -> In
         return 1
     if tid == sc[].b_tid[]:
         var hb = _handle(tcb_addr, tid)
+        sc[].b_n[] = sc[].b_n[] + 1
         claim_running(hb)
         seam_drive(rt, sc[].slot_b)
+        seam_mark_completed(sc[].slot_b)
         hb.tcb()[].transition(TaskControlBlock.COMPLETED)
         hb.tcb()[].mark_result(IntResult(111))
         return 1
     if tid == sc[].y_tid[]:
         var hy = _handle(tcb_addr, tid)
+        sc[].y_n[] = sc[].y_n[] + 1
         claim_running(hy)
         seam_drive(rt, sc[].slot_y)
-        if sc[].slot_y[].finished:
+        if sc[].y_n[] >= 2:
+            seam_mark_completed(sc[].slot_y)
             hy.tcb()[].transition(TaskControlBlock.COMPLETED)
             hy.tcb()[].mark_result(IntResult(311))
         else:
             fiber_yield_now(rt, hy)
         return 1
-    raise Error("unexpected task id in t26 dispatcher")
+    raise Error("unexpected task id in t26 dispatcher (tid " + String(tid) + ")")
 
 
 # Drive scheduler_loop from `depth` nested LIVE native frames (recursion
@@ -319,14 +336,20 @@ def main() raises:
         failures.append("ms_page_size non-positive")
     var stack_bytes = 4 * ps
 
-    # --- heap block layout (single malloc of raw cells) --------------------
-    var block = UnsafePointer[Int, MutUntrackedOrigin](
-        unsafe_from_address=Int(c_malloc(14 * 8))
+    # --- heap blocks: the EVENT LOG gets its own buffer (it grows with every
+    # _log call and must never overlap the per-task scene cells) ------------
+    var logbuf = UnsafePointer[Int, MutUntrackedOrigin](
+        unsafe_from_address=Int(c_malloc(16 * 8))
     )
-    for i in range(14):
+    for i in range(16):
+        logbuf[i] = 0
+    var block = UnsafePointer[Int, MutUntrackedOrigin](
+        unsafe_from_address=Int(c_malloc(17 * 8))
+    )
+    for i in range(17):
         block[i] = 0
     var sc = T26Scene()
-    sc.log = UnsafePointer[Int, MutUntrackedOrigin](unsafe_from_address=Int(block) + 0)
+    sc.log = UnsafePointer[Int, MutUntrackedOrigin](unsafe_from_address=Int(logbuf) + 0)
     sc.n = UnsafePointer[Int, MutUntrackedOrigin](unsafe_from_address=Int(block) + 1 * 8)
     sc.a_tid = UnsafePointer[Int, MutUntrackedOrigin](unsafe_from_address=Int(block) + 2 * 8)
     sc.b_tid = UnsafePointer[Int, MutUntrackedOrigin](unsafe_from_address=Int(block) + 3 * 8)
@@ -337,6 +360,9 @@ def main() raises:
     sc.ok_a = UnsafePointer[Int, MutUntrackedOrigin](unsafe_from_address=Int(block) + 8 * 8)
     sc.ok_y = UnsafePointer[Int, MutUntrackedOrigin](unsafe_from_address=Int(block) + 9 * 8)
     sc.pay_a = UnsafePointer[Int, MutUntrackedOrigin](unsafe_from_address=Int(block) + 10 * 8)
+    sc.a_n = UnsafePointer[Int, MutUntrackedOrigin](unsafe_from_address=Int(block) + 11 * 8)
+    sc.b_n = UnsafePointer[Int, MutUntrackedOrigin](unsafe_from_address=Int(block) + 12 * 8)
+    sc.y_n = UnsafePointer[Int, MutUntrackedOrigin](unsafe_from_address=Int(block) + 13 * 8)
     sc.pay_a[] = PAY_A
 
     # --- three SeamSlots in a stable heap block (fibers never relocate) ----
@@ -510,8 +536,11 @@ def main() raises:
     var rt2 = create()
     var tcb_pool = List[TB]()
     var cheap_ud = UnsafePointer[Byte, MutAnyOrigin](unsafe_from_address=0x33)
-    for i in range(16):
+    for _ in range(16):
         tcb_pool.append(TB.create())
+    # NOTE: List[TB] may relocate on append, so (like t12_stress) spawn only
+    # AFTER the pool has settled — never take to=pool[i] mid-growth.
+    for i in range(16):
         _ = spawn(rt2, UnsafePointer[TB, MutAnyOrigin](to=tcb_pool[i]), 0)
     var served3 = scheduler_loop(rt2, dispatch_cheap, cheap_ud)
     if served3 != 16:
@@ -532,6 +561,7 @@ def main() raises:
         failures.append("destroy left a fiber alive")
 
     c_free(slots_block)
+    c_free(UnsafePointer[Byte, MutAnyOrigin](unsafe_from_address=Int(logbuf)))
     c_free(UnsafePointer[Byte, MutAnyOrigin](unsafe_from_address=Int(block)))
     c_free(UnsafePointer[Byte, MutAnyOrigin](unsafe_from_address=Int(npre)))
     c_free(UnsafePointer[Byte, MutAnyOrigin](unsafe_from_address=Int(ndeep)))
