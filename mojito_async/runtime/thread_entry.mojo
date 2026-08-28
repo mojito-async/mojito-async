@@ -49,6 +49,7 @@
 # Externs: none HERE — pthread spawn/join/TLS live in vendor/mojito_sys.mojo
 # at concrete module scope; this module only composes them.
 from std.atomic import Atomic, Ordering
+from std.memory import stack_allocation
 from std.time import sleep
 from mojito_async.integration.sys import BytePtr
 from mojito_async.runtime.worker import Worker
@@ -63,14 +64,50 @@ from mojito_async.vendor.mojito_sys import (
 
 # Worker/entry cell byte-strides for the pool's heap arrays (b2 exposes no
 # public sizeof; >= real struct sizes is the documented t28-style contract).
-# CELL_WORKER must cover the post-#68/#69/#70 Worker: its Runtime embeds the
-# @align(128) LocalDeque + RemoteReadyQueue (cache-line isolation, issue #68
-# step 5) plus the bounded InjectQueue, so the real struct is far larger
-# than the A2.1 five-field Worker — 512 bytes overflowed and corrupted the
-# heap (tcmalloc aborted freeing a bogus pointer in t30).  4096 keeps the
-# headroom for the E-lanes' further field growth.
+# M4 (PR #107 fold, issue #112): the strides are no longer blind magic —
+# CELL_WORKER/CELL_ENTRY are ASSERTED at compile time to cover the REAL
+# struct sizes, measured the existing way (the stack_allocation stride
+# probe — the `seam_slot_stride` pattern, runtime/fiber_seam.mojo; see
+# `_worker_cell_stride` / `_entry_cell_stride` + `cell_size_gate` below,
+# instantiated from worker_pool.start()).  The repaired base raised
+# CELL_WORKER from 512 — which overflowed and corrupted the heap (tcmalloc
+# aborted freeing a bogus pointer in t30) — to 4096; the assert now makes
+# the contract SELF-CHECKING: a future lane that grows the post-#68/#69/
+# #70 Worker (Runtime embeds the @align(128) LocalDeque + RemoteReadyQueue,
+# cache-line isolation issue #68 step 5, plus the bounded InjectQueue and
+# the E6/M2 idle-acct pointer) past the cell stride FAILS THE BUILD instead
+# of corrupting the heap.  4096/256 are rounded values (multiples of 16)
+# with headroom for the E-lanes' further field growth.
 comptime CELL_WORKER = Int(4096)
 comptime CELL_ENTRY = Int(256)
+
+
+def _worker_cell_stride() -> Int:
+    """sizeof(Worker) measured as a pointer stride — the stack_allocation
+    stride probe (the `seam_slot_stride` pattern).  The pool's heap cells
+    must be >= this; cell_size_gate asserts the contract."""
+    var one = stack_allocation[1, Worker]()
+    return Int(one + 1) - Int(one)
+
+
+def _entry_cell_stride() -> Int:
+    """sizeof(WorkerEntryCell) measured as a pointer stride."""
+    var one = stack_allocation[1, WorkerEntryCell]()
+    return Int(one + 1) - Int(one)
+
+
+def cell_size_gate() raises:
+    """M4: compile-time + runtime size contract for the pool's heap cell
+    arrays.  Instantiated by worker_pool.start() (the only heap allocator);
+    the comptime asserts evaluate at BUILD time, so a struct grown past its
+    cell stride fails the build; the runtime checks are the belt-and-
+    suspenders backstop (layout can depend on build flags)."""
+    comptime assert(CELL_WORKER >= _worker_cell_stride())
+    comptime assert(CELL_ENTRY >= _entry_cell_stride())
+    if CELL_WORKER < _worker_cell_stride():
+        raise Error("thread_entry: CELL_WORKER too small for the Worker struct")
+    if CELL_ENTRY < _entry_cell_stride():
+        raise Error("thread_entry: CELL_ENTRY too small for the WorkerEntryCell")
 
 
 struct WorkerEntryCell(ImplicitlyCopyable, ImplicitlyDeletable, Movable):
