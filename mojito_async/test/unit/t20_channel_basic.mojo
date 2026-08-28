@@ -197,10 +197,13 @@ def main() raises:
     var t2 = TB.create()
     var t3 = TB.create()
     var t4 = TB.create()
-    var h1 = spawn(rt, UnsafePointer[TB, MutAnyOrigin](to=t1), 0)
-    var h2 = spawn(rt, UnsafePointer[TB, MutAnyOrigin](to=t2), 0)
-    var h3 = spawn(rt, UnsafePointer[TB, MutAnyOrigin](to=t3), 0)
+    # A2.2 (issue #68): owner pop is LIFO, so register the consumer FIRST
+    # and the producers after -> the deque serves producers (fills the
+    # channel) before the consumer, preserving the MPSC intent.
     var h4 = spawn(rt, UnsafePointer[TB, MutAnyOrigin](to=t4), 0)
+    var h3 = spawn(rt, UnsafePointer[TB, MutAnyOrigin](to=t3), 0)
+    var h2 = spawn(rt, UnsafePointer[TB, MutAnyOrigin](to=t2), 0)
+    var h1 = spawn(rt, UnsafePointer[TB, MutAnyOrigin](to=t1), 0)
     buf[13] = h1.id()
     buf[14] = h2.id()
     buf[15] = h3.id()
