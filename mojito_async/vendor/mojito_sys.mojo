@@ -125,6 +125,13 @@ def ms_stack_free(base: BytePtr) abi("C"):
     ...
 
 
+@extern("ms_stack_is_live")
+def ms_stack_is_live(base: BytePtr) abi("C") -> Int32:
+    """1 when `base` is a still-registered (not-yet-freed) stack reservation,
+    0 when it was never allocated or was already ms_stack_free'd (munmap'd)."""
+    ...
+
+
 @extern("ms_stack_total_size")
 def ms_stack_total_size() abi("C") -> Int:
     ...
@@ -154,7 +161,7 @@ def ms_ctx_switch(from_: BytePtr, to: BytePtr) abi("C"):
 # The Fiber struct stays all-scalar; its two 168-byte ms_ctx_t slots, the
 # FiberFrame sidecar and the entry/userdata scratch live in ONE malloc'd
 # block -- so the struct is trivially copy-safe, and destroy() frees one
-# block.  libc is not mojito-sys, but the C-ABI firewall is the single home
+# block.  libc is not mojito-sys, but the C-ABI firewall is the single touch
 # of every extern the runtime needs, so the allocator pair lives here too
 # (never in fiber.mojo).
 # ---------------------------------------------------------------------------

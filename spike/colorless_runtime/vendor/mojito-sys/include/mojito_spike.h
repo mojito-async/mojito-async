@@ -22,6 +22,9 @@ int      ms_page_size(void);
 int      ms_stack_alloc(size_t bytes, void **out_base, void **out_top);
 void     ms_stack_free(void *base);
 size_t   ms_stack_total_size(void); /* reserved incl guard, for reporting */
+/* 1 when `base` is a still-registered (not-yet-freed) reservation; 0 when it
+ * was never allocated or was already returned by ms_stack_free (munmap'd). */
+int      ms_stack_is_live(void *base);
 
 /* Prepare ctx so ms_ctx_switch resumes at entry(userdata) on stack_top,
  * with AAPCS64 prologue assumptions (sp 16-aligned at entry). */
