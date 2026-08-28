@@ -45,8 +45,9 @@ comptime BytePtr = UnsafePointer[Byte, MutAnyOrigin]
 # ms_stack_alloc writes *out_base / *out_top through.
 comptime OutSlots = UnsafePointer[BytePtr, MutUntrackedOrigin]
 
-# sizeof(ms_ctx_t) per the frozen v2 header: 12 GPRs + 8 FP lows + sp.
-comptime MS_CTX_SIZE = 168
+# sizeof(ms_ctx_t) per the v3 header (issue #101 A2.0 M:N rework, tracks the
+# prod vendor substrate): 12 GPRs + 8 FP lows + sp + return_to.
+comptime MS_CTX_SIZE = 176
 
 
 # Code address of an @export'd abi("C") Mojo callback, as a C function
