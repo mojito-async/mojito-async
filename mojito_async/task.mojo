@@ -15,13 +15,15 @@
 #     (RUNNABLE -> RUNNING) before entering/resuming the task;
 #   - abandon: deterministic single destruction of an unconsumed result.
 #
-# A1 follow-up (issue #39): JoinHandle + SuspendReason MOVED to
-# runtime/join_handle.mojo (their single definition) and are re-exported here
-# so every existing import path (`from mojito_async.task import JoinHandle,
-# SuspendReason`) keeps working unchanged.  The park/wake choreography now
-# lives ONLY in runtime/park.mojo (park_current/unpark_current); the old
-# task.park_prepare/park_commit/suspend_commit/wake duplicates were deleted
-# (they were dead — no callers).
+# A1 follow-up (issue #40): spawn is SCOPE-AWARE.  The scoped overload takes
+# the parent `Scope` pointer and AUTO-REGISTERS the child inside spawn
+# (INV-3: "every child belongs to a scope" becomes structure, not
+# convention) — the scope stays the single owner of the registry and its
+# register() refuses a closed scope or a child that already names another
+# scope.  The un-scoped overload remains (b2 has no TLS and the runtime
+# carries only a Integer scope handle, not the registry pointer, so the
+# scope must be threaded explicitly; un-scoped callers own their scoping by
+# convention).
 #
 # COOPERATIVE POLICY (spec §88): run()/execute are work-first — a task's
 # first entry happens eagerly on the current worker; a task that must wait
@@ -38,11 +40,8 @@ from mojito_async.integration.sys import BytePtr
 from mojito_async.runtime.runtime import Runtime
 from mojito_async.runtime.task_control_block import ResultValue, TaskControlBlock
 from mojito_async.runtime.join_handle import JoinHandle, SuspendReason
+from mojito_async.scope import CancelHook, Scope
 
-
-# ---------------------------------------------------------------------------
-# spawn / execute / claim_running / abandon
-# ---------------------------------------------------------------------------
 
 def spawn[R: ResultValue](
     mut rt: Runtime,
@@ -51,10 +50,12 @@ def spawn[R: ResultValue](
 ) raises -> JoinHandle[R]:
     """Register a NEW task: link its parent, walk NEW -> RUNNABLE, enqueue.
 
-    The CALLER allocates the TCB cell (stack_allocation pattern).  Returns
-    the single owner handle.  Work-first: spawn only REGISTERS the child as
-    independently schedulable; its first entry happens when execute() (or a
-    scheduler trampoline) reaches it.
+    The CALLER allocates the TCB cell (stack_allocation pattern) and owns
+    the SCOPE BOOKKEEPING by convention (the INV-3-scoped spelling is
+    `spawn(rt, scope, tcb, parent_id)`, which auto-registers).  Returns the
+    single owner handle.  Work-first: spawn only REGISTERS the child as
+    runnable; its first entry happens when execute() or a scheduler
+    trampoline reaches it.
     """
     if rt.is_shutdown():
         raise Error("mojito_async.spawn: runtime is shut down")
@@ -63,6 +64,25 @@ def spawn[R: ResultValue](
     var id = rt.next_id()
     rt.enqueue(Int(tcb), id)
     return JoinHandle[R](tcb, id)
+
+
+def spawn[R: ResultValue, H: CancelHook](
+    mut rt: Runtime,
+    scope: UnsafePointer[Scope[R, H], MutAnyOrigin],
+    tcb: UnsafePointer[TaskControlBlock[R], MutAnyOrigin],
+    parent_id: Int,
+) raises -> JoinHandle[R]:
+    """SCOPE-AWARE spawn (issue #40): auto-registers the child in `scope`
+    and enqueues it as a NEW RUNNABLE task.
+
+    INV-3 inspection: registration is STRUCTURAL here, not by convention —
+    the child cannot become a task without also becoming a member of the
+    scope, because this overload's scope.register() (the registry's single
+    owner) stamps scope_handle and parent on the child, refuses a CLOSED
+    scope (ScopeClosed), and refuses a child that already names a DIFFERENT
+    scope.  Same work-first bookkeeping as the un-scoped spawn afterwards."""
+    _ = scope[].register(tcb, parent_id)
+    return spawn(rt, tcb, parent_id)
 
 
 def execute[R: ResultValue, F: def(BytePtr) raises -> R](
