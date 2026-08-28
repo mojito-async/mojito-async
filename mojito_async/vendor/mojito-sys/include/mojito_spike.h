@@ -5,14 +5,18 @@
 
 typedef void (*ms_entry_fn)(void *userdata);
 
-/* Fixed-layout save area consumed by aarch64_switch.S: 21 x 8 bytes = 168
+/* Fixed-layout v3 save area consumed by aarch64_switch.S: 22 x 8 = 176 bytes
  * (regs[12] = x19..x30 @0..95; fps[8] = d8..d15 low halves @96..159;
- * sp @160). v2 per issue #19: AAPCS64 callee-saved d8-d15 must survive a
- * switch or Mojo numeric frames corrupt silently. */
+ * sp @160; return_to @168). v2 per issue #19 added the FP lows; v3 per
+ * issue #101 (A2.0 M:N rework) adds `return_to` — the O(1) in-ctx return
+ * link that replaces the removed process-global resume table, so a switch
+ * touches NO shared writable state and the substrate is thread-safe. */
 typedef struct ms_ctx {
     uint64_t regs[12]; /* x19..x30 (x30=lr); slot i => reg x(19+i) */
     uint64_t fps[8];   /* low 64 bits of v8..v15, callee-saved     */
     uint64_t sp;
+    uint64_t return_to; /* ctx to switch back to on suspend/exit (owned by
+                           aarch64_switch.S via _ms_ctx_switch)          */
 } ms_ctx_t;
 
 int      ms_page_size(void);
