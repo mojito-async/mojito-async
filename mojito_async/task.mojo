@@ -15,15 +15,21 @@
 #     (RUNNABLE -> RUNNING) before entering/resuming the task;
 #   - abandon: deterministic single destruction of an unconsumed result.
 #
-# A1 follow-up (issue #40): spawn is SCOPE-AWARE.  The scoped overload takes
-# the parent `Scope` pointer and AUTO-REGISTERS the child inside spawn
-# (INV-3: "every child belongs to a scope" becomes structure, not
-# convention) — the scope stays the single owner of the registry and its
-# register() refuses a closed scope or a child that already names another
-# scope.  The un-scoped overload remains (b2 has no TLS and the runtime
-# carries only a Integer scope handle, not the registry pointer, so the
-# scope must be threaded explicitly; un-scoped callers own their scoping by
-# convention).
+# A1 follow-up (issue #40): spawn is SCOPE-AWARE.  The scoped spelling is
+# now the SCOPE METHOD `scope.spawn[T](rt, tcb, parent_id) -> JoinHandle[T]`
+# on the #42 non-generic Scope (mojito_async/scope.mojo, issue #61): it
+# AUTO-REGISTERS the child inside spawn (INV-3 becomes structure, not
+# convention) and returns the typed handle.  The module-level SCOPED
+# overload is DELETED with the generic Scope (scope.mojo header carries the
+# #42 decision summary).  The un-scoped overload remains (b2 has no TLS and
+# the runtime carries only a Integer scope handle, not the registry pointer,
+# so the scope must be threaded explicitly; un-scoped callers own their
+# scoping by convention).
+#
+# execute() (A3.2, issue #61/#42) ALSO stamps the child's R-free TCB_Prefix
+# failure record (mark_failed) in parallel with the JoinHandle-level fail(),
+# so the non-generic Scope's erased registry (and the #63/#64 grouped-join
+# lanes) can see per-child failure without knowing the child's type.
 #
 # COOPERATIVE POLICY (spec §88): run()/execute are work-first — a task's
 # first entry happens eagerly on the current worker; a task that must wait
@@ -40,7 +46,6 @@ from mojito_async.integration.sys import BytePtr
 from mojito_async.runtime.runtime import Runtime
 from mojito_async.runtime.task_control_block import ResultValue, TaskControlBlock
 from mojito_async.runtime.join_handle import JoinHandle, SuspendReason
-from mojito_async.scope import CancelHook, Scope
 
 
 def spawn[R: ResultValue](
@@ -51,8 +56,9 @@ def spawn[R: ResultValue](
     """Register a NEW task: link its parent, walk NEW -> RUNNABLE, enqueue.
 
     The CALLER allocates the TCB cell (stack_allocation pattern) and owns
-    the SCOPE BOOKKEEPING by convention (the INV-3-scoped spelling is
-    `spawn(rt, scope, tcb, parent_id)`, which auto-registers).  Returns the
+    the SCOPE BOOKKEEPING by convention (the INV-3-scoped spelling is the
+    #42 Scope method `scope.spawn[T](rt, tcb, parent_id)`, which
+    auto-registers and returns the typed JoinHandle[T]).  Returns the
     single owner handle.  Work-first: spawn only REGISTERS the child as
     runnable; its first entry happens when execute() or a scheduler
     trampoline reaches it.
@@ -66,25 +72,6 @@ def spawn[R: ResultValue](
     return JoinHandle[R](tcb, id)
 
 
-def spawn[R: ResultValue, H: CancelHook](
-    mut rt: Runtime,
-    scope: UnsafePointer[Scope[R, H], MutAnyOrigin],
-    tcb: UnsafePointer[TaskControlBlock[R], MutAnyOrigin],
-    parent_id: Int,
-) raises -> JoinHandle[R]:
-    """SCOPE-AWARE spawn (issue #40): auto-registers the child in `scope`
-    and enqueues it as a NEW RUNNABLE task.
-
-    INV-3 inspection: registration is STRUCTURAL here, not by convention —
-    the child cannot become a task without also becoming a member of the
-    scope, because this overload's scope.register() (the registry's single
-    owner) stamps scope_handle and parent on the child, refuses a CLOSED
-    scope (ScopeClosed), and refuses a child that already names a DIFFERENT
-    scope.  Same work-first bookkeeping as the un-scoped spawn afterwards."""
-    _ = scope[].register(tcb, parent_id)
-    return spawn(rt, tcb, parent_id)
-
-
 def execute[R: ResultValue, F: def(BytePtr) raises -> R](
     mut h: JoinHandle[R],
     thunk: F,
@@ -95,7 +82,9 @@ def execute[R: ResultValue, F: def(BytePtr) raises -> R](
     The generic hook statically knows the task body (b2 has no dynamic fn
     values): claim RUNNABLE -> RUNNING, invoke thunk(userdata) on the current
     stack, settle RUNNING -> COMPLETED and store the result — or, on a raise,
-    still reach COMPLETED and preserve the message for join() to re-raise.
+    still reach COMPLETED, preserve the message for join() to re-raise, AND
+    stamp the R-free TCB_Prefix failure record (mark_failed) so the erased
+    registry sees the failure without knowing T (A3.2, #42).
     """
     if h.is_completed():
         raise Error("execute: task already completed")
@@ -107,6 +96,7 @@ def execute[R: ResultValue, F: def(BytePtr) raises -> R](
     except e:
         h.tcb()[].transition(TaskControlBlock.COMPLETED)
         h.fail(String(e))
+        h.tcb()[].mark_failed(String(e))
 
 
 def claim_running[R: ResultValue](

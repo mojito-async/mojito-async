@@ -124,6 +124,20 @@ struct Scene(Movable, ImplicitlyDeletable):
     var n: UnsafePointer[Int, MutAnyOrigin]
     var total: UnsafePointer[Int, MutAnyOrigin]
 
+    def __init__(
+        out self,
+        cells: UnsafePointer[List[TB_P], MutAnyOrigin],
+        act: UnsafePointer[TB_A, MutAnyOrigin],
+        args: UnsafePointer[List[Int], MutAnyOrigin],
+        n: UnsafePointer[Int, MutAnyOrigin],
+        total: UnsafePointer[Int, MutAnyOrigin],
+    ):
+        self.cells = cells
+        self.act = act
+        self.args = args
+        self.n = n
+        self.total = total
+
 
 # ---------------------------------------------------------------------------
 # §113-shaped body: spawn-in-loop -> drive-in-loop -> join-in-loop.
@@ -142,7 +156,11 @@ def service_113(mut rt: Runtime, sp: UnsafePointer[Scope, MutAnyOrigin], ud: Byt
 
     var handles = List[JoinHandle[Profile]]()
     for i in range(len(sc[].cells[])):
-        handles.append(sp[].spawn[Profile](rt, sc[].cells[][i], 0))
+        handles.append(
+            sp[].spawn[Profile](
+                rt, UnsafePointer[TB_P, MutAnyOrigin](to=sc[].cells[][i]), 0
+            )
+        )
 
     for i in range(len(handles)):
         var h = handles[i]
@@ -169,8 +187,12 @@ def service_mixed(mut rt: Runtime, sp: UnsafePointer[Scope, MutAnyOrigin], ud: B
         unsafe_from_address=Int(sc[].args[].unsafe_ptr()) + 0 * 8
     )
     id_cell[] = 5
-    var hp = sp[].spawn[Profile](rt, sc[].cells[][0], 0)
-    var ha = sp[].spawn[Activity](rt, sc[].act[], 0)
+    var hp = sp[].spawn[Profile](
+        rt, UnsafePointer[TB_P, MutAnyOrigin](to=sc[].cells[][0]), 0
+    )
+    var ha = sp[].spawn[Activity](
+        rt, UnsafePointer[TB_A, MutAnyOrigin](to=sc[].act[]), 0
+    )
     _ = execute(hp, body_fetch, id_cell.bitcast[Byte]())
     _ = execute(ha, body_track, id_cell.bitcast[Byte]())
     # typed joins: Profile + Activity static types side by side (acceptance).
@@ -191,8 +213,12 @@ def service_first_error(
     mut rt: Runtime, sp: UnsafePointer[Scope, MutAnyOrigin], ud: BytePtr
 ) raises:
     var sc = UnsafePointer[Scene, MutAnyOrigin](unsafe_from_address=Int(ud))
-    var hp = sp[].spawn[Profile](rt, sc[].cells[][0], 0)
-    var ha = sp[].spawn[Activity](rt, sc[].act[], 0)
+    var hp = sp[].spawn[Profile](
+        rt, UnsafePointer[TB_P, MutAnyOrigin](to=sc[].cells[][0]), 0
+    )
+    var ha = sp[].spawn[Activity](
+        rt, UnsafePointer[TB_A, MutAnyOrigin](to=sc[].act[]), 0
+    )
     _ = execute(hp, body_boom, UnsafePointer[Byte, MutAnyOrigin](unsafe_from_address=0x33))
     # the Activity sibling is mid-flight on the cooperative worker: model its
     # RUNNING frame directly (it would otherwise keep running in the
@@ -305,7 +331,7 @@ def main() raises:
     var cell_p2 = TB_P.create()
     var h1 = sp_h[].spawn[Profile](rt, UnsafePointer[TB_P, MutAnyOrigin](to=cell_p1), 0)
     var h2 = sp_h[].spawn[Profile](rt, UnsafePointer[TB_P, MutAnyOrigin](to=cell_p2), 0)
-    var id_e = UnsafePointer[Int, MutAnyOrigin>(
+    var id_e = UnsafePointer[Int, MutAnyOrigin](
         unsafe_from_address=Int(args_e.unsafe_ptr()) + 0 * 8
     )
     id_e[] = 2
@@ -320,7 +346,7 @@ def main() raises:
     # ---- F. negative: wrong-type boundary cast -> deterministic tag mismatch
     var args_f = List[Int]()
     args_f.append(0)
-    var id_f = UnsafePointer[Int, MutAnyOrigin>(
+    var id_f = UnsafePointer[Int, MutAnyOrigin](
         unsafe_from_address=Int(args_f.unsafe_ptr()) + 0 * 8
     )
     var s_m = make_scope(62, UnsafePointer[List[Int], MutAnyOrigin](to=args_f), False)
