@@ -57,6 +57,13 @@ struct Runtime:
                      count ROLE-task executions by run(); _enqueued counts
                      runnable registrations (spawn/wake).  Tests observe
                      these instead of trusting silent success.
+      _fiber_drives / _fiber_switches — A1.5 (issue #53) fiber-path toggle:
+                     drives count scheduler slices that drove a task's FIBER;
+                     switches count the actual ms_ctx_switch calls (2 per
+                     fiber drive: switch-in + switch-out at the park or the
+                     completion trampoline).  CHEAP (non-parking) tasks never
+                     touch these — the fast-path regression guard asserts a
+                     non-parking run observes 0.
     """
 
     comptime NO_SCOPE = Int(0)
@@ -69,6 +76,8 @@ struct Runtime:
     var _tasks_completed: Int
     var _enqueued: Int
     var _skipped: Int
+    var _fiber_drives: Int
+    var _fiber_switches: Int
 
     def __init__(out self):
         self._ready = FifoQueue[TaskRecord]()
@@ -79,6 +88,8 @@ struct Runtime:
         self._tasks_completed = 0
         self._enqueued = 0
         self._skipped = 0
+        self._fiber_drives = 0
+        self._fiber_switches = 0
 
     # --- root-task execution (A0-T1) ----------------------------------------
 
@@ -144,6 +155,7 @@ struct Runtime:
 
     def enqueued(self) -> Int:
         return self._enqueued
+
     def note_skipped(mut self):
         """Count a popped RUNNABLE record that was skipped (its TCB was not
         RUNNABLE — stale duplicate) by the scheduler loop."""
@@ -152,6 +164,27 @@ struct Runtime:
     def skipped(self) -> Int:
         """Number of stale/duplicate records the scheduler loop skipped."""
         return self._skipped
+
+    # --- A1.5 fiber-path toggle (issue #53) ---------------------------------
+
+    def note_fiber_drive(mut self):
+        """Count one fiber-backed dispatch slice (a record driven on a task
+        fiber; the cheap path never calls this)."""
+        self._fiber_drives += 1
+
+    def note_fiber_switch(mut self):
+        """Count one fiber stack switch (ms_ctx_switch; the cheap path never
+        calls this)."""
+        self._fiber_switches += 1
+
+    def fiber_drives(self) -> Int:
+        """Fiber-backed dispatch slices served (A1.5 seam; issue #53)."""
+        return self._fiber_drives
+
+    def fiber_switches(self) -> Int:
+        """Actual fiber stack switches (issue #53 cheap-path guard: a
+        non-parking run must observe 0)."""
+        return self._fiber_switches
 
     def scope_handle(self) -> Int:
         return self._scope
