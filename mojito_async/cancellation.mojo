@@ -106,6 +106,12 @@ struct CancelFlag(ImplicitlyCopyable, ImplicitlyDeletable):
     def set_parent(mut self, parent: UnsafePointer[CancelFlag, MutAnyOrigin]):
         self._parent = Optional[UnsafePointer[CancelFlag, MutAnyOrigin]](parent)
 
+    def clear_parent(mut self):
+        """Sever the parent link (symmetry with set_parent).  After this the
+        flag is effectively a root: is_requested()/checkpoint() no longer read
+        through to a former parent.  Idempotent when already parent-less."""
+        self._parent = Optional[UnsafePointer[CancelFlag, MutAnyOrigin]]()
+
 
 # ---------------------------------------------------------------------------
 # CancellationToken — the public surface wrapping a CancelFlag cell

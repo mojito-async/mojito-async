@@ -25,6 +25,9 @@
 #     message prefixes);
 #   - double-register / unregister / unregister-of-unknown refuse
 #     deterministically and never leave a stale mapping behind.
+#   - symmetric unregister: unregister_child / unregister_scope severs the
+#     child's parent link (clear_parent), so a later scope request no longer
+#     propagates into an unregistered child flag.
 #
 # Verdict: exit 0 + "PASS"; any RED prints + raises (exit 1).
 from std.collections import List
@@ -174,6 +177,37 @@ def main() raises:
         re_reg = True
     if not re_reg:
         red("re-register of an already-mapped child did not refuse")
+
+    # 7. symmetric unregister: unregister_child severs the child's parent link
+    # (clear_parent symmetry with register_child's set_parent), so a later
+    # scope request no longer propagates into the unregistered child flag.
+    var sym_scope = make_cancel_flag()
+    var sym_sp = UnsafePointer[CancelFlag, MutAnyOrigin](to=sym_scope)
+    var sym_child = make_cancel_flag()
+    var sym_cp = UnsafePointer[CancelFlag, MutAnyOrigin](to=sym_child)
+    var sym_reg = make_cancel_flag_registry()
+    var sym_rp = UnsafePointer[CancelFlagRegistry, MutAnyOrigin](to=sym_reg)
+    sym_rp[].register_scope(77, sym_sp)
+    sym_rp[].register_child(77, 771, sym_cp)  # links child under scope
+    sym_scope.request()
+    if not sym_child.is_requested():
+        red("registered child did not read through the requested scope flag")
+    sym_rp[].unregister_child(77, 771)  # severs the parent link (clear_parent)
+    # Re-verify the real contract with a FRESH child: register, then
+    # unregister, then request the scope — the unregistered child must NOT
+    # read through any more.
+    var sym2_scope = make_cancel_flag()
+    var sym2_sp = UnsafePointer[CancelFlag, MutAnyOrigin](to=sym2_scope)
+    var sym2_child = make_cancel_flag()
+    var sym2_cp = UnsafePointer[CancelFlag, MutAnyOrigin](to=sym2_child)
+    var sym2_reg = make_cancel_flag_registry()
+    var sym2_rp = UnsafePointer[CancelFlagRegistry, MutAnyOrigin](to=sym2_reg)
+    sym2_rp[].register_scope(88, sym2_sp)
+    sym2_rp[].register_child(88, 881, sym2_cp)
+    sym2_rp[].unregister_child(88, 881)
+    sym2_scope.request()
+    if sym2_child.is_requested():
+        red("unregistered child still read through the scope flag (clear_parent broken)")
 
     # 8. duplicate scope registration refuses; unregister of an unknown scope
     # refuses; a fresh registry starts empty.
