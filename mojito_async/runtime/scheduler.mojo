@@ -19,18 +19,18 @@
 #     queue; E5 routes it to the OWNER worker, spec §19.2).  The A1.1
 #     `_suspend_current` / `resume_current` spellings were deleted; every
 #     consumer and lane driver imports park.mojo.
-#   - `scheduler_loop` — the per-worker cooperative drive loop.  It is
-#     GENERIC over a statically-known task-owner dispatcher (b2 cannot store
-#     function values): the caller supplies the body executor for THIS task
-#     tree, so unstarted records are executed exactly where their bodies are
-#     known (the spike's proven model; NEVER dynamic dispatch through the
-#     record).  The loop drains the worker's LOCAL deque first, then its
-#     REMOTE-ready queue (spec §21), running each record via the dispatcher
-#     to its next checkpoint, and stops when both are quiet.  A popped
-#     record whose TCB is not RUNNABLE (stale duplicate) is SKIPPED —
-#     counted via rt.skipped(), never dispatched (the A1 invariant survives
-#     the queue split, issue #68).
+#     A2.5 (issue #71) — STARTED-FIBER AFFINITY: the loop stamps
+#     owner_worker AND the owner Runtime address at FIRST RUN (when
+#     `worker_id` is nonzero), and asserts the no-off-owner invariant
+#     (a STARTED record is never popped by a non-owner worker — spec §19.2;
+#     the wake routing in park.mojo + E4's steal guard make it unreachable,
+#     this is the debug assertion path).  OWNERSHIP SPLIT (#73 fairness:
+#     yield_now's `rt.note_yield()` line + the fair_scheduler_loop append
+#     are the sibling lane's; this lane edits only scheduler_loop's body).
 #
+#     # E3-OWNED: injection intake (issue #69) — #69's bounded injection poll
+#     # (optional `inject`/`inject_budget` params, default None) drops in at
+#     # the seam below, BEFORE pop_local, keeping the A1 call form.
 #
 # A1.5 (issue #53) — the FIBER-BACKED drive.  This module stays EXTERN-FREE
 # and UNCHANGED in its mechanics: the per-worker loop pops a RUNNABLE
@@ -144,8 +144,31 @@ def scheduler_loop[F: def(mut Runtime, Int, Int, BytePtr) raises -> Int, R: Resu
         if checker[].state() != TaskControlBlock.RUNNABLE:
             rt.note_skipped()
             continue
-        if worker_id != 0 and checker[].owner_worker() == 0:
+        var own = checker[].owner_worker()
+        # no-off-owner invariant (issue #71): a STARTED record is worker-
+        # affine — the wake routing (park.mojo's owner-remote push) and E4's
+        # steal guard keep it off every non-owner queue, so popping one here
+        # is a migration bug.  Assert it (debug builds; the A1 unpooled
+        # sentinel worker_id == 0 skips the check).
+        if own != 0 and worker_id != 0 and own != worker_id:
+            raise Error(
+                "scheduler_loop: STARTED task "
+                + String(rec.task_id)
+                + " popped off-owner (owner "
+                + String(own)
+                + ", worker "
+                + String(worker_id)
+                + ") — a started fiber must never migrate (issue #71)"
+            )
+        if worker_id != 0 and own == 0:
+            # FIRST RUN: stamp the worker affinity — the owner worker id
+            # (E5 surface, issue #68) AND the owner Runtime address (issue
+            # #71: the cross-worker wake route target, so unpark_current
+            # needs no global worker registry).
             checker[].set_owner_worker(worker_id)
+            checker[].set_owner_runtime(
+                Int(UnsafePointer[Runtime, MutAnyOrigin](to=rt))
+            )
         slices += 1
         _ = dispatcher(rt, rec.tcb_addr, rec.task_id, ud)
     return slices
