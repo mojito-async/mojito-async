@@ -19,17 +19,18 @@
 #     queue; E5 routes it to the OWNER worker, spec §19.2).  The A1.1
 #     `_suspend_current` / `resume_current` spellings were deleted; every
 #     consumer and lane driver imports park.mojo.
-#     OWNERSHIP SPLIT (this branch, post-repair): the BASE scheduler_loop
-#     stamps owner_worker at FIRST RUN (E5 surface, issue #68) — the owner
-#     RUNTIME address stamp + the base loop's no-off-owner assertion are
-#     the #71 lane's (FoldPark, with its owner-routed park).  The H1 fold
-#     (#73/#71 coordinate) lives in fair_scheduler_loop below: it stamps
-#     owner_worker AND the owner Runtime address at FIRST RUN, and asserts
-#     the no-off-owner invariant on its REMOTE-ready pops (a STARTED record
-#     is never popped by a non-owner worker — spec §19.2; sound on this
-#     base because remote records carry either no owner yet or this
-#     worker's own id, and t36 is the only fair-loop driver).  When the
-#     #71 lane lands, both loops carry the full invariant.
+#     A2.5 (issue #71) — STARTED-FIBER AFFINITY / OWNERSHIP SPLIT: the
+#     BASE scheduler_loop stamps owner_worker AND the owner Runtime
+#     address at FIRST RUN (when `worker_id` is nonzero) and asserts the
+#     no-off-owner invariant (a STARTED record is never popped by a
+#     non-owner worker — spec §19.2; the wake routing in park.mojo + E4's
+#     steal guard make it unreachable, this is the debug assertion path).
+#     H1 fold (#73/#71 coordinate): fair_scheduler_loop stamps BOTH at
+#     FIRST RUN (owner_worker + owner Runtime address) and asserts the
+#     same no-off-owner invariant on its REMOTE-ready pops (budget-drain
+#     + main pick) — sound on this base because every remote record
+#     carries either no owner yet or this worker's own id, and t36 is the
+#     only fair-loop driver.
 #
 #     # E3-OWNED: injection intake (issue #69) — #69's bounded injection poll
 #     # (optional `inject`/`inject_budget` params, default None) drops in at
@@ -185,16 +186,31 @@ def scheduler_loop[F: def(mut Runtime, Int, Int, BytePtr) raises -> Int, R: Resu
         if checker[].state() != TaskControlBlock.RUNNABLE:
             rt.note_skipped()
             continue
-        # E5 first-run owner stamp (issue #68): the owner WORKER id only —
-        # the owner RUNTIME address stamp + the base loop's no-off-owner
-        # assertion land with the #71 lane's park routing (FoldPark);
-        # fair_scheduler_loop below carries the H1 fold (issue #73/#71):
-        # BOTH stamps at first run + the no-off-owner assertion on its
-        # remote-ready pops (sound on this base: remote records carry
-        # either no owner yet or this worker's own id — t36 is the only
-        # fair-loop driver).
-        if worker_id != 0 and checker[].owner_worker() == 0:
+        var own = checker[].owner_worker()
+        # no-off-owner invariant (issue #71): a STARTED record is worker-
+        # affine — the wake routing (park.mojo's owner-remote push) and E4's
+        # steal guard keep it off every non-owner queue, so popping one here
+        # is a migration bug.  Assert it (debug builds; the A1 unpooled
+        # sentinel worker_id == 0 skips the check).
+        if own != 0 and worker_id != 0 and own != worker_id:
+            raise Error(
+                "scheduler_loop: STARTED task "
+                + String(rec.task_id)
+                + " popped off-owner (owner "
+                + String(own)
+                + ", worker "
+                + String(worker_id)
+                + ") — a started fiber must never migrate (issue #71)"
+            )
+        if worker_id != 0 and own == 0:
+            # FIRST RUN: stamp the worker affinity — the owner worker id
+            # (E5 surface, issue #68) AND the owner Runtime address (issue
+            # #71: the cross-worker wake route target, so unpark_current
+            # needs no global worker registry).
             checker[].set_owner_worker(worker_id)
+            checker[].set_owner_runtime(
+                Int(UnsafePointer[Runtime, MutAnyOrigin](to=rt))
+            )
         slices += 1
         _ = dispatcher(rt, rec.tcb_addr, rec.task_id, ud)
     return slices
