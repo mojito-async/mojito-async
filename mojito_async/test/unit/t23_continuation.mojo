@@ -223,7 +223,7 @@ def main() raises:
     cont_cycle.start()
     if cont_cycle.state() != FiberContinuation.STARTED:
         failures.append("cycle start must move to STARTED")
-    cont_cycle.resume()   # episode 1 enters: REFRESHED_ONCE (running)
+    cont_cycle.resume()   # episode 1 enters: RESUMED_ONCE (running)
     if cont_cycle.state() != FiberContinuation.RESUMED_ONCE:
         failures.append("cycle episode 1 must be RUNNING (RESUMED_ONCE)")
     cont_cycle.suspend()  # body parks: SUSPENDED

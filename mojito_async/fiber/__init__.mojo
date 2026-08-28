@@ -9,12 +9,15 @@
 # package re-exports the concrete fiber binding surface so consumers import
 # from mojito_async.fiber (spec §6 layout).
 #
-# The stack pool (issue #52) and the continuation layer (issue #50) are
-# provided by sibling files in this package; their names are added to this
-# module as those lanes land (additive, never removed).
 from mojito_async.fiber.fiber import (
     Fiber,
     FiberFrame,
     bind,
     make_fiber,
+)
+from mojito_async.fiber.continuation import (
+    FiberContinuation,
+    FiberMotion,
+    is_continuation_error,
+    make_continuation,
 )
