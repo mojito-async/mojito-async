@@ -129,7 +129,3 @@ def unpark_current[R: ResultValue](
 #     park_current while holding the pool latched.
 #   - cross-worker wakes route through wake_target_worker (scheduler.mojo,
 #     A1.3 affinity seam) + the E5 adapter; nothing here changes for A2.1.
-=======
-# That adapter is the spike's event.mojo park_pipeline promoted into this
-# module when #2 lands; A1 ships only the WAITING-side pair this worker can
-# actually race on (which is none).
