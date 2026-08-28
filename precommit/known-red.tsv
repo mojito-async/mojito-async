@@ -5,3 +5,8 @@
 # commit of the same PR) and does NOT block the commit; the failure is still
 # logged. Remove the row as soon as the implementation turns the test green —
 # an unlisted failure blocks the commit.
+
+# A2.5 (issue #71) TDD-red: t34_two_phase_aot + t34b_affinity_aot compile
+# only once the two-phase park + affinity implementation lands (the
+# implementation commit of the same PR).
+suite	https://github.com/mojito-async/mojito-async/issues/71
