@@ -15,11 +15,8 @@
 from std.memory import stack_allocation
 from mojito_async.integration.sys import BytePtr, IntResult
 from mojito_async.runtime.runtime import Runtime, create
-from mojito_async.runtime.scheduler import (
-    _suspend_current,
-    resume_current,
-    scheduler_loop,
-)
+from mojito_async.runtime.scheduler import scheduler_loop
+from mojito_async.runtime.park import park_current, unpark_current
 from mojito_async.runtime.task_control_block import TaskControlBlock
 from mojito_async.sync import Mutex
 from mojito_async.task import JoinHandle, claim_running, spawn
@@ -81,7 +78,7 @@ def a_dispatch(mut rt: Runtime, tcb_addr: Int, tid: Int, ud: BytePtr) raises -> 
             sc[].seq0[i] = E_LOCKED
             sc[].seqN[] = i + 1
             sc[].ph_hold[] = 1
-            _suspend_current(rt, h)
+            park_current(rt, h)
             return 1
         else:
             claim_running(h)
@@ -154,7 +151,7 @@ def scenario_a() raises:
     if h_b.state() != TaskControlBlock.WAITING:
         red("waiter did not park")
 
-    resume_current(rt, h_a)
+    unpark_current(rt, h_a)
     _ = scheduler_loop(rt, a_dispatch, ud)
 
     if not h_a.is_completed():

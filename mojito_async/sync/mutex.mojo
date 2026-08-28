@@ -14,7 +14,7 @@
 #     worker slice (no invisible preemption), mirroring the spec's atomic
 #     model without a spur.
 #   - slow path: publish the current task as an embedded FIFO waiter; park it
-#     via the A1.1 `_suspend_current`; the caller is free to drive other
+#     via the A1.1 `park_current`; the caller is free to drive other
 #     tasks.  A later unlock grants the head waiter (per-waiter GRANT marker
 #     in its embedded WaitNode), re-dispatches it; its lock() claims the
 #     marker and acquires without re-checking the contended state.
@@ -26,7 +26,7 @@
 # Lost-wakeup safety: within one dispatcher slice there is no interleaving, so
 # publish+park on the slow path is atomic with respect to other tasks; a
 # release therefore always finds its waiter already parked (WAITING) and the
-# A1.1 `resume_current` delivers readiness exactly once per epoch.
+# A1.1 `unpark_current` delivers readiness exactly once per epoch.
 #
 # Mojo 1.0.0b2 (def-only) constraints honored: `def` only; generic methods
 # parameterized on the caller's ResultValue R; module-level factories; the
@@ -34,9 +34,9 @@
 # allocation on the fast path.
 from std.collections import Deque
 from mojito_async.runtime.runtime import Runtime
-from mojito_async.runtime.scheduler import _suspend_current, resume_current
 from mojito_async.runtime.task_control_block import ResultValue, TaskControlBlock
 from mojito_async.task import JoinHandle
+from mojito_async.runtime.park import park_current, unpark_current
 
 
 comptime WAITER_GRANTED = Int(1)
@@ -115,7 +115,7 @@ struct Mutex[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable](Movable, Imp
         """Task-aware acquire.  Returns True when THIS call owns the lock.
 
         Fast path returns immediately.  On contention: publish the caller as
-        an embedded FIFO waiter, park it via the A1.1 `_suspend_current`, and
+        an embedded FIFO waiter, park it via the A1.1 `park_current`, and
         return False — the caller's dispatcher is free to drive other tasks.
         A later unlock grants the head waiter, which is re-dispatched, enters
         lock() again, claims its GRANT marker and returns True.
@@ -131,7 +131,7 @@ struct Mutex[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable](Movable, Imp
         # 3) contended slow path
         self._w_tcb.append(Int(h.tcb()))
         self._w_id.append(h.id())
-        _suspend_current(rt, h)
+        park_current(rt, h)
         return False
 
     # --- unlock / handoff (spec §34.3) -------------------------------------
@@ -149,7 +149,7 @@ struct Mutex[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable](Movable, Imp
         var tid = self._w_id.popleft()
         var hw = _waiter_handle[R](tcb, tid)
         hw.tcb()[].wait_node()[].set_next(WAITER_GRANTED)
-        resume_current(rt, hw)
+        unpark_current(rt, hw)
         return True
 
     def holds_grant[R: ResultValue](self, h: JoinHandle[R]) -> Bool:
