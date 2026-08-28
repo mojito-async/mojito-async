@@ -268,9 +268,11 @@ def main() raises:
     var ud0 = scp0.bitcast[Byte]()
     var t_p0 = TB.create()
     var t_c0 = TB.create()
-    # producer FIRST: with the buffer full it must park on its first attempt
-    var h_p0 = spawn(rt0, UnsafePointer[TB, MutAnyOrigin](to=t_p0), 0)
+    # A2.2 (issue #68): owner pop is LIFO, so register the consumer FIRST
+    # and the producer after -> the producer pops first and parks on the
+    # full buffer (its first attempt).
     var h_c0 = spawn(rt0, UnsafePointer[TB, MutAnyOrigin](to=t_c0), 0)
+    var h_p0 = spawn(rt0, UnsafePointer[TB, MutAnyOrigin](to=t_p0), 0)
     scp0[].p_tcb = UnsafePointer[TB, MutAnyOrigin](to=t_p0)
     scp0[].c_tcb = UnsafePointer[TB, MutAnyOrigin](to=t_c0)
     scp0[].p_id[] = h_p0.id()
@@ -316,9 +318,11 @@ def main() raises:
     var ud1 = scp1.bitcast[Byte]()
     var t_p1 = TB.create()
     var t_c1 = TB.create()
-    # consumer FIRST so it parks on the empty channel before the producer runs
-    var h_c1 = spawn(rt1, UnsafePointer[TB, MutAnyOrigin](to=t_c1), 0)
+    # A2.2 (issue #68): owner pop is LIFO, so register the producer FIRST
+    # and the consumer after -> the consumer pops first and parks on the
+    # empty channel before the producer runs.
     var h_p1 = spawn(rt1, UnsafePointer[TB, MutAnyOrigin](to=t_p1), 0)
+    var h_c1 = spawn(rt1, UnsafePointer[TB, MutAnyOrigin](to=t_c1), 0)
     scp1[].p_tcb = UnsafePointer[TB, MutAnyOrigin](to=t_p1)
     scp1[].c_tcb = UnsafePointer[TB, MutAnyOrigin](to=t_c1)
     scp1[].p_id[] = h_p1.id()
@@ -360,8 +364,10 @@ def main() raises:
     var ud2 = scp2.bitcast[Byte]()
     var t_p2 = TB.create()
     var t_c2 = TB.create()
-    var h_c2 = spawn(rt2, UnsafePointer[TB, MutAnyOrigin](to=t_c2), 0)
+    # LIFO owner pop (issue #68): producer registered first, consumer after
+    # -> consumer parks on the empty channel first, then the chain pumps.
     var h_p2 = spawn(rt2, UnsafePointer[TB, MutAnyOrigin](to=t_p2), 0)
+    var h_c2 = spawn(rt2, UnsafePointer[TB, MutAnyOrigin](to=t_c2), 0)
     scp2[].p_tcb = UnsafePointer[TB, MutAnyOrigin](to=t_p2)
     scp2[].c_tcb = UnsafePointer[TB, MutAnyOrigin](to=t_c2)
     scp2[].p_id[] = h_p2.id()
@@ -405,8 +411,10 @@ def main() raises:
     var ud3 = scp3.bitcast[Byte]()
     var t_p3 = TB.create()
     var t_c3 = TB.create()
-    var h_c3 = spawn(rt3, UnsafePointer[TB, MutAnyOrigin](to=t_c3), 0)
+    # LIFO owner pop (issue #68): producer registered first, consumer after
+    # -> consumer parks on the empty channel first, then the ping-pong.
     var h_p3 = spawn(rt3, UnsafePointer[TB, MutAnyOrigin](to=t_p3), 0)
+    var h_c3 = spawn(rt3, UnsafePointer[TB, MutAnyOrigin](to=t_c3), 0)
     scp3[].p_tcb = UnsafePointer[TB, MutAnyOrigin](to=t_p3)
     scp3[].c_tcb = UnsafePointer[TB, MutAnyOrigin](to=t_c3)
     scp3[].p_id[] = h_p3.id()

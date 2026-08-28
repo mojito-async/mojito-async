@@ -38,7 +38,7 @@ OBJS   := $(patsubst $(PROD)/%.c,$(BUILD)/prod/%.o,$(CSRCS_P)) \
 HAS_SOURCES := $(CSRCS_S)$(SSRCS_S)$(CSRCS_P)$(SSRCS_P)
 
 .DELETE_ON_ERROR:
-.PHONY: all test clean
+.PHONY: all test bench clean
 
 all:
 	@$(if $(HAS_SOURCES),$(MAKE) $(DYLIB),echo "make: no vendored C/asm sources yet; nothing to build.")
@@ -72,6 +72,12 @@ test:
 	@$(if $(HAS_SOURCES),$(MAKE) $(DYLIB),echo "make test: no vendored C/asm sources yet; skipping dylib build.")
 	@MOJO="$(MOJO)" CC="$(CC)" ./$(RUNSH)
 	@MOJO="$(MOJO)" ./$(A11SH)
+	@MOJO="$(MOJO)" ./bench/run.sh
+
+# A2.8 (issue #74): standalone benchmark run (bench/run.sh; also wired into
+# the pre-commit suite via precommit/run-suite.sh).
+bench:
+	@MOJO="$(MOJO)" ./bench/run.sh
 
 clean:
 	rm -rf $(BUILD) $(DYLIB)
