@@ -44,6 +44,7 @@
 from mojito_async.integration.sys import BytePtr
 from mojito_async.runtime.runtime import Nil, Runtime
 from mojito_async.runtime.task_control_block import ResultValue, TaskControlBlock
+from mojito_async.runtime.inject_queue import InjectQueue
 
 
 # ---------------------------------------------------------------------------
@@ -81,6 +82,8 @@ def scheduler_loop[F: def(mut Runtime, Int, Int, BytePtr) raises -> Int, R: Resu
     mut rt: Runtime,
     dispatcher: F,
     ud: BytePtr,
+    inject: Optional[UnsafePointer[InjectQueue, MutAnyOrigin]] = None,
+    inject_budget: Int = 4,
 ) raises -> Int:
     """Drive the ONE worker until its runnable queue is quiet.
 
@@ -91,7 +94,19 @@ def scheduler_loop[F: def(mut Runtime, Int, Int, BytePtr) raises -> Int, R: Resu
     completed is handled by the dispatcher over rt.  Returns the number of
     records SERVED (observable progress); skipped records are observable via
     `rt.skipped()`.
+
+    A2.3 (issue #69) bounded injection poll: when `inject` names the shared
+    MPSC InjectQueue, each loop slice services at most `inject_budget`
+    injected records before returning to the worker's local queue — the
+    fairness bound that keeps one busy worker from starving global intake
+    (spec §21/§86; E7 sharpens the budget).  TDD-RED SCAFFOLD: the poll
+    raises "not implemented" until the GREEN commit; callers passing no
+    `inject` keep the A1 single-worker semantics below unchanged.
     """
+    if inject:
+        raise Error(
+            "scheduler_loop: a2.3 injection poll not implemented yet (issue #69)"
+        )
     var slices = 0
     while rt.has_ready():
         var rec = rt.pop_ready()
