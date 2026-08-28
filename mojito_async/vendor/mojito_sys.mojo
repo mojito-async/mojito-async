@@ -139,6 +139,21 @@ def ms_live_stack_count() abi("C") -> Int:
     ...
 
 
+# Liveness probe for a stack reservation: 1 when `base` is a still-registered
+# (not-yet-freed) reservation, 0 when it was never allocated or was already
+# ms_stack_free'd (munmap'd).  Used by the stack pool (issue #52) to refuse
+# release()/warm-acquire of a reservation a Fiber.destroy already freed.
+@extern("ms_stack_is_live")
+def ms_stack_is_live(base: BytePtr) abi("C") -> Int32:
+    ...
+
+
+@extern("ms_stack_total_size")
+def ms_stack_total_size() abi("C") -> Int:
+    ...
+    ...
+
+
 # ctx: 176-byte ms_ctx_t write target; stack_top: initial sp (16-aligned);
 # entry: ms_entry_fn code pointer (see entry_pointer above);
 # userdata: passed through unmodified to entry(userdata).
@@ -163,7 +178,7 @@ def ms_ctx_switch(from_: BytePtr, to: BytePtr) abi("C"):
 # The Fiber struct stays all-scalar; its two 176-byte ms_ctx_t slots, the
 # FiberFrame sidecar and the entry/userdata scratch live in ONE malloc'd
 # block -- so the struct is trivially copy-safe, and destroy() frees one
-# block.  libc is not mojito-sys, but the C-ABI firewall is the single home
+# block.  libc is not mojito-sys, but the C-ABI firewall is the single touch
 # of every extern the runtime needs, so the allocator pair lives here too
 # (never in fiber.mojo).
 # ---------------------------------------------------------------------------

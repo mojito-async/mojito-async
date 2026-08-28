@@ -21,6 +21,7 @@ from mojito_async.vendor.mojito_sys import (
     ms_page_size,
     ms_stack_alloc,
     ms_stack_free,
+    ms_stack_is_live,
     ms_stack_total_size,
     stack_free,
 )
