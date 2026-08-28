@@ -147,3 +147,12 @@ int ms_stack_is_live(void *base) {
             return 1;
     return 0;
 }
+
+
+/* Sum of all live reservations, guard pages included (reporting only). */
+size_t ms_stack_total_size(void) {
+    size_t total = 0;
+    for (size_t i = 0; i < g_resv_len; ++i)
+        total += g_resv[i].total;
+    return total;
+}

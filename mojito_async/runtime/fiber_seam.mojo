@@ -27,18 +27,16 @@
 #   - a wake is fiber_resume_current (WAITING -> RUNNABLE + re-enqueue, the
 #     #39 unpark kernel); the next scheduler slice re-enters the fiber at
 #     its exact point;
-#   - completion: the body parks through a DIRECT ms_ctx_switch (it never
-#     touches the fiber's suspended flag), so park-vs-complete is decided by
-#     the DRIVER's deterministic slice bookkeeping (the single-worker loop
-#     knows which slice it is — the t15/t25 pattern): on the completing
-#     slice the driver calls seam_mark_completed() and settles RUNNING ->
-#     COMPLETED + result.
+#   - completion: the body UNWINDS (its entry thunk returns), so the frame
+#     never reports a park — the seam_drive verdict is read from the
+#     FiberFrame.parked flag that seam_park_switch stamps on the fiber
+#     BEFORE the switch back (see DriveVerdict below).
 #
-# Each worker owns ONE native context (spec §18): the fiber's caller is the
+# Each worker owns ONE native context (spec #18): the fiber's caller is the
 # worker's own stack; any number of task frames run through it without
 # stacking.
 #
-# Cheap path (issue #53, acceptance): a task whose body never parks is
+# Cheap path (issue #15, acceptance): a task whose body never parks is
 # dispatched with plain execute() on the worker's native context — ZERO
 # fiber switches; the Runtime's fiber_drives/fiber_switches toggle stays
 # flat (the fast-path regression guard asserts 0 for non-parking runs).
@@ -51,8 +49,7 @@
 # EXTERN DISCIPLINE: every extern call site (ms_stack_alloc, ms_ctx_switch)
 # sits at this CONCRETE module scope (or in the vendored firewall /
 # fiber.mojo's concrete methods); generic functions here (fiber_suspend_*)
-# never lower externs.  Consumed ONLY by *_aot drivers (the b2 JIT cannot
-# resolve dylib symbols through an imported module).
+# never lower externs.  Consumed ONLY by the schema driver (b2 JIT integrity).
 #
 # Stack-cache seam (#52): A1.5 binds FRESH #49 reservations (the issue's
 # "else a fresh #49 binding" branch).  Reusing a #52 StackCache cell across
@@ -75,18 +72,51 @@ from mojito_async.runtime.park import park_current, unpark_current
 from mojito_async.runtime.scheduler import yield_now
 
 
+comptime FIBER_TOGGLE = True
+
+
+# ---------------------------------------------------------------------------
+# DriveVerdict — the frame-reported outcome of one seam_drive slice (T3)
+# ---------------------------------------------------------------------------
+#
+# A frame-reported park/complete verdict (T3, issue #53 / consensus): the
+# disassembler NO LONGER relies on hardcoded driver slice counts to decide
+# whether a resume() returned because the body PARKED mid-frame or because a
+# task COMPLETED.  seam_park_switch stamps FiberFrame.parked = 1 right
+# before the fiber->caller switch; seam_drive reads the flag after resume()
+# returns and returns Parked | Completed accordingly.  A generic EPIC #2
+# dispatcher keys off this verdict, so a miscount can never silently wrong-
+# transition a task.
+struct DriveVerdict:
+    """Frame-reported outcome of one seam_drive slice (issue #15, T3)."""
+
+    comptime Parked = Int(1)
+    comptime Completed = Int(0)
+
+    var _v: Int
+
+    def __init__(out self, v: Int):
+        self._v = v
+
+    def value(self) -> Int:
+        return self._v
+
+    def is_parked(self) -> Bool:
+        return self._v == Self.Parked
+
+
 # ---------------------------------------------------------------------------
 # SeamSlot — one task's fiber + lifecycle state
 # ---------------------------------------------------------------------------
 
-struct SeamSlot(ImplicitlyCopyable, ImplicitlyDeletable):
+struct SeamSlot(Movable, ImplicitlyDeletable):
     """One task's fiber and its drive lifecycle (A1.5, issue #53).
 
     DRIVER-OWNED and STABLE: each slot lives in a heap cell or a stable
     local the driver never moves once the fiber is WIRED (ADR-007 — the
     fiber sidecar and in-flight entry hold pointers into its block slots).
-    A slot is implicitly copyable (all-scalar Fiber handle) but a WIRED
-    slot must never be copied; only its address is threaded.
+    A slot is Movable and never copied (its Fiber is Movable post-#49-fold);
+    a WIRED slot must never be moved either — only its address is threaded.
 
     Lifecycle:
       make_seam_slot()        inert slot (no fiber)
@@ -152,64 +182,86 @@ def seam_bind_slot(
     slot[].finished = False
 
 
-def seam_drive(mut rt: Runtime, slot: UnsafePointer[SeamSlot, MutAnyOrigin]) raises:
+def seam_drive(mut rt: Runtime, slot: UnsafePointer[SeamSlot, MutAnyOrigin]) raises -> DriveVerdict:
     """ONE fiber-backed dispatch slice (the drive the generic scheduler_loop
-    reaches through the driver value).
+    reaches through the driver value).  Returns the frame-reported Parked |
+    Completed verdict (T3).
 
-      - LOUD frame contract: a terminal slot (body already unwound) raises
-        instead of silently walking the frame again;
+      - LOUD frame contract: an already-terminal slot raises instead of
+        silently walking the frame again;
       - switch caller -> fiber (counted): the FIRST slice makes the fresh
         context (ms_ctx_make, deferred to the fiber's first resume); every
         later slice RE-ENTERS at the exact saved point;
-      - when the switch returns, the body either PARKED mid-frame (worker's
-        native context untouched; the dispatcher then commits
-        fiber_suspend_current / fiber_yield_now) or UNWOUND — park-vs-
-        complete is the DRIVER's deterministic slice bookkeeping (t15/t25
-        pattern); the completing slice calls seam_mark_completed() and
-        settles RUNNING -> COMPLETED.  The frame never reports completion
-        itself, because the body parks through a direct switch that does not
-        touch the fiber's suspended flag;
+      - after resume() returns, seam_park_switch stamps FiberFrame.parked=1
+        iff the body parked mid-frame -> the return verdict is
+        DriveVerdict.Parked; an unwound body (no stamp) -> DriveVerdict.
+        Completed.  The verdict replaces hardcoded slice accounting;
       - counts: exactly 2 ms_ctx_switch calls per drive slice (switch-in +
-        switch-out at the park or the completion trampoline).
+        switch-out at the park or the completion trampoline).  The runtime
+        fiber toggle is gated by the comptime FIBER_TOGGLE (T4) so the
+        counters compile out of a release build; t16 asserts exact values.
     """
     if slot[].finished:
         raise Error(
             "fiber_seam.seam_drive: resume of an already-terminal fiber "
             "(resumed past its completion; frame contract violated)"
         )
-    rt.note_fiber_drive()
-    rt.note_fiber_switch()          # caller -> fiber
+    comptime if FIBER_TOGGLE:
+        rt.note_fiber_drive()           # one fiber-backed dispatch slice
+        rt.note_fiber_switch()          # caller -> fiber
+    var fr = slot[].fiber.frame_ptr().bitcast[FiberFrame]()
+    fr[].parked = False
     slot[].fiber.resume()
-    rt.note_fiber_switch()          # fiber -> caller (park or trampoline)
+    comptime if FIBER_TOGGLE:
+        rt.note_fiber_switch()          # fiber -> caller (park or trampoline)
     if not slot[].started:
         slot[].started = True
+    if fr[].parked:
+        return DriveVerdict(DriveVerdict.Parked)
+    return DriveVerdict(DriveVerdict.Completed)
 
 
 def seam_mark_completed(slot: UnsafePointer[SeamSlot, MutAnyOrigin]):
     """Record the slot's task reached TERMINAL (the body unwound on the
     completing dispatch slice — declared by the driver's slice accounting).
     From here seam_drive raises LOUDLY (the hardened frame contract) until
-    the slot is torn down (seam_destroy_slot) and reused through the
-    required terminal transition."""
+    the slot is torn down (seam_destroy_slot)."""
     slot[].finished = True
     slot[].started = True
 
 
-def seam_destroy_slot(slot: UnsafePointer[SeamSlot, MutAnyOrigin]):
+def seam_destroy_slot(slot: UnsafePointer[SeamSlot, MutAnyOrigin]) raises:
     """Terminal teardown (idempotent): the fiber releases its synthetic
-    stack reservation and its heap block; the slot returns to inert."""
+    stack reservation and its heap block; the slot returns to inert.
+
+    T6 (issue #53): destroying a slot whose fiber is PARKED/SUSPENDED raises
+    LOUDLY instead of destructing a live frame — the fiber's synthetic stack
+    reserve is still in use, so a silent destroy here would free a live
+    reservation (the stack-pool double-free class).  The FIRED (started)
+    state checks first: only a started slot can hold a live frame; inert
+    (never bound / already destroyed) and TERMINAL (finished) slots fall
+    through to the idempotent destroy."""
+    if slot[].started and not slot[].finished:
+        var fr = slot[].fiber.frame_ptr().bitcast[FiberFrame]()
+        var live = fr[].parked or slot[].fiber.is_suspended()
+        if live:
+            raise Error(
+                "fiber_seam.seam_destroy_slot: slot holds a parked/suspended "
+                "(live) fiber frame; teardown would free a live reservation "
+                "(drive to terminal first)"
+            )
     slot[].fiber.destroy()
     slot[].started = False
     slot[].finished = False
 
 
 def seam_park_switch(fr: UnsafePointer[FiberFrame, MutAnyOrigin]):
-    """In-fiber FIBER PARK: migrate the RUNNING frame OFF the worker's native
-    context onto the fiber's saved registers (fiber -> caller).  Called from
-    the task body at its exact park point (spec §60); the worker's native
-    context is untouched and immediately free for the next RUNNABLE record.
-    The frame re-enters at this exact point on the next seam_drive.  The
-    switch is counted by seam_drive (it covers the return side)."""
+    """In-fiber FIBER PARK: migrate the RUNNING frame OFF the worker's
+    native context onto the fiber's saved registers (fiber -> caller).
+    Stamps FiberFrame.parked = 1 BEFORE the switch so seam_drive can report
+    a Parked verdict (T3) when the switch returns.  Called from the task
+    body at its exact park point (spec §60)."""
+    fr[].parked = True
     ms_ctx_switch(fr[].self_ctx, fr[].caller_ctx)
 
 # ---------------------------------------------------------------------------
@@ -217,8 +269,8 @@ def seam_park_switch(fr: UnsafePointer[FiberFrame, MutAnyOrigin]):
 # ---------------------------------------------------------------------------
 # The FRAME already migrated (seam_park_switch + seam_drive); these close
 # the STATE half through the #39 single-source park/wake kernel
-# (park_current / unpark_current) and scheduler.yield_now's early-wake edge.
-# Generic-parameter functions here perform NO extern calls (b2 discipline).
+# (park_current / unpark_current) and scheduler.yield_early's early-wake
+# edge.  Generic-parameter functions here perform NO extern calls.
 
 def fiber_suspend_current[R: ResultValue](
     mut rt: Runtime,
@@ -227,15 +279,15 @@ def fiber_suspend_current[R: ResultValue](
 ) raises:
     """A1.5 `_suspend_current` (spec §60): the state commit of a fiber park.
 
-    RUNNING -> PARKING -> WAITING over the #39 kernel, stamping the wait
-    REASON and claiming a fresh wait epoch (generation-bumped).  The worker
-    is free for other RUNNABLE records; only a later wake re-enters this
-    fiber."""
+    After seam_park_switch, commit RUNNING -> PARKING -> WAITING over the
+    #39 kernel, stamping the wait REASON and claiming a fresh wait epoch
+    (generation is bumped).  The worker is free for other RUNNABLE records;
+    only a later wake re-enters this fiber at its exact saved frame."""
     park_current(rt, h, reason)
 
 
 def fiber_yield_now[R: ResultValue](mut rt: Runtime, h: JoinHandle[R]) raises:
-    """A1.5 `yield_now` (spec §27): the state commit of a fiber yield.
+    """A1.5 yield_now (spec §27): the state commit of a fiber yield.
 
     Takes the early-wake edge (spec A0.5): PARKING -> RUNNABLE with
     immediate FIFO re-enqueue and NO wait epoch — the task was never
@@ -245,8 +297,8 @@ def fiber_yield_now[R: ResultValue](mut rt: Runtime, h: JoinHandle[R]) raises:
 
 
 def fiber_resume_current[R: ResultValue](mut rt: Runtime, h: JoinHandle[R]) raises:
-    """A1.5 `resume_current` (spec §27): deliver readiness ONCE for a parked
+    """A1.5 `resume_current` (spec §60): deliver readiness ONCE for a parked
     fiber — WAITING -> RUNNABLE + FIFO re-enqueue via the #39 unpark kernel
     (enqueue-once; an already-RUNNABLE task is a no-op).  The next scheduler
-    slice re-enters the fiber at its exact saved frame via seam_drive."""
+    slice re-enters the fiber at its exact saved frame."""
     unpark_current(rt, h)
