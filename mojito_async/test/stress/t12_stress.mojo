@@ -9,7 +9,7 @@
 # forever.  On the A1.1 single cooperative worker the defense is the
 # protocol: before committing to WAITING a task re-checks cancellation and
 # its condition, and readiness is delivered AT MOST ONCE per wait epoch
-# (resume_current + enqueue-once), while a wake that lands on a
+# (unpark_current + enqueue-once), while a wake that lands on a
 # not-yet-parked task is a counted no-op that the waiter observes through
 # its condition.
 #
@@ -29,7 +29,7 @@
 # PART B — race_hooks-style pipeline model bound to REAL spawned TCBs and a
 # REAL Runtime: scripted boundaries (PREPARE/VALIDATE/COMMIT/WAKE) fire
 # actions (SET_READY / REQUEST_CANCEL / WAKE); every delivery is an actual
-# resume_current enqueue, so attempts/accepted/enqueues are ground truth.
+# unpark_current enqueue, so attempts/accepted/enqueues are ground truth.
 #   B1 baseline           full pipeline, parks, explicit wake accepted once.
 #   B2 wake-before-park   SET_READY at VALIDATE: never sleeps, one winner.
 #   B3 double-wake        sleeps, 2 attempts -> 1 accepted (per-epoch guard).
@@ -42,11 +42,8 @@
 from mojito_async.cancellation import CancelFlag, make_cancel_flag
 from mojito_async.integration.sys import BytePtr, IntResult
 from mojito_async.runtime.runtime import Runtime, create
-from mojito_async.runtime.scheduler import (
-    _suspend_current,
-    resume_current,
-    scheduler_loop,
-)
+from mojito_async.runtime.scheduler import scheduler_loop
+from mojito_async.runtime.park import park_current, unpark_current
 from mojito_async.runtime.task_control_block import TaskControlBlock
 from mojito_async.task import JoinHandle, claim_running, execute, spawn
 
@@ -127,7 +124,7 @@ def dispatch_a1(mut rt: Runtime, tcb_addr: Int, tid: Int, ud: BytePtr) raises ->
         var hb = _handle(tcb_addr, tid)
         _ = execute(hb, b_body_notify, ud)
         var ha = _handle(sc[].a_tcb[], sc[].a_tid[])
-        resume_current(rt, ha)
+        unpark_current(rt, ha)
         return 1
     var ha = _handle(tcb_addr, tid)
     _ = execute(ha, a_body_see, ud)
@@ -142,7 +139,7 @@ def dispatch_a2(mut rt: Runtime, tcb_addr: Int, tid: Int, ud: BytePtr) raises ->
         var ha = _handle(tcb_addr, tid)
         if sc[].slice_a[] == 0:
             claim_running(ha)
-            _suspend_current(rt, ha)
+            park_current(rt, ha)
             sc[].slice_a[] = 1
             sc[].waiting_seen[] = 1
         else:
@@ -151,7 +148,7 @@ def dispatch_a2(mut rt: Runtime, tcb_addr: Int, tid: Int, ud: BytePtr) raises ->
     var hb = _handle(tcb_addr, tid)
     _ = execute(hb, b_body_notify, ud)
     var ha = _handle(sc[].a_tcb[], sc[].a_tid[])
-    resume_current(rt, ha)
+    unpark_current(rt, ha)
     return 1
 
 
@@ -162,7 +159,7 @@ def dispatch_a3(mut rt: Runtime, tcb_addr: Int, tid: Int, ud: BytePtr) raises ->
         var ha = _handle(tcb_addr, tid)
         if sc[].slice_a[] == 0:
             claim_running(ha)
-            _suspend_current(rt, ha)
+            park_current(rt, ha)
             sc[].slice_a[] = 1
             sc[].waiting_seen[] = 1
         else:
@@ -171,8 +168,8 @@ def dispatch_a3(mut rt: Runtime, tcb_addr: Int, tid: Int, ud: BytePtr) raises ->
     var hb = _handle(tcb_addr, tid)
     _ = execute(hb, b_body_notify, ud)
     var ha = _handle(sc[].a_tcb[], sc[].a_tid[])
-    resume_current(rt, ha)
-    resume_current(rt, ha)  # duplicate: RUNNABLE -> counted no-op
+    unpark_current(rt, ha)
+    unpark_current(rt, ha)  # duplicate: RUNNABLE -> counted no-op
     return 1
 
 
@@ -208,7 +205,7 @@ def dispatch_storm(mut rt: Runtime, tcb_addr: Int, tid: Int, ud: BytePtr) raises
     var h = _handle(tcb_addr, tid)
     if sc[].counts[slot] == 0:
         claim_running(h)
-        _suspend_current(rt, h)
+        park_current(rt, h)
         sc[].counts[slot] = 1
         sc[].parked[] = sc[].parked[] + 1
     else:
@@ -394,7 +391,7 @@ def _attempt_wake(mut ctx: ModelCtx, mut rt: Runtime, h: JoinHandle[IntResult]) 
     var st = ctx.state
     st[].attempts += 1
     if h.state() == TaskControlBlock.WAITING:
-        resume_current(rt, h)
+        unpark_current(rt, h)
         st[].accepted += 1
         if st[].winner == ModelResult.NONE:
             st[].winner = ModelResult.READY
@@ -608,7 +605,7 @@ def main() raises:
     # Reverse-order wake storm (slot S-1 down to 0).
     for i in range(S):
         var slot = S - 1 - i
-        resume_current(rt, handles[slot])
+        unpark_current(rt, handles[slot])
 
     var served4b = scheduler_loop(rt, dispatch_storm, ud_s)
     if served4b != S:
