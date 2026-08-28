@@ -62,7 +62,6 @@ struct Runtime:
     """One worker's scheduler core.
 
     State:
-<<<<<<< HEAD
       _ready     — E3-OWNED injection intake: the A1 global FIFO, retained
                      for global/injection submits until #69's inject queue
                      replaces it (NOT on the local hot path).
@@ -70,15 +69,12 @@ struct Runtime:
                      tasks; owner push_back/pop_back — LIFO spawn locality).
       _remote    — this worker's REMOTE-ready queue (wakes of STARTED
                      fibers; any worker pushes, the owner pops — FIFO).
-=======
       _ready     — FIFO of RUNNABLE TaskRecords (mutex-free: single worker,
                      no cross-thread handoff exists).
       _inject    — A2.3 (issue #69) shared bounded MPSC injection queue: the
                      global intake for non-worker-local spawns/foreign
                      enqueues; drained by every worker (see enqueue_global
-                     and scheduler_loop's bounded poll).
->>>>>>> origin/a2/69-inject
-      _shutdown  — latched by shutdown(); run()/spawn refuse afterwards.
+                     and scheduler_loop's bounded poll).      _shutdown  — latched by shutdown(); run()/spawn refuse afterwards.
       _scope     — root scope handle (Int cell handle; refined upward).
       _next_id   — monotonic task-id allocator (ids start at 1; 0 = none).
       counters   — observable scheduling effects: _tasks_started/_completed
@@ -126,7 +122,11 @@ struct Runtime:
     # drains (see scheduler_loop's bounded poll).  Worker-local enqueues
     # NEVER take this queue's lock.
     var _inject: InjectQueue
-
+    # E4 (issue #70) — successful unstarted-task steals (spec §71
+    # `task_steals_total`).  Bumped exactly once per successful steal; a
+    # failed probe (empty deque or a STARTED record returned to its owner)
+    # bumps nothing — no fake counters.
+    var _steal_total: Int
     def __init__(out self):
         self._ready = FifoQueue[TaskRecord]()
         self._local = LocalDeque()
@@ -141,7 +141,7 @@ struct Runtime:
         self._fiber_drives = 0
         self._fiber_switches = 0
         self._inject = InjectQueue(Self.INJECT_CAPACITY)
-
+        self._steal_total = 0
     # --- root-task execution (A0-T1) ----------------------------------------
 
     def run[T: def() raises -> None](mut self, task: T) raises:
@@ -359,6 +359,19 @@ struct Runtime:
         """Actual fiber stack switches (issue #53 cheap-path guard: a
         non-parking run must observe 0)."""
         return self._fiber_switches
+
+    # --- E4 (issue #70): steal observability (spec §71) ----------------------
+
+    def note_steal(mut self):
+        """Count one successful unstarted-task steal (issue #70 step 5)."""
+        self._steal_total += 1
+
+    def task_steals_total(self) -> Int:
+        """Successful unstarted-task steals on this runtime (spec §71
+        `task_steals_total`).  Exact: one bump per steal, zero on failed
+        probes; a started-fiber steal is never counted (the STARTED guard
+        returns the record before the counter is reached)."""
+        return self._steal_total
 
     def scope_handle(self) -> Int:
         return self._scope
