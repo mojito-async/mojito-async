@@ -22,10 +22,19 @@ BUILD_DIR="$REPO_ROOT/build"
 MOJO=${MOJO:-mojo}
 command -v "$MOJO" >/dev/null 2>&1 || { echo "ERROR: mojo not found"; exit 2; }
 
-UNIT_TESTS=$(ls "$SCRIPT_DIR"/unit/t[0-9][0-9]_*.mojo 2>/dev/null || true)
+# Drivers that import the vendored mojito-sys seams (fiber #49, stack pool
+# #52, continuation #50) need the production dylib at link time; the JIT
+# cannot resolve its symbols through an imported module, so those drivers
+# are AOT-built.  Pass -Xlinker only when the dylib exists so the suite
+# stays runnable before the substrate dylib is built.
+DYLIB="$REPO_ROOT/libmojito_spike.dylib"
+LINK_FLAGS=""
+[ -f "$DYLIB" ] && LINK_FLAGS="-Xlinker $DYLIB"
+
+UNIT_TESTS=$(ls "$SCRIPT_DIR"/unit/t[0-9][0-9]_*.mojo 2>/dev/null | grep -v "_aot\.mojo$" | sort || true)
 # _aot.mojo drivers are excluded here; they are built+run in the AOT loop.
 STRESS_TESTS=$(ls "$SCRIPT_DIR"/stress/t*_*.mojo 2>/dev/null | grep -v "_aot\.mojo$" | sort || true)
-AOT_TESTS=$(ls "$SCRIPT_DIR"/stress/t*_aot.mojo 2>/dev/null || true)
+AOT_TESTS=$(ls "$SCRIPT_DIR"/stress/t*_aot.mojo "$SCRIPT_DIR"/unit/t*_aot.mojo 2>/dev/null || true)
 if [ -z "$UNIT_TESTS" ] && [ -z "$STRESS_TESTS" ]; then
     echo "ERROR: no tests under $SCRIPT_DIR/unit or $SCRIPT_DIR/stress"
     exit 2
@@ -51,14 +60,14 @@ run_one() { # <name> <out> <exit>
 # --- A1 unit drivers -----------------------------------------------------------
 for t in $UNIT_TESTS; do
     name=$(basename "$t" .mojo)
-    out=$("$MOJO" run -I "$REPO_ROOT" "$t" 2>&1); st=$?
+    out=$("$MOJO" run -I "$REPO_ROOT" $LINK_FLAGS "$t" 2>&1); st=$?
     run_one "$name" "$out" "$st"
 done
 
 # --- A1.5 stress drivers (JIT) --------------------------------------------------
 for t in $STRESS_TESTS; do
     name=$(basename "$t" .mojo)
-    out=$("$MOJO" run -I "$REPO_ROOT" "$t" 2>&1); st=$?
+    out=$("$MOJO" run -I "$REPO_ROOT" $LINK_FLAGS "$t" 2>&1); st=$?
     run_one "$name" "$out" "$st"
 done
 
@@ -67,7 +76,7 @@ mkdir -p "$BUILD_DIR" || true
 for t in $AOT_TESTS; do
     name=$(basename "$t" .mojo)
     bin="$BUILD_DIR/$name"
-    if ! "$MOJO" build "$t" -o "$bin" -I "$REPO_ROOT" \
+    if ! "$MOJO" build "$t" -o "$bin" -I "$REPO_ROOT" $LINK_FLAGS \
             >"$BUILD_DIR/$name.build.log" 2>&1; then
         row="$name FAIL (AOT build error)"
         failures=$((failures+1))
