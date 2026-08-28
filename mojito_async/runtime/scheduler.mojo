@@ -24,10 +24,23 @@
 #     A popped record whose TCB is not RUNNABLE (stale duplicate) is
 #     SKIPPED — counted via rt.skipped(), never dispatched.
 #
-# No per-suspension allocation on the hot path (AMORTIZED: no allocation
-# beyond the runnable queue's amortized ring growth): yield/park reuse the
-# TCB's embedded WaitNode and the Runtime's FIFO; the caller supplies every
-# TCB cell (stack-allocated) — code, not heap, owns task storage.
+#
+# A1.5 (issue #53) — the FIBER-BACKED drive.  This module stays EXTERN-FREE
+# and UNCHANGED in its mechanics: the single-worker loop pops a RUNNABLE
+# record and hands it to the statically-known dispatcher.  The frame
+# migration lives one module over, in runtime/fiber_seam.mojo, and the
+# fiber handle is THREADED THROUGH THE DRIVER VALUE (b2 design decision #4,
+# never dynamic dispatch): an *_aot driver's dispatcher drives each record's
+# fiber via the seam — first entry makes the fresh context (ms_ctx_make),
+# a park is the body's seam_park_switch (fiber -> caller; the frame leaves
+# the worker's native context), the park/wake state commit is
+# fiber_suspend_current / fiber_yield_now / fiber_resume_current (#39 kernel
+# spellings), and the next slice re-enters the fiber at its exact saved
+# frame.  Non-parking tasks never touch a fiber: the cheap path is this
+# loop + plain execute() on the worker's native context, and the Runtime
+# fiber-path toggle (fiber_drives/fiber_switches) stays flat — the fast-path
+# regression guard.  Keep this module import-free of fibers so the JIT unit
+# drivers (t11..t18/t20..t22) keep linking without the dylib (#6971).
 from mojito_async.integration.sys import BytePtr
 from mojito_async.runtime.runtime import Nil, Runtime
 from mojito_async.runtime.task_control_block import ResultValue, TaskControlBlock
