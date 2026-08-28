@@ -135,10 +135,13 @@ def scenario_a() raises:
     var scp = UnsafePointer[SceneA, MutAnyOrigin](to=sc)
     var ud = scp.bitcast[Byte]()
 
-    var tcb_a = TB.create()
-    var h_a = spawn(rt, UnsafePointer[TB, MutAnyOrigin](to=tcb_a), 0)
+    # A2.2 (issue #68): owner pop is LIFO (spawn locality), so register the
+    # parker FIRST and the taker after -> the taker (A) acquires and holds
+    # the permit before the parker (B) contends.
     var tcb_b = TB.create()
     var h_b = spawn(rt, UnsafePointer[TB, MutAnyOrigin](to=tcb_b), 0)
+    var tcb_a = TB.create()
+    var h_a = spawn(rt, UnsafePointer[TB, MutAnyOrigin](to=tcb_a), 0)
     buf[6] = h_a.id()
     buf[7] = h_b.id()
 
@@ -233,12 +236,15 @@ def scenario_b() raises:
     var scp = UnsafePointer[SceneB, MutAnyOrigin](to=sc)
     var ud = scp.bitcast[Byte]()
 
-    var tcb_w0 = TB.create()
-    var h_w0 = spawn(rt, UnsafePointer[TB, MutAnyOrigin](to=tcb_w0), 0)
-    var tcb_w1 = TB.create()
-    var h_w1 = spawn(rt, UnsafePointer[TB, MutAnyOrigin](to=tcb_w1), 0)
+    # A2.2 (issue #68): owner pop is LIFO, so register the waiters in
+    # REVERSE -> the deque serves w0, w1, w2, which park in that order and
+    # are granted strictly FIFO.
     var tcb_w2 = TB.create()
     var h_w2 = spawn(rt, UnsafePointer[TB, MutAnyOrigin](to=tcb_w2), 0)
+    var tcb_w1 = TB.create()
+    var h_w1 = spawn(rt, UnsafePointer[TB, MutAnyOrigin](to=tcb_w1), 0)
+    var tcb_w0 = TB.create()
+    var h_w0 = spawn(rt, UnsafePointer[TB, MutAnyOrigin](to=tcb_w0), 0)
     buf[0] = h_w0.id()
     buf[1] = h_w1.id()
     buf[2] = h_w2.id()
