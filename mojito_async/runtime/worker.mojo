@@ -74,35 +74,6 @@ struct Worker:
         return UnsafePointer[Runtime, MutAnyOrigin](to=self._runtime)
 
 
-    def id(mut self) -> Int:
-        """Distinct per-worker id (0 for an unpooled A1 worker; the pool
-        numbers its workers 0..N-1)."""
-        return self._id
-
-    def thread(mut self) -> NativeThread:
-        """The OS thread this worker runs on once the pool spawned it."""
-        return self._thread
-
-    def started(mut self) -> Bool:
-        """True once the pool spawned this worker's OS thread."""
-        return self._started
-
-    def tls_key(mut self) -> NativeTlsKey:
-        return self._tls_current_worker
-
-    def mark_started(mut self, t: NativeThread, key: NativeTlsKey):
-        """Pool-owned: bind the spawned thread + the current_worker TLS key."""
-        self._thread = t
-        self._tls_current_worker = key
-        self._started = True
-
-    def tls_worker_ptr(mut self) -> BytePtr:
-        """Read THIS OS thread's current_worker slot (coarse entry-only
-        value; address 0 when unset).  Only the worker thread itself reads
-        its own slot — the pool side never calls this."""
-        return tls_get(self._tls_current_worker)
-
-    # --- A2.2 per-worker run queues (issue #68) — E2-owned accessors ------
 
     def local_queue(mut self) -> UnsafePointer[LocalDeque, MutAnyOrigin]:
         """This worker's LOCAL runnable deque (owner push/pop; the scheduler
