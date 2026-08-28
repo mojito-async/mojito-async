@@ -141,19 +141,6 @@ struct Worker:
         value; address 0 when unset).  Only the worker thread itself reads
         its own slot — the pool side never calls this."""
         return tls_get(self._tls_current_worker)
-=======
-    # --- A2.2 per-worker run queues (issue #68) — E2-owned accessors ------
-
-    def local_queue(mut self) -> UnsafePointer[LocalDeque, MutAnyOrigin]:
-        """This worker's LOCAL runnable deque (owner push/pop; the scheduler
-        drains it before the remote queue, spec §21)."""
-        return self._runtime.local_queue()
-
-    def remote_queue(mut self) -> UnsafePointer[RemoteReadyQueue, MutAnyOrigin]:
-        """This worker's REMOTE-ready queue (any worker pushes a wake, the
-        owner pops — spec §19.2)."""
-        return self._runtime.remote_queue()
->>>>>>> origin/a2/68-queues
 
     # --- entry points -------------------------------------------------------
 
