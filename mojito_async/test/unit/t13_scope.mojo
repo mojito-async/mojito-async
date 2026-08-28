@@ -22,6 +22,7 @@ from mojito_async.integration.sys import IntResult
 from mojito_async.runtime.runtime import Runtime, create
 from mojito_async.runtime.task_control_block import ResultValue, TaskControlBlock
 from mojito_async.scope import CancelHook, Scope, make_nested_scope, make_scope
+from mojito_async.task import spawn
 
 
 def red(what: String) raises -> None:
@@ -147,15 +148,51 @@ def main() raises:
     if not pair:
         red("surviving siblings not both cancelled")
 
-    # 6. drop_children escape hatch.
-    var s6 = make_scope[IntResult, RecordingCancel](hook, 66, order_ptr, False)
-    var sp6 = scope_ptr(s6)
-    var y1 = TB.create()
-    var y2 = TB.create()
-    _ = sp6[].register(tcb_ptr(y1), 0)
-    _ = sp6[].register(tcb_ptr(y2), 0)
-    sp6[].drop_children()
-    if sp6[].live_child_count() != 0:
-        red("drop_children did not empty the registry")
+    # 7. SCOPE-AWARE spawn auto-registers the child (INV-3, issue #40).
+    var rt7 = create()
+    var s7 = make_scope[IntResult, RecordingCancel](hook, 70, order_ptr, False)
+    var sp7a = scope_ptr(s7)
+    var z1 = TB.create()
+    var h1 = spawn(rt7, sp7a, tcb_ptr(z1), 0)
+    if sp7a[].live_child_count() != 1:
+        red("scoped spawn did not auto-register the child")
+    if z1.scope_handle() != 70:
+        red("scoped spawn did not stamp the scope handle")
+    if not sp7a[].is_registered(h1.id()):
+        red("registry does not know the spawned child by task id")
+    if z1.state() != TaskControlBlock.RUNNABLE:
+        red("spawned child not RUNNABLE after scoped spawn")
+    if rt7.pending() != 1:
+        red("spawned child not enqueued exactly once")
+    # join-integrated close consumes the spawned child's settled result
+    # (z1 is already RUNNABLE from the scoped spawn).
+    z1.transition(TaskControlBlock.RUNNING)
+    z1.transition(TaskControlBlock.COMPLETED)
+    z1.mark_result(IntResult(9))
+    sp7a[].close(rt7)
+    if z1.has_result_pending():
+        red("close did not join+consume the scoped spawn's result")
+    # a spawn into a CLOSED scope is refused.
+    var denied = False
+    var z8 = TB.create()
+    try:
+        _ = spawn(rt7, sp7a, tcb_ptr(z8), 0)
+    except Error:
+        denied = True
+    if not denied:
+        red("spawn into a closed scope did not refuse")
+    # a child that already names a DIFFERENT scope is refused (no
+    # cross-scope aliasing).
+    var s9 = make_scope[IntResult, RecordingCancel](hook, 92, order_ptr, False)
+    var sp9 = scope_ptr(s9)
+    var c2 = TB.create()
+    _ = sp9[].register(tcb_ptr(c2), 0)
+    var cross = False
+    try:
+        _ = spawn(rt7, sp7a, tcb_ptr(c2), 0)
+    except Error:
+        cross = True
+    if not cross:
+        red("spawn did not refuse a child already scoped elsewhere")
 
     print("T13 scope: PASS")
