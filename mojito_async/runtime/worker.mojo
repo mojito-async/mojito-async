@@ -114,7 +114,6 @@ struct Worker:
         owner pops — spec §19.2)."""
         return self._runtime.remote_queue()
 
-<<<<<<< HEAD
     def id(mut self) -> Int:
         """Distinct per-worker id (0 for an unpooled A1 worker; the pool
         numbers its workers 0..N-1)."""
