@@ -1,13 +1,13 @@
 # mojito_async/test/unit/t15_suspend.mojo
 #
-# A1.1 (issue #33) — _suspend_current park + resume_current, and worker
+# A1.1 (issue #33) — park_current park + unpark_current, and worker
 # reuse: while a task is WAITING, another RUNNABLE task executes on the SAME
 # worker before the parked task resumes.
 #
 # Acceptance:
-#   - _suspend_current parks a RUNNING task to WAITING (fresh wait epoch) and
+#   - park_current parks a RUNNING task to WAITING (fresh wait epoch) and
 #     it drops OFF the runnable queue;
-#   - resume_current delivers readiness ONCE (WAITING -> RUNNABLE +
+#   - unpark_current delivers readiness ONCE (WAITING -> RUNNABLE +
 #     re-enqueue), preserving the task's scheduler id;
 #   - worker reuse: driving the single-worker scheduler loop, B runs entirely
 #     inside A's park window (order A_START < A_PARK < B_RUN < A_RESUME).
@@ -16,11 +16,8 @@
 from std.memory import stack_allocation
 from mojito_async.integration.sys import BytePtr, IntResult
 from mojito_async.runtime.runtime import Runtime, create
-from mojito_async.runtime.scheduler import (
-    _suspend_current,
-    resume_current,
-    scheduler_loop,
-)
+from mojito_async.runtime.scheduler import scheduler_loop
+from mojito_async.runtime.park import park_current, unpark_current
 from mojito_async.runtime.task_control_block import TaskControlBlock
 from mojito_async.task import JoinHandle, claim_running, execute, spawn
 
@@ -94,7 +91,7 @@ def dispatch(mut rt: Runtime, tcb_addr: Int, tid: Int, ud: BytePtr) raises -> In
         if sc[].phase[] == 0:
             claim_running(ha)
             _ = a_start(ud)
-            _suspend_current(rt, ha)
+            park_current(rt, ha)
             rec(sc[], EV_A_PARK)
             sc[].phase[] = 1
         else:
@@ -132,7 +129,7 @@ def main() raises:
     if h_a.state() != TaskControlBlock.WAITING:
         red("A should be WAITING after park, is " + String(h_a.state()))
 
-    resume_current(rt, h_a)
+    unpark_current(rt, h_a)
     if h_a.state() != TaskControlBlock.RUNNABLE:
         red("resume did not make A RUNNABLE")
     if rt.pending() != 1:
@@ -153,7 +150,7 @@ def main() raises:
 
     var stale = False
     try:
-        resume_current(rt, h_a)
+        unpark_current(rt, h_a)
     except Error:
         stale = True
     if not stale:

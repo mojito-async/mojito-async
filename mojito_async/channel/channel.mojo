@@ -14,11 +14,11 @@
 #     reconstructs task handles from raw addresses — the b2 compiler
 #     miscompiles `unsafe_from_address` reconstruction inside generic struct
 #     methods (probes 7/10), so no transition is performed inside a method.
-#     Parks use the canonical A1.1 `_suspend_current(mut rt, h)` on the
+#     Parks use the canonical A1.1 `park_current(mut rt, h)` on the
 #     PASSED-IN JoinHandle of the CURRENT task; wakes are DEFERRED: a signal
 #     moves a WaitRecord into `_to_wake`, and the embedding DRIVER (a plain
 #     concrete function that knows the task's result type) drains `_to_wake`
-#     and resumes each waiter via `resume_current` — the canonical wake path
+#     and resumes each waiter via `unpark_current` — the canonical wake path
 #     (single source, issue #39).
 #   - send/recv are one-shot colorless operations: attempt now; if the
 #     channel forces a wait, register the waiter and park ONCE.  On resume
@@ -37,9 +37,9 @@
 #     send on closed channel".
 from std.collections import Deque
 from mojito_async.runtime.runtime import Runtime
-from mojito_async.runtime.scheduler import _suspend_current
 from mojito_async.runtime.task_control_block import ResultValue
 from mojito_async.task import JoinHandle
+from mojito_async.runtime.park import park_current
 
 
 # ---------------------------------------------------------------------------
@@ -50,7 +50,7 @@ struct WaitRecord(ImplicitlyCopyable, ImplicitlyDeletable, Movable):
     """Identity of a parked task: address of its caller-allocated TCB cell +
     scheduler id.  The embedding driver (which knows the task's concrete
     result type) reconstructs the JoinHandle from these two ints and resumes
-    it via the canonical resume_current."""
+    it via the canonical unpark_current."""
 
     var tcb_addr: Int
     var task_id: Int
@@ -84,9 +84,9 @@ struct Channel[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable](
 
     Single worker, fully deterministic: no mutex, no atomics; the wait
     queues and buffer are only mutated by the one running worker slice.  A
-    task parks ONLY via the canonical `_suspend_current` on its own handle;
+    task parks ONLY via the canonical `park_current` on its own handle;
     every wake is a deferred WaitRecord the driver executes via
-    `resume_current` (no transition inside this struct).
+    `unpark_current` (no transition inside this struct).
     """
 
     var _items: Deque[Self.T]
@@ -210,7 +210,7 @@ struct Channel[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable](
         the item is delivered through the ring and the waiter consumes it on
         re-entry.  Slow path: ring full — register this task as a sender
         waiter (FIFO, deduped by id), then park via the canonical
-        `_suspend_current`.  On resume the driver re-enters the task with the
+        `park_current`.  On resume the driver re-enters the task with the
         SAME pending item; if the channel closed meanwhile the re-entry
         raises here.
         """
@@ -224,7 +224,7 @@ struct Channel[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable](
                 self._to_wake.append(w)
             return
         self.register_sender(h)
-        _suspend_current(rt, h)
+        park_current(rt, h)
 
     def recv[R: ResultValue](
         mut self, mut rt: Runtime, h: JoinHandle[R]
@@ -235,7 +235,7 @@ struct Channel[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable](
         wake the OLDEST parked sender (deferred).  Closed-and-empty: return
         None (close observable).  Slow path (§40.2): register this task as a
         receiver waiter (FIFO, deduped by id) and park via the canonical
-        `_suspend_current`; on resume the driver re-enters and the fresh call
+        `park_current`; on resume the driver re-enters and the fresh call
         takes the fast path or observes close.
         """
         if len(self._items) > 0:
@@ -248,7 +248,7 @@ struct Channel[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable](
         if self._send_closed or self._recv_closed:
             return Optional[Self.T]()
         self.register_receiver(h)
-        _suspend_current(rt, h)
+        park_current(rt, h)
         return Optional[Self.T]()
 
     # --- waiter registration (FIFO, dedupe by task id) -------------------------
