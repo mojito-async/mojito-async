@@ -62,15 +62,14 @@ struct Runtime:
     """One worker's scheduler core.
 
     State:
-      _ready     — E3-OWNED injection intake: the A1 global FIFO, retained
-                     for global/injection submits until #69's inject queue
-                     replaces it (NOT on the local hot path).
+      _ready     — A1 legacy global FIFO (mutex-free: single worker, no
+                     cross-thread handoff); retained ONLY for the A1
+                     `enqueue()` intake, which #69's inject queue replaced
+                     on every live path (NOT on the local hot path).
       _local     — this worker's LOCAL work-stealing deque (unstarted
                      tasks; owner push_back/pop_back — LIFO spawn locality).
       _remote    — this worker's REMOTE-ready queue (wakes of STARTED
                      fibers; any worker pushes, the owner pops — FIFO).
-      _ready     — FIFO of RUNNABLE TaskRecords (mutex-free: single worker,
-                     no cross-thread handoff exists).
       _inject    — A2.3 (issue #69) shared bounded MPSC injection queue: the
                      global intake for non-worker-local spawns/foreign
                      enqueues; drained by every worker (see enqueue_global
@@ -258,11 +257,11 @@ struct Runtime:
         `current_worker` is the known worker identity when the spawn hails
         from a task already running on worker W (b2 has no TLS, so worker
         identity is threaded by value; 0 = no known current worker):
-          - current_worker != 0 -> enqueue_local(W) — the per-worker deque
-            lane is E2/#68's; until it lands this routes through the A1 FIFO
-            `_ready` (the single-worker local queue), so a worker-local
-            enqueue NEVER takes the injection lock (acceptance: no global
-            lock on the local hot path).  [E2-OWNED seam]
+          - current_worker != 0 -> enqueue_local(W) — the record lands on
+            this worker's LOCAL deque (E2/#68's owner push_back, spec §21),
+            so a worker-local enqueue NEVER takes the injection lock
+            (acceptance: no global lock on the local hot path).  [E2 seam
+            consumed: #68's LocalDeque replaced the A1 `_ready` FIFO]
           - current_worker == 0 -> _inject.push — the shared bounded MPSC
             intake; the record is an INJECTION (UNSTARTED, stealable per
             §19.1) any worker may run.  At capacity `_inject.push` raises a
@@ -282,14 +281,14 @@ struct Runtime:
             # `_enqueued` counter stays untouched here.
             self._inject.push(TaskRecord(tcb_addr, task_id))
         else:
-            # enqueue_local(W): the per-worker deque lane is E2/#68's — this
-            # branch consumes that seam when it lands; until then it routes
-            # through the A1 FIFO `_ready` (the single-worker local queue).
-            # A worker-local enqueue NEVER takes the injection lock here
-            # (acceptance: no global lock on the local hot path).
-            # [E2-OWNED]
-            self._ready.push(TaskRecord(tcb_addr, task_id))
-            self._bump_enqueued()
+            # enqueue_local(W): E2/#68's per-worker deque lane — the record
+            # lands on THIS worker's LOCAL deque (owner push_back, LIFO
+            # spawn locality; the scheduler drains it first, spec §21).  A
+            # worker-local enqueue NEVER takes the injection lock here
+            # (acceptance: no global lock on the local hot path).  [E2 seam
+            # consumed: #68's LocalDeque replaced the A1 `_ready` FIFO]
+            self._local.push_back(TaskRecord(tcb_addr, task_id))
+            self._enqueued += 1
 
     def inject_queue(mut self) -> UnsafePointer[InjectQueue, MutAnyOrigin]:
         """The shared injection queue (drain seam for scheduler_loop)."""

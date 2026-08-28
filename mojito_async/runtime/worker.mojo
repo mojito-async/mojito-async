@@ -11,19 +11,26 @@
 # own task bodies (b2 cannot store them); callers pass dispatchers where
 # bodies are known, exactly like the spike's drivers.
 #
-#
 # A2.2 (issue #68) — per-worker run-queue accessors (E2-owned).  The queue
 # STATE lives on this worker's Runtime (_local LocalDeque + _remote
-# RemoteReadyQueue); Worker exposes thin refs so callers can probe/drive
-# them without reaching into Runtime internals.
+# RemoteReadyQueue, runtime/queue.mojo — the ONE LocalDeque in the tree);
+# Worker exposes thin refs so callers can probe/drive them without reaching
+# into Runtime internals.
 #
-# # E1-OWNED: the WORKER POOL, thread_entry, NativeThread and TlsKey
-# bindings are the sibling lane's (issue #67).  The entry points below
-# (run_root/drive/shutdown) stay untouched by this lane.
+# E1-OWNED (issue #67): the WORKER POOL, thread_entry, NativeThread and
+# TlsKey bindings are the sibling lane's; the entry points below
+# (run_root/drive/shutdown) stay untouched by that lane.
+#
+# E4-OWNED (issue #70): the unstarted-task steal probe surface.  The probe
+# runs over queue.mojo's LocalDeque (owner push_back/pop_back at the back,
+# thief steal_front at the front — spec §20 opposite ends); a STARTED
+# record popped under the target deque's guard is RETURNED to the owner
+# (push_back) — never run off-owner (ADR-006/007).
 from mojito_async.integration.sys import BytePtr
-from mojito_async.runtime.queue import LocalDeque, RemoteReadyQueue
-from mojito_async.runtime.runtime import Runtime, create
+from mojito_async.runtime.queue import LocalDeque, RemoteReadyQueue, TaskRecord
+from mojito_async.runtime.runtime import Nil, Runtime, create
 from mojito_async.runtime.scheduler import scheduler_loop
+from mojito_async.runtime.task_control_block import ResultValue, TaskControlBlock
 from mojito_async.vendor.mojito_sys import (
     NativeThread,
     NativeTlsKey,
@@ -32,123 +39,37 @@ from mojito_async.vendor.mojito_sys import (
 )
 
 
-struct Worker:
-    """One worker = one Runtime + (A1) run/drive entry points + (A2.1)
-    per-OS-thread identity: worker id, the owned NativeThread handle once
-    the pool spawns it, and the current_worker TLS key this worker's thread
-    writes at entry (issue #67).  The A1 motions are UNCHANGED: on ONE
-    worker everything is cooperative — run the root task, or drive the
-    runnable queue with a statically-known dispatcher.  A2.1 adds the
-    OS-thread carrier; the scheduler_loop integration on the worker thread
-    is the queue lane's (#68) E2-OWNED seam fill.
-# Extern-free, allocation-discipline kept: the Worker holds no task storage;
-# every TaskControlBlock cell is caller-allocated.
-from std.atomic import Atomic, Ordering
-from std.collections import Deque
-from mojito_async.integration.sys import BytePtr
-from mojito_async.runtime.queue import TaskRecord
-from mojito_async.runtime.runtime import Nil, Runtime, create
-from mojito_async.runtime.scheduler import scheduler_loop
-from mojito_async.runtime.task_control_block import ResultValue, TaskControlBlock
-
-
 # ===========================================================================
 # E4-OWNED (issue #70): A2.4 unstarted-task stealing
 # ===========================================================================
 #
-# The P0 LocalDeque below is the E2-OWNED PROTOTYPE of #68's LocalDeque
-# (runtime/queue.mojo).  The A2 lane merge order is E1..E8 and THIS PR merges
-# AFTER #68, so the production call sites use the ISSUE-BODY API contract:
-#
-#     LocalDeque.push / pop / steal_front / len / is_empty
-#
-# This base ships no LocalDeque yet (A1 FifoQueue only; queue.mojo is #68's
-# file), so the P0 shape below stands in with IDENTICAL call-site names —
-# the #68 merge replaces this struct (and Worker's `_local` field type)
-# mechanically.
-#
-# P0 deque semantics (spec §20 — "simpler locked deque" phase): owner push
-# at the BACK, owner pop at the FRONT (FIFO, matching the A1 runtime queue),
-# thieves steal_front at the BACK — the OPPOSITE end from the owner's FIFO
-# pop, so owner-drain and thief-steal never contend on the same records
-# ("prototype steal_front against the A1 FifoQueue's tail").  A per-deque
-# spinlock (the §20 P0 lock) makes pop / steal_front ATOMIC with respect to
-# every worker.
-#
-# b2 toolchain note: the lock is a VALUE `Atomic` field (not a pointer) —
-# pointer-dereferenced atomic ops inside loops ICE the b2 kgen (verified
-# probe); the value-field shape below compiles and runs.  The struct is a
-# PLAIN struct (no Movable/Copyable traits): synthesized moves over the
-# non-movable Atomic/Deque fields are deliberately not requested; LocalDeque
-# is default-constructed in place (caller-allocated, never copied/moved).
-struct LocalDeque:
-    """E2-OWNED P0 prototype (issue #68): spinlock-guarded FIFO task deque.
-
-    push        — owner enqueue (FIFO tail).
-    pop         — owner dequeue (FIFO head); None when empty.
-    steal_front — THIEF take from the tail (spec §20 opposite end; the
-                  youngest never-yet-served work); None when empty; atomic
-                  with owner operations under the same guard.
-    len/is_empty — size queries (caller-owned: only meaningful without
-                  concurrent mutation).
-    """
-
-    var _lock: Atomic[DType.int64]
-    var _data: Deque[TaskRecord]
-
-    def __init__(out self):
-        self._lock = Atomic[DType.int64](0)
-        self._data = Deque[TaskRecord]()
-
-    def _acquire(mut self):
-        while True:
-            var expected = Int64(0)
-            if self._lock.compare_exchange[
-                success_ordering=Ordering.ACQUIRE,
-                failure_ordering=Ordering.ACQUIRE,
-            ](expected, Int64(1)):
-                return
-
-    def _release(mut self):
-        self._lock.store[ordering=Ordering.RELEASE](Int64(0))
-
-    def push(mut self, t: TaskRecord) raises:
-        self._acquire()
-        self._data.append(t)
-        self._release()
-
-    def pop(mut self) raises -> Optional[TaskRecord]:
-        self._acquire()
-        var out = Optional[TaskRecord]()
-        if len(self._data) > 0:
-            out = Optional[TaskRecord](self._data.popleft())
-        self._release()
-        return out
-
-    def steal_front(mut self) raises -> Optional[TaskRecord]:
-        self._acquire()
-        var out = Optional[TaskRecord]()
-        if len(self._data) > 0:
-            out = Optional[TaskRecord](self._data.pop())
-        self._release()
-        return out
-
-    def len(self) -> Int:
-        return len(self._data)
-
-    def is_empty(self) -> Bool:
-        return len(self._data) == 0
+# The steal surface below probes PEER workers' LOCAL deques (queue.mojo's
+# LocalDeque — owner push_back/pop_back LIFO at the BACK, thief steal_front
+# at the FRONT, spec §20; started-fiber wakes ride the remote-ready queue,
+# spec §19.2, and are never theft-eligible).  Stealability is decided
+# ATOMICALLY with the steal, under the target deque's guard: the popped
+# record's TCB is checked immediately; a STARTED record is RETURNED to the
+# owner's deque (it re-runs there — nothing lost) and the probe reports
+# failure so the caller picks another peer.  Each successful steal bumps
+# the stealing worker runtime's task_steals_total exactly once (spec §71);
+# a failed probe bumps nothing — no fake counters.
 
 
 struct Worker:
-    """One cooperative worker = one Runtime + run/drive entry points.
+    """One worker = one Runtime + (A1) run/drive entry points + (A2.1)
+    per-OS-thread identity (id, the owned NativeThread handle once the pool
+    spawns it, the current_worker TLS key written at thread entry, issue
+    #67) + the M:N pool seams the worker-loop restructure consumes: `_local`
+    is this worker's local runnable deque (queue.mojo's LocalDeque, issue
+    #68), `_index` is the pool identity, `_peers`/`_n_workers` are the peer
+    registry (#67's pool wires them), and `_steal_cursor` is E4's (issue
+    #70) round-robin probe rotation.  The A1 motions are UNCHANGED: on ONE
+    worker everything is cooperative — run the root task, or drive the
+    runnable queue with a statically-known dispatcher.
 
-    E1-OWNED / E2-OWNED (issues #67/#68) fields below are the M:N pool
-    seams the worker loop restructure consumes: `_local` is the worker's
-    local runnable deque (LocalDeque prototype until #68 merges), `_index`
-    is the pool identity, `_peers`/`_n_workers` are the peer registry
-    (#67's pool wires them).  The E4 (issue #70) steal surface reads them;
-    `_steal_cursor` is E4's round-robin rotation state.    """
+    Extern-free, allocation-discipline kept: the Worker holds no task
+    storage; every TaskControlBlock cell is caller-allocated.
+    """
 
     var _runtime: Runtime
     var _id: Int
@@ -171,6 +92,13 @@ struct Worker:
         self._thread = make_native_thread()
         self._started = False
         self._tls_current_worker = NativeTlsKey()
+        self._local = LocalDeque()
+        self._index = 0
+        self._peers = UnsafePointer[
+            UnsafePointer[Worker, MutAnyOrigin], MutUntrackedOrigin
+        ](unsafe_from_address=1)
+        self._n_workers = 0
+        self._steal_cursor = 0
 
     def __init__(out self, id: Int):
         self._runtime = create()
@@ -189,18 +117,21 @@ struct Worker:
     # --- E4 (issue #70): the steal probe surface ---------------------------
 
     def pop_local(mut self) raises -> Optional[TaskRecord]:
-        """The §21 `pop_local` motion over the worker's local deque (the
-        only runnable source in the A1 base; #68 restructures the loop and
-        adds the remote-ready queue).  Included here because the E4 steal
-        probe sits exactly after local/remote/inject in the §21 order."""
-        return self._local.pop()
+        """The §21 `pop_local` motion over the worker's local deque (owner
+        LIFO end — the only runnable source in the A1 base; #68 restructures
+        the loop and adds the remote-ready queue).  Included here because
+        the E4 steal probe sits exactly after local/remote/inject in the
+        §21 order.  None when the deque is empty."""
+        if self._local.is_empty():
+            return Optional[TaskRecord]()
+        return Optional[TaskRecord](self._local.pop_back())
 
     def request_steal[R: ResultValue = Nil](
         mut self, target: Int
     ) raises -> Optional[TaskRecord]:
         """Probe ONE peer worker's local deque (issue #70 step 1).
 
-        Under the TARGET deque's guard, steal_front takes the youngest
+        Under the TARGET deque's guard, steal_front takes the oldest
         record and the popped record's TCB is checked IMMEDIATELY — still
         under the guard — so stealability is determined ATOMICALLY with the
         steal itself (no window in which a started fiber could slip between
@@ -220,10 +151,9 @@ struct Worker:
         if target < 0 or target >= self._n_workers or target == self._index:
             return Optional[TaskRecord]()
         var peer = self._peers[target]
-        var rec = peer[]._local.steal_front()
-        if not rec:
+        if peer[]._local.is_empty():
             return Optional[TaskRecord]()
-        var r = rec.value()
+        var r = peer[]._local.steal_front()
         var checker = UnsafePointer[TaskControlBlock[R], MutAnyOrigin](
             unsafe_from_address=r.tcb_addr
         )
@@ -231,10 +161,10 @@ struct Worker:
             # Started task — return it to the OWNER's deque (it re-runs
             # there; nothing is lost or duplicated) and report the probe as
             # failed so the caller picks another peer.
-            peer[]._local.push(r)
+            peer[]._local.push_back(r)
             return Optional[TaskRecord]()
         self._runtime.note_steal()
-        return rec
+        return Optional[TaskRecord](r)
 
     def try_steal_unstarted[R: ResultValue = Nil](
         mut self
@@ -242,7 +172,7 @@ struct Worker:
         """The §21 steal probe: poll PEER workers' local deques in
         round-robin starting from own_index+1 (locality-aware order;
         ADR-007-safe — only unstarted tasks are ever removed), skipping
-        self, CAPTED at ONE full probe round so an idle worker never spins
+        self, CAPPED at ONE full probe round so an idle worker never spins
         on empty deques — the empty-round outcome hands control back to the
         caller, which yields to the E6 idle sleep path (issue #70 step 3;
         see the §21 loop banner in scheduler.mojo).
@@ -273,6 +203,7 @@ struct Worker:
         # One complete round, nothing stealable — rotate and yield to E6.
         self._steal_cursor = (start + 1) % self._n_workers
         return Optional[TaskRecord]()
+
     # --- access ----------------------------------------------------------
 
     def runtime(mut self) -> UnsafePointer[Runtime, MutAnyOrigin]:
@@ -282,8 +213,6 @@ struct Worker:
 
     def handle(mut self) -> UnsafePointer[Runtime, MutAnyOrigin]:
         return UnsafePointer[Runtime, MutAnyOrigin](to=self._runtime)
-
-
 
     def local_queue(mut self) -> UnsafePointer[LocalDeque, MutAnyOrigin]:
         """This worker's LOCAL runnable deque (owner push/pop; the scheduler
