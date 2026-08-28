@@ -82,6 +82,7 @@ from mojito_async.vendor.mojito_sys import (
     stack_free,
 )
 from mojito_async.fiber.continuation import FiberMotion
+from std.atomic import Ordering, fence
 
 # Sidecar handed to the entry thunk (as the ms_ctx_make userdata, unmodified).
 # self_ctx/caller_ctx are the addresses of this Fiber's two save areas;
@@ -145,6 +146,18 @@ struct Fiber(Movable, ImplicitlyDeletable, FiberMotion):
     # trampoline re-entry trap (brk 0x66).
     var _completed: Bool
 
+    # A1.3 (issue #51): the WORKER identity this fiber is affine to once
+    # started (spec §19.2 / ADR-006).  0 = not pinned.  b2 has no TLS, so
+    # worker identity is threaded explicitly: the creating worker (EPIC #2's
+    # pool) calls set_owner() before the first resume; the owner becomes
+    # OBSERVABLE via owner_worker() only after STARTED.
+    var _owner: Int
+
+    # A1.3 (issue #51) — ADR-007: live stacks never relocate.  In fault-
+    # enabled builds the switch helpers assert stack-locality before every
+    # switch; the assertion is a single compare (no allocation).
+    comptime FAULT_CHECKS = True
+
     # Zero-arg ctor: inert Fiber (nothing allocated).  The driver may hold
     # `var f = Fiber()` and hand `to=f` to bind()/init.
     def __init__(out self):
@@ -155,6 +168,7 @@ struct Fiber(Movable, ImplicitlyDeletable, FiberMotion):
         self._started = False
         self._suspended = False
         self._completed = False
+        self._owner = 0
 
     # All-scalar ctor binding an existing reservation: `stack` (base/top from
     # ms_stack_alloc).  The block is not yet allocated (deferred to the
@@ -167,6 +181,7 @@ struct Fiber(Movable, ImplicitlyDeletable, FiberMotion):
         self._started = False
         self._suspended = False
         self._completed = False
+        self._owner = 0
 
     # -- queries -----------------------------------------------------------
 
@@ -198,6 +213,62 @@ struct Fiber(Movable, ImplicitlyDeletable, FiberMotion):
         self._completed = True
         if self._block != 0:
             self._completed_flag()[0] = 1
+
+    def is_started(self) -> Bool:
+        """Spec §14.1 `started`: True exactly once the fiber has entered body
+        entry (set on the FIRST resume — not at construction).  Reads the
+        cross-switch heap flag (synced through the fiber's own block) so a
+        driver sees the body-run state after a switch back."""
+        if self._block == 0:
+            return False
+        return self._started_flag()[0] == 1
+
+    def owner_worker(self) -> Int:
+        """The worker identity this started fiber is affine to (spec §19.2 /
+        ADR-006).  An unstarted fiber has NO owner pinned until first entry:
+        0 means not started / no owner.  Once STARTED this never changes —
+        set_owner() rejects a conflicting re-pin.
+
+        T5 (issue #51): this owner read is an ACQUIRE fence paired with the
+        RELEASE in set_owner(), so a cross-worker producer (EPIC #2's pool)
+        reading the pinned worker id from ANOTHER worker thread sees the
+        fiber's synchronized state together with the store.  A no-op pass-
+        through on today's single cooperative worker."""
+        if not self._started:
+            return 0
+        fence[Ordering.ACQUIRE]
+        return self._owner
+
+    def assert_never_relocated(self) raises:
+        """ADR-007 (issue #51): the live stack address is fixed at the first
+        ms_stack_alloc and never reassigned; this Fiber only ever releases
+        that SAME reservation (in destroy()).  Called from the switch helpers
+        in fault-enabled builds (FAULT_CHECKS) and by drivers/EPIC #2 as a
+        direct policy assertion.  Raises only on a fiber with no live stack
+        (unbound/destroyed)."""
+        if self._stack == 0:
+            raise Error(
+                "fiber.assert_never_relocated: no live stack (unbound/destroyed)"
+            )
+
+    def set_owner(mut self, worker_id: Int) raises:
+        """Pin the owner WORKER this fiber is affine to (ADR-006).  Called by
+        the worker that will START the fiber (the sole worker today; EPIC #2's
+        pool pins at spawn, before the first resume).  Once the fiber has
+        STARTED (entered body entry) the owner is immutable: a re-pin to a
+        DIFFERENT worker raises; a re-pin to the SAME worker is an idempotent
+        no-op.  The pin store is RELEASED so any acquiring owner_worker() on
+        another worker thread sees the fiber's synchronized state together
+        with the store."""
+        if self._started:
+            if self._owner != worker_id:
+                raise Error(
+                    "fiber.set_owner: owner is immutable once started "
+                    "(pinned to " + String(self._owner) + ")"
+                )
+            return
+        self._owner = worker_id
+        fence[Ordering.RELEASE]
 
     def stack_ptr(self) -> NativeStack:
         return NativeStack(
@@ -287,8 +358,12 @@ struct Fiber(Movable, ImplicitlyDeletable, FiberMotion):
         # block yet (deferred to a factory/bind); resume() writes the sidecar
         # into that block, so guard _block (not just _stack) to raise rather
         # than SEGV on an un-bound block.
+        comptime if Self.FAULT_CHECKS:
+            self.assert_never_relocated()  # ADR-007 before every switch
         if self._block == 0:
             raise Error("fiber.resume: no bound block (Fiber not factory-bound)")
+        comptime if Self.FAULT_CHECKS:
+            self.assert_never_relocated()  # ADR-007 before every switch
         # A completed fiber's body has unwound; re-entering it through the asm
         # trampoline would trap (brk 0x66).  Raise a loud Error instead.  Read
         # the heap flag (synced cross-switch).
@@ -320,6 +395,8 @@ struct Fiber(Movable, ImplicitlyDeletable, FiberMotion):
         # Guard _block too (mirror of resume()): the public Fiber(stack) ctor
         # has no block yet; a driver suspending a stack-only Fiber must raise,
         # not SEGV (fold T4).
+        comptime if Self.FAULT_CHECKS:
+            self.assert_never_relocated()  # ADR-007 before every switch
         if self._block == 0:
             raise Error("fiber.suspend: no bound block (Fiber not factory-bound)")
         if self._completed_flag()[0] != 0:
@@ -343,6 +420,7 @@ struct Fiber(Movable, ImplicitlyDeletable, FiberMotion):
             self._started = False
             self._suspended = False
             self._completed = False
+            self._owner = 0
             self._zero_flags()
         if self._block != 0:
             c_free(UnsafePointer[Byte, MutAnyOrigin](unsafe_from_address=self._block))
