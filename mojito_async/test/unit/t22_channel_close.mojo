@@ -32,7 +32,8 @@ from mojito_async.channel import (
 )
 from mojito_async.integration.sys import BytePtr, IntResult
 from mojito_async.runtime.runtime import Runtime, create
-from mojito_async.runtime.scheduler import resume_current, scheduler_loop
+from mojito_async.runtime.scheduler import scheduler_loop
+from mojito_async.runtime.park import unpark_current
 from mojito_async.runtime.task_control_block import TaskControlBlock
 from mojito_async.task import JoinHandle, claim_running, spawn
 
@@ -181,7 +182,7 @@ def drain(mut rt: Runtime, sc: UnsafePointer[Scene, MutAnyOrigin]) raises:
         if wr.task_id == 0:
             break
         var hp = _handle(wr.tcb_addr, wr.task_id)
-        resume_current(rt, hp)
+        unpark_current(rt, hp)
 
 
 def dispatch(mut rt: Runtime, tcb_addr: Int, tid: Int, ud: BytePtr) raises -> Int:

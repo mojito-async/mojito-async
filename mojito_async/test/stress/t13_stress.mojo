@@ -14,7 +14,7 @@
 # checkpoint and settles COMPLETED.
 #
 # Scenario A (storm on parked): 10,000 children spawn into a Scope, each
-# parks via _suspend_current with its own CancellationToken; the storm
+# parks via park_current with its own CancellationToken; the storm
 # requests all 10,000 tokens, every child is woken, each checkpoint raises
 # CancellationError, execute() settles COMPLETED; scope.close(rt) joins all
 # settled children (no orphaned results); sample joins re-raise the
@@ -37,8 +37,8 @@ from mojito_async.cancellation import (
 )
 from mojito_async.integration.sys import BytePtr, IntResult
 from mojito_async.runtime.runtime import Runtime, create
-from mojito_async.runtime.scheduler import _suspend_current, resume_current
 from mojito_async.runtime.scheduler import scheduler_loop
+from mojito_async.runtime.park import park_current, unpark_current
 from mojito_async.runtime.task_control_block import TaskControlBlock
 from mojito_async.scope import CancelHook, Scope, make_scope
 from mojito_async.task import JoinHandle, claim_running, execute, spawn
@@ -141,7 +141,7 @@ def body_checkpoint(ud: BytePtr) raises -> IntResult:
 def dispatch_storm(mut rt: Runtime, tcb_addr: Int, tid: Int, ud: BytePtr) raises -> Int:
     """Scenario-aware dispatcher over ONE generic body:
       phase 0 (storm on parked): slice 1 parks the child (claim RUNNING,
-        _suspend_current); slice 2 executes body_checkpoint (raises ->
+        park_current); slice 2 executes body_checkpoint (raises ->
         COMPLETED).
       phase 1 (storm before park): every slice executes body_checkpoint
         (raises -> COMPLETED at the very first checkpoint)."""
@@ -152,7 +152,7 @@ def dispatch_storm(mut rt: Runtime, tcb_addr: Int, tid: Int, ud: BytePtr) raises
     if sc[].phase()[] == 0:
         if sc[].counts[idx] == 0:
             claim_running(transient)
-            _suspend_current(rt, transient)
+            park_current(rt, transient)
             sc[].counts[idx] = 1
             sc[].parked()[] = sc[].parked()[] + 1
             return 1
@@ -243,7 +243,7 @@ def main() raises:
 
     # ---- wake every parked child (the cancel-resume edge) -------------------
     for i in range(NA):
-        resume_current(rt, handles[i])
+        unpark_current(rt, handles[i])
 
     # ---- wave 2: every child checkpoints -> CancellationError -> COMPLETED -
     var served2 = scheduler_loop(rt, dispatch_storm, ud)

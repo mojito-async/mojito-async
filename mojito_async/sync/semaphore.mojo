@@ -5,7 +5,7 @@
 # exhausted instead of blocking the worker.  Composes with the A1.1
 # cooperative scheduler exactly like Mutex: `acquire` is a dispatcher-level
 # operation (fast path returns immediately; on exhaustion it publishes the
-# waiter, parks via `_suspend_current`, and is re-entered on resume with a
+# waiter, parks via `park_current`, and is re-entered on resume with a
 # GRANT marker that a `release` set).
 #
 # Fairness (documented, spec §36): STRICT FIFO.  A waiter never overtakes an
@@ -25,9 +25,9 @@
 # of parallel addr/id/n with no fast-path allocation.
 from std.collections import Deque
 from mojito_async.runtime.runtime import Runtime
-from mojito_async.runtime.scheduler import _suspend_current, resume_current
 from mojito_async.runtime.task_control_block import ResultValue, TaskControlBlock
 from mojito_async.task import JoinHandle
+from mojito_async.runtime.park import park_current, unpark_current
 
 
 comptime PERMIT_GRANTED = Int(1)
@@ -109,7 +109,7 @@ struct Semaphore(Movable):
         self._w_tcb.append(Int(h.tcb()))
         self._w_id.append(h.id())
         self._w_n.append(n)
-        _suspend_current(rt, h)
+        park_current(rt, h)
         return False
 
     def release[R: ResultValue](mut self, mut rt: Runtime, n: Int = 1) raises -> Bool:
@@ -129,7 +129,7 @@ struct Semaphore(Movable):
                 self._permits -= need
                 var hw = _perm_waiter_handle[R](tcb, tid)
                 hw.tcb()[].wait_node()[].set_next(PERMIT_GRANTED)
-                resume_current(rt, hw)
+                unpark_current(rt, hw)
                 return True
         return False
 

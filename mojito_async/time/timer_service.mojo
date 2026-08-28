@@ -8,7 +8,7 @@
 # order, suppresses stale generations (a popped entry whose granted gen no
 # longer matches the live armed gen for its id is DROPPED, never a wake),
 # and wakes each live WAITING task through the A1.1 canonical park/wake path
-# (`resume_current`: WAITING -> RUNNABLE + re-enqueue, once per epoch —
+# (`unpark_current`: WAITING -> RUNNABLE + re-enqueue, once per epoch —
 # issue #39 single-source).  `drive_step` composes the A1.1 scheduler loop
 # with the timer service: run ready tasks, then service due timers — the
 # deterministic virtual-clock stepping the tests/drivers perform.
@@ -17,7 +17,8 @@
 # storage: touching exactly the embedded TCBs + the runnable queue.
 from mojito_async.integration.sys import BytePtr
 from mojito_async.runtime.runtime import Nil, Runtime
-from mojito_async.runtime.scheduler import resume_current, scheduler_loop
+from mojito_async.runtime.scheduler import scheduler_loop
+from mojito_async.runtime.park import unpark_current
 from mojito_async.runtime.task_control_block import ResultValue, TaskControlBlock
 from mojito_async.task import JoinHandle
 from mojito_async.time.timer_heap import TimerHeap
@@ -45,7 +46,7 @@ def service_timers[R: ResultValue](
             e.id,
         )
         if h.state() == TaskControlBlock.WAITING:
-            resume_current(rt, h)
+            unpark_current(rt, h)
             woke += 1
     return woke
 

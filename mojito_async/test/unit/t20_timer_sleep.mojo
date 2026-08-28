@@ -12,7 +12,7 @@
 #   - the virtual clock has NOT reached A's deadline: the servicing hook
 #     wakes nobody (no premature wake, no spin, no OS-thread block);
 #   - the driver advances the clock past the deadline; service_timers pops
-#     the due timer and wakes A ONCE via the canonical resume_current
+#     the due timer and wakes A ONCE via the canonical unpark_current
 #     (WAITING -> RUNNABLE + enqueue);
 #   - A resumes on the next drive and completes; heap drained; runnable
 #     queue quiet.

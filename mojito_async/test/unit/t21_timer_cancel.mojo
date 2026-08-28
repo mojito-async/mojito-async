@@ -15,7 +15,8 @@
 from std.memory import stack_allocation
 from mojito_async.integration.sys import BytePtr, IntResult
 from mojito_async.runtime.runtime import Runtime, create
-from mojito_async.runtime.scheduler import resume_current, scheduler_loop
+from mojito_async.runtime.scheduler import scheduler_loop
+from mojito_async.runtime.park import unpark_current
 from mojito_async.runtime.task_control_block import TaskControlBlock
 from mojito_async.task import JoinHandle, claim_running, execute, spawn
 from mojito_async.time.clock import MonotonicClock
@@ -150,7 +151,7 @@ def main() raises:
         red("cancelled wake enqueued a record")
 
     # ---- re-arm the same task: cancellation is not poisoning --------------
-    resume_current(rt, h)
+    unpark_current(rt, h)
     if h.state() != TaskControlBlock.RUNNABLE:
         red("resume did not schedule A after cancel")
     var served2 = scheduler_loop(rt, dispatch, ud)

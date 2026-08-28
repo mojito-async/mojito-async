@@ -5,9 +5,9 @@
 #
 # The A1.1 colorless runtime has no fibers: a task parks BETWEEN dispatcher
 # slices.  The channel's send/recv attempt once, register a waiter, and
-# suspend via the canonical A1.1 park (`_suspend_current`); the embedding
+# suspend via the canonical A1.1 park (`park_current`); the embedding
 # driver re-enters the task on resume, and deferred wakes (the channel's
-# `_to_wake`) are drained by the driver via `resume_current` (the canonical
+# `_to_wake`) are drained by the driver via `unpark_current` (the canonical
 # wake — single source, issue #39).
 #
 # Modes (capacity-1 channels, deterministic FIFO schedules):
@@ -28,7 +28,8 @@ from std.memory import stack_allocation
 from mojito_async.channel import Channel, Receiver, Sender, make_channel
 from mojito_async.integration.sys import BytePtr, IntResult
 from mojito_async.runtime.runtime import Runtime, create
-from mojito_async.runtime.scheduler import resume_current, scheduler_loop, yield_now
+from mojito_async.runtime.scheduler import scheduler_loop, yield_now
+from mojito_async.runtime.park import unpark_current
 from mojito_async.runtime.task_control_block import TaskControlBlock
 from mojito_async.task import JoinHandle, claim_running, spawn
 
@@ -212,7 +213,7 @@ def drain(mut rt: Runtime, sc: UnsafePointer[Scene, MutAnyOrigin]) raises:
         if wr.task_id == 0:
             break
         var hp = _handle(wr.tcb_addr, wr.task_id)
-        resume_current(rt, hp)
+        unpark_current(rt, hp)
 
 
 def dispatch(mut rt: Runtime, tcb_addr: Int, tid: Int, ud: BytePtr) raises -> Int:

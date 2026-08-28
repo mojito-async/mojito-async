@@ -1,7 +1,7 @@
 # mojito_async/task.mojo
 #
-# A1.1 runtime (issue #33) — spawn + one-shot JoinHandle + the
-# park/wake/join protocol over the runtime's runnable queue.
+# A1.1 runtime (issue #33) — spawn + execute + claim_running + abandon over
+# the runtime's runnable queue.
 #
 # Productionized from spike/colorless_runtime/spawn.mojo (A0.6, issue #15);
 # semantics carried forward VERBATIM.  Proven IN-library (extern-free):
@@ -11,15 +11,21 @@
 #     receives the task body as `[F: def(BytePtr) raises -> R]` plus its
 #     userdata pointer (the S0 pattern), runs it on the current stack, and
 #     settles COMPLETED with either a stored result or a preserved error;
-#   - park protocol: RUNNING -> PARKING -> WAITING (generation bump via the
-#     A0.5 TCB) and wake WAITING -> RUNNABLE + re-enqueue (once per epoch);
-#   - JoinHandle one-shot join: double-join rejected, consume-once result
-#     take, child-error re-raise with the message preserved, deterministic
-#     single-destruction teardown for abandoned results.
+#   - claim_running: the owner-worker claim of a dequeued record
+#     (RUNNABLE -> RUNNING) before entering/resuming the task;
+#   - abandon: deterministic single destruction of an unconsumed result.
+#
+# A1 follow-up (issue #39): JoinHandle + SuspendReason MOVED to
+# runtime/join_handle.mojo (their single definition) and are re-exported here
+# so every existing import path (`from mojito_async.task import JoinHandle,
+# SuspendReason`) keeps working unchanged.  The park/wake choreography now
+# lives ONLY in runtime/park.mojo (park_current/unpark_current); the old
+# task.park_prepare/park_commit/suspend_commit/wake duplicates were deleted
+# (they were dead — no callers).
 #
 # COOPERATIVE POLICY (spec §88): run()/execute are work-first — a task's
 # first entry happens eagerly on the current worker; a task that must wait
-# commits to PARKING/WAITING through the protocol and lets the scheduler
+# commits to PARKING/WAITING through runtime.park and lets the scheduler
 # dequeue-and-execute other RUNNABLE records.  INV: no OS-thread creation,
 # no hidden blocking.
 #
@@ -31,143 +37,11 @@
 from mojito_async.integration.sys import BytePtr
 from mojito_async.runtime.runtime import Runtime
 from mojito_async.runtime.task_control_block import ResultValue, TaskControlBlock
+from mojito_async.runtime.join_handle import JoinHandle, SuspendReason
 
 
 # ---------------------------------------------------------------------------
-# SuspendReason / park reason codes (shared by scheduler + sync)
-# ---------------------------------------------------------------------------
-
-struct SuspendReason:
-    """Why a task waits — stamped on the embedded WaitNode.  Open set."""
-
-    comptime NONE = Int(0)
-    comptime YIELD = Int(1)
-    comptime JOIN = Int(2)
-    comptime TIMER = Int(5)
-    comptime PARK = Int(3)
-    comptime CANCEL = Int(4)
-
-
-# ---------------------------------------------------------------------------
-# JoinHandle[R]
-# ---------------------------------------------------------------------------
-
-struct JoinHandle[R: ResultValue](ImplicitlyCopyable, ImplicitlyDeletable):
-    """One-shot handle to a spawned task's outcome (spec §9.1, INV-4).
-
-    Holds the address of the task's caller-allocated TaskControlBlock cell
-    plus the consumption bookkeeping:
-      _joined    — join() consumed (or was attempted); second join raises.
-      _abandoned — abandon() released the result; later join raises.
-      _failed    — the child raised; _err carries the PRESERVED message that
-                   join() re-raises.
-    """
-
-    var _tcb: UnsafePointer[TaskControlBlock[Self.R], MutAnyOrigin]
-    var _id: Int
-    var _joined: Bool
-    var _abandoned: Bool
-    var _failed: Bool
-    var _err: String
-
-    def __init__(
-        out self,
-        tcb: UnsafePointer[TaskControlBlock[Self.R], MutAnyOrigin],
-        id: Int,
-    ):
-        self._tcb = tcb
-        self._id = id
-        self._joined = False
-        self._abandoned = False
-        self._failed = False
-        self._err = ""
-
-    # --- queries ------------------------------------------------------------
-
-    def id(self) -> Int:
-        return self._id
-
-    def tcb(self) -> UnsafePointer[TaskControlBlock[Self.R], MutAnyOrigin]:
-        """Address of the underlying TCB cell (driver/fiber choreography)."""
-        return self._tcb
-
-    def state(self) -> Int:
-        return self._tcb[].state()
-
-    def is_completed(self) -> Bool:
-        return self._tcb[].is_completed()
-
-    def is_cancelled(self) -> Bool:
-        return self._tcb[].is_cancelled()
-
-    def is_failed(self) -> Bool:
-        return self._failed
-
-    def error(self) -> String:
-        return self._err
-
-    # --- consumption ---------------------------------------------------------
-
-    def begin_join(mut self) raises:
-        """One-shot gate.  Raises on ANY second consumption attempt: double
-        join, or join after abandon.  ALSO refuses a child that has not yet
-        reached COMPLETED — WITHOUT marking the handle joined — so a join
-        attempted early does not burn the handle: once the child completes, a
-        later join still works (the pending state is not consumed)."""
-        if self._joined:
-            raise Error(
-                "JoinHandle.join: double join rejected (one-shot, spec INV-4)"
-            )
-        if self._abandoned:
-            raise Error(
-                "JoinHandle.join: result already abandoned; cannot join"
-            )
-        if not self.is_completed():
-            raise Error(
-                "JoinHandle.join: child not COMPLETED yet — drive the "
-                "scheduler first; the pending join was NOT consumed"
-            )
-        self._joined = True
-
-    def finish_join(mut self) raises -> Self.R:
-        """Consume-once fast path: move the settled result out (or re-raise
-        the preserved child error).  A pending (not-yet-COMPLETED) child has
-        no in-library drive: mid-frame resumption needs the embedding
-        scheduler loop, so this path raises descriptively instead of blocking
-        the worker invisibly."""
-        if not self.is_completed():
-            raise Error(
-                "JoinHandle.finish_join: child not COMPLETED yet — pending "
-                "join requires the A1 scheduler loop (see module header); "
-                "schedule/drive before finishing"
-            )
-        if self._failed:
-            raise Error("child task failed: " + self._err)
-        return self._tcb[].take_result()
-
-    def finish_join_preserve(mut self) raises -> Self.R:
-        """Synonym to keep spike-spawn compatibility naming."""
-        return self.finish_join()
-
-    def join(mut self) raises -> Self.R:
-        """join(): begin + finish.  Fast paths (completed child, error
-        propagation, double-join rejection) run entirely in-library."""
-        self.begin_join()
-        return self.finish_join()
-
-    def fail(mut self, msg: String):
-        """Record a preserved child error (called by execute()'s handler)."""
-        self._failed = True
-        self._err = msg
-
-    def mark_abandoned(mut self) raises:
-        if self._abandoned or self._joined:
-            raise Error("JoinHandle.abandon: result already consumed")
-        self._abandoned = True
-
-
-# ---------------------------------------------------------------------------
-# spawn / execute / park-wake protocol / abandon
+# spawn / execute / claim_running / abandon
 # ---------------------------------------------------------------------------
 
 def spawn[R: ResultValue](
@@ -221,34 +95,6 @@ def claim_running[R: ResultValue](
     """Owner-worker claim of a dequeued record: RUNNABLE -> RUNNING.  Called
     by the scheduler immediately BEFORE entering or resuming the task."""
     h.tcb()[].transition(TaskControlBlock.RUNNING)
-
-
-def park_prepare[R: ResultValue](h: JoinHandle[R]) raises:
-    """Park pipeline step 1: RUNNING -> PARKING (commit to stop using the
-    worker after the current checkpoint)."""
-    h.tcb()[].transition(TaskControlBlock.PARKING)
-
-
-def park_commit[R: ResultValue](h: JoinHandle[R]) raises:
-    """Park pipeline step 2: PARKING -> WAITING.  Claims a fresh wait epoch
-    (generation bump — stale wakes from a previous epoch are rejected)."""
-    h.tcb()[].transition(TaskControlBlock.WAITING)
-
-
-def suspend_commit[R: ResultValue](h: JoinHandle[R]) raises:
-    """A1 `_suspend_current` commit: RUNNING -> PARKING -> WAITING, atomically
-    as far as the worker allows (a single suspension).  Equivalent to
-    park_prepare(h); park_commit(h)."""
-    h.tcb()[].transition(TaskControlBlock.PARKING)
-    h.tcb()[].transition(TaskControlBlock.WAITING)
-
-
-def wake[R: ResultValue](mut rt: Runtime, h: JoinHandle[R]) raises:
-    """Deliver readiness: WAITING -> RUNNABLE and re-enqueue (FIFO).  Waking
-    keeps the task's original scheduler id; a wake to a non-WAITING task is
-    an illegal transition and raises (never silently enqueued twice)."""
-    h.tcb()[].transition(TaskControlBlock.RUNNABLE)
-    rt.enqueue(Int(h.tcb()), h.id())
 
 
 def abandon[R: ResultValue](mut h: JoinHandle[R]) raises:
