@@ -128,8 +128,14 @@ def ms_stack_free(base: BytePtr) abi("C"):
     ...
 
 
-@extern("ms_stack_total_size")
-def ms_stack_total_size() abi("C") -> Int:
+# Number of currently-live ms_stack_alloc reservations (process-wide).  Used
+# by the fiber factories' oversubscription guard (T1): the vendored resume
+# table caps the process at 32 concurrent fibers (64 rows / 2 per fiber) and
+# traps with `brk #0x67` (SIGILL) on saturation, so A1 raises a catchable
+# Error before the 33rd live fiber rather than trapping.  EPIC #2 (#101)
+# removes the cap; this surface is the fail-loud seam until then.
+@extern("ms_live_stack_count")
+def ms_live_stack_count() abi("C") -> Int:
     ...
 
 
