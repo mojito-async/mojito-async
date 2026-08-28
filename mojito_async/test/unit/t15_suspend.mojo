@@ -114,10 +114,13 @@ def main() raises:
     var scp = UnsafePointer[Scene, MutAnyOrigin](to=sc)
     var ud = scp.bitcast[Byte]()
 
-    var tcb_a = TB.create()
-    var h_a = spawn(rt, UnsafePointer[TB, MutAnyOrigin](to=tcb_a), 0)
+    # A2.2 (issue #68): owner pop is LIFO (spawn locality), so register B
+    # first, A second -> the deque serves A (parks) before B (runs inside
+    # A's park window), preserving this scenario's intent.
     var tcb_b = TB.create()
     var h_b = spawn(rt, UnsafePointer[TB, MutAnyOrigin](to=tcb_b), 0)
+    var tcb_a = TB.create()
+    var h_a = spawn(rt, UnsafePointer[TB, MutAnyOrigin](to=tcb_a), 0)
     buf[9] = h_a.id()
     buf[10] = h_b.id()
 

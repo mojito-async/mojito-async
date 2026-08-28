@@ -6,27 +6,34 @@
 #
 #   - `yield_now(mut rt, h)`  — the RUNNING task is put back on the runnable
 #     queue as RUNNABLE (spec §27) WITHOUT blocking; it MUST NOT sleep the
-#     worker or register a wait.  `rt` re-queues FIFO; enqueue-once is
-#     guarded (an already-RUNNABLE task is never re-enqueued).
+#     worker or register a wait.  `rt` re-queues onto THIS worker's LOCAL
+#     deque (A2.2, issue #68 — owner push_back, the same runnable set the
+#     scheduler drains); enqueue-once is guarded (an already-RUNNABLE task
+#     is never re-enqueued).
 #   - the cooperative PARK/WAKE primitives live in runtime/park.mojo now
 #     (issue #39 single source): park_current (RUNNING -> PARKING -> WAITING,
 #     generation-bumped epoch, spec §25, wait reason stamped) and
 #     unpark_current (readiness delivered ONCE, WAITING -> RUNNABLE +
-#     re-enqueue).  The A1.1 `_suspend_current` / `resume_current` spellings
-#     were deleted; every consumer and lane driver imports park.mojo.
-#   - `scheduler_loop` — the single-worker cooperative drive loop.  It is
+#     re-enqueue onto the worker's REMOTE-ready queue — issue #68: a wake
+#     may come from any worker, so the wake lands on the per-worker remote
+#     queue; E5 routes it to the OWNER worker, spec §19.2).  The A1.1
+#     `_suspend_current` / `resume_current` spellings were deleted; every
+#     consumer and lane driver imports park.mojo.
+#   - `scheduler_loop` — the per-worker cooperative drive loop.  It is
 #     GENERIC over a statically-known task-owner dispatcher (b2 cannot store
 #     function values): the caller supplies the body executor for THIS task
 #     tree, so unstarted records are executed exactly where their bodies are
 #     known (the spike's proven model; NEVER dynamic dispatch through the
-#     record).  The loop dequeues RUNNABLE records, runs each via the
-#     dispatcher to its next checkpoint, and stops when the queue is empty.
-#     A popped record whose TCB is not RUNNABLE (stale duplicate) is
-#     SKIPPED — counted via rt.skipped(), never dispatched.
+#     record).  The loop drains the worker's LOCAL deque first, then its
+#     REMOTE-ready queue (spec §21), running each record via the dispatcher
+#     to its next checkpoint, and stops when both are quiet.  A popped
+#     record whose TCB is not RUNNABLE (stale duplicate) is SKIPPED —
+#     counted via rt.skipped(), never dispatched (the A1 invariant survives
+#     the queue split, issue #68).
 #
 #
 # A1.5 (issue #53) — the FIBER-BACKED drive.  This module stays EXTERN-FREE
-# and UNCHANGED in its mechanics: the single-worker loop pops a RUNNABLE
+# and UNCHANGED in its mechanics: the per-worker loop pops a RUNNABLE
 # record and hands it to the statically-known dispatcher.  The frame
 # migration lives one module over, in runtime/fiber_seam.mojo, and the
 # fiber handle is THREADED THROUGH THE DRIVER VALUE (b2 design decision #4,
@@ -42,6 +49,7 @@
 # regression guard.  Keep this module import-free of fibers so the JIT unit
 # drivers (t11..t18/t20..t22) keep linking without the dylib (#6971).
 from mojito_async.integration.sys import BytePtr
+from mojito_async.runtime.queue import TaskRecord
 from mojito_async.runtime.runtime import Nil, Runtime
 from mojito_async.runtime.task_control_block import ResultValue, TaskControlBlock
 
@@ -55,52 +63,82 @@ def yield_now[R: ResultValue](mut rt: Runtime, h: JoinHandle[R]) raises:
 
     RUNNING -> PARKING -> RUNNABLE is taken through the machine's early-wake
     edge (spec A0.5): the task is never WAITING, claims no wait epoch, and
-    re-enters the runnable queue FIFO - the worker picks the next RUNNABLE
-    record next.  A real WAITING suspend would use runtime.park's `park_current`.
-    Doesn't sleep the worker or register a wait; no allocation beyond the
-    queue's amortized growth.  Enqueue-once: if the task is ALREADY RUNNABLE
-    (its record still queued), this is a no-op - never double-enqueued."""
+    re-enters THIS worker's runnable set via enqueue_local (A2.2, issue #68
+    — owner push_back onto the local deque; the scheduler drains LOCAL
+    before REMOTE).  A real WAITING suspend would use runtime.park's
+    `park_current`.  Doesn't sleep the worker or register a wait; no
+    allocation beyond the deque's amortized growth.  Enqueue-once: if the
+    task is ALREADY RUNNABLE (its record still queued), this is a no-op -
+    never double-enqueued."""
     if h.state() == TaskControlBlock.RUNNABLE:
         return  # already reschedulable; do not double-enqueue
     h.tcb()[].transition(TaskControlBlock.PARKING)
     h.tcb()[].transition(TaskControlBlock.RUNNABLE)
-    rt.enqueue(Int(h.tcb()), h.id())
-
+    rt.enqueue_local(Int(h.tcb()), h.id())
 
 
 # ---------------------------------------------------------------------------
-# scheduler_loop — the single-worker cooperative drive loop (spec §21 / C7)
+# scheduler_loop — the per-worker cooperative drive loop (spec §21 / C7)
 # ---------------------------------------------------------------------------
 
 # Dispatcher slot: given the worker's Runtime plus a RUNNABLE record, execute
 # that record's task up to its next state.  The dispatcher KNOWS the task
-# bodies (b2 cannot store heterogeneous thunks); the lopp is generic over it.
-# Passing `rt` lets the dispatcher park (via `park_current`), yield (via
-# `yield_now`), or wake (via `unpark_current`) as it drives.
+# bodies (b2 cannot store heterogeneous thunks); the loop is generic over
+# it.  Passing `rt` lets the dispatcher park (via `park_current`), yield
+# (via `yield_now`), or wake (via `unpark_current`) as it drives.
 def scheduler_loop[F: def(mut Runtime, Int, Int, BytePtr) raises -> Int, R: ResultValue = Nil](
     mut rt: Runtime,
     dispatcher: F,
     ud: BytePtr,
+    worker_id: Int = 0,
 ) raises -> Int:
-    """Drive the ONE worker until its runnable queue is quiet.
+    """Drive ONE worker until its run queues are quiet (A2.2, issue #68).
 
-    For each popped record, SKIP it (counted) when its TCB is not RUNNABLE
-    (stale duplicate — never dispatched), else hand (rt, tcb_addr, task_id,
-    ud) to `dispatcher`, which executes that task to its next state.  A task
-    that parks (via `park_current`), yields (via `yield_now`), or is
-    completed is handled by the dispatcher over rt.  Returns the number of
-    records SERVED (observable progress); skipped records are observable via
-    `rt.skipped()`.
+    Per-worker queues (spec §21): the worker's LOCAL deque is drained
+    FIRST, then its REMOTE-ready queue — locally-resident spawns never
+    starve on their own worker, and a remote wake is observed as soon as
+    local work is served.  For each popped record:
+
+      - SKIP it (counted via rt.skipped()) when its TCB is not RUNNABLE —
+        a stale duplicate is NEVER dispatched (the A1 enqueue-once
+        invariant survives the queue split; it is only logical cross-
+        worker), else
+      - stamp owner_worker at FIRST RUN when `worker_id` is nonzero (E5
+        surface, issue #68; 0 = unpinned/not-started, matching
+        wake_target_worker), then hand (rt, tcb_addr, task_id, ud) to
+        `dispatcher`, which executes that task to its next state.
+    Returns the number of records SERVED (observable progress); skipped
+    records are observable via `rt.skipped()`.
+
+    worker_id — explicit worker identity threaded by value (b2 has no TLS);
+    the E1 worker pool passes its worker index.  Existing single-runtime
+    callers keep the 3-argument form (default 0 = no pin stamp).
+
+    # E3-OWNED: injection intake (issue #69) — #69's bounded injection poll
+    # (optional `inject`/`inject_budget` params, default None) drops in at
+    # the seam below, BEFORE pop_local, keeping the A1 call form.
     """
     var slices = 0
-    while rt.has_ready():
-        var rec = rt.pop_ready()
+    while True:
+        var have = False
+        var rec = TaskRecord(0, 0)
+        # # E3-OWNED: injection intake — #69 polls its inject queue HERE.
+        if rt.has_local():
+            rec = rt.pop_local()
+            have = True
+        elif rt.has_remote():
+            rec = rt.pop_remote()
+            have = True
+        if not have:
+            break
         var checker = UnsafePointer[TaskControlBlock[R], MutAnyOrigin](
             unsafe_from_address=rec.tcb_addr
         )
         if checker[].state() != TaskControlBlock.RUNNABLE:
             rt.note_skipped()
             continue
+        if worker_id != 0 and checker[].owner_worker() == 0:
+            checker[].set_owner_worker(worker_id)
         slices += 1
         _ = dispatcher(rt, rec.tcb_addr, rec.task_id, ud)
     return slices
@@ -124,6 +162,8 @@ def scheduler_loop[F: def(mut Runtime, Int, Int, BytePtr) raises -> Int, R: Resu
 # wake_target_worker(f.owner_worker(), this_worker_id) at wake time and
 # enqueues onto that worker's (remote-ready) queue when the returned target
 # differs from the waker; on one worker the target is always the sole queue.
+# A2.2 (issue #68) has already landed the queues: the E5 seam pushes onto
+# the target worker's RemoteReadyQueue (push_remote).
 def wake_target_worker(owner_worker: Int, local_worker: Int) -> Int:
     """Resolve the enqueue target for a woken (started) task/fiber.
 
@@ -134,12 +174,13 @@ def wake_target_worker(owner_worker: Int, local_worker: Int) -> Int:
 
     Returns the worker whose run queue must receive the wake:
       - owner == local_worker (intra-worker wake, spec §88) -> local_worker,
-        the wake stays on this worker's FIFO (today's behavior);
+        the wake lands on this worker's own runnable set (today's
+        behavior);
       - owner == 0 (unstarted/unpinned) -> local_worker, the general
         runnable-set fallback (nothing to be affine to yet);
       - otherwise (foreign wake) -> owner_worker: the wake lands on the
         OWNER worker's remote-ready queue (spec §19.2), never the stealable
-        set.  EPIC #2 enqueues there in the E5 seam.
+        set.  EPIC #2 enqueues there in the E5 seam (push_remote).
     """
     if owner_worker == 0 or owner_worker == local_worker:
         return local_worker
