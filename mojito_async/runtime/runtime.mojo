@@ -35,6 +35,8 @@
 #   stay in the embedding *_aot drivers).
 from mojito_async.runtime.queue import FifoQueue, LocalDeque, RemoteReadyQueue, TaskRecord
 from mojito_async.runtime.task_control_block import ResultValue, TaskControlBlock
+from std.atomic import Atomic
+from mojito_async.runtime.inject_queue import InjectQueue
 
 
 # ---------------------------------------------------------------------------
@@ -60,6 +62,7 @@ struct Runtime:
     """One worker's scheduler core.
 
     State:
+<<<<<<< HEAD
       _ready     — E3-OWNED injection intake: the A1 global FIFO, retained
                      for global/injection submits until #69's inject queue
                      replaces it (NOT on the local hot path).
@@ -67,6 +70,14 @@ struct Runtime:
                      tasks; owner push_back/pop_back — LIFO spawn locality).
       _remote    — this worker's REMOTE-ready queue (wakes of STARTED
                      fibers; any worker pushes, the owner pops — FIFO).
+=======
+      _ready     — FIFO of RUNNABLE TaskRecords (mutex-free: single worker,
+                     no cross-thread handoff exists).
+      _inject    — A2.3 (issue #69) shared bounded MPSC injection queue: the
+                     global intake for non-worker-local spawns/foreign
+                     enqueues; drained by every worker (see enqueue_global
+                     and scheduler_loop's bounded poll).
+>>>>>>> origin/a2/69-inject
       _shutdown  — latched by shutdown(); run()/spawn refuse afterwards.
       _scope     — root scope handle (Int cell handle; refined upward).
       _next_id   — monotonic task-id allocator (ids start at 1; 0 = none).
@@ -83,6 +94,9 @@ struct Runtime:
     """
 
     comptime NO_SCOPE = Int(0)
+    # A2.3 (issue #69): default bound for the shared injection queue (spec
+    # §86 — limits for externally submitted unbounded work).
+    comptime INJECT_CAPACITY = Int(1024)
 
     var _ready: FifoQueue[TaskRecord]
     var _local: LocalDeque
@@ -93,9 +107,25 @@ struct Runtime:
     var _tasks_started: Int
     var _tasks_completed: Int
     var _enqueued: Int
+    # Cross-thread safety (A2.3): the INJECTED path counts accepted records
+    # inside InjectQueue's own lock (push already holds it — free there,
+    # and NO atomic RMW on a Runtime field: b2 miscompiles that inside the
+    # fiber-crossing enqueue path, verified vs t26).  `enqueued()` folds
+    # local `_enqueued` (A1 paths, plain +=, worker-local) + inject
+    # `accepted()`.  External producer threads therefore never touch any
+    # Runtime scalar concurrently.
     var _skipped: Int
     var _fiber_drives: Int
     var _fiber_switches: Int
+    # A2.3 (issue #69): the shared global injection queue — the MPSC intake
+    # for tasks submitted outside any worker's local deque (external spawn
+    # entry, cross-worker/foreign enqueues, reactor/timer submissions).
+    # DISTINCT from the A1 `_ready` FIFO: `_ready` stays the LOCAL runnable
+    # queue of this Runtime (single worker today; per-worker deque lane is
+    # E2/#68), while `_inject` is the global bounded intake any worker
+    # drains (see scheduler_loop's bounded poll).  Worker-local enqueues
+    # NEVER take this queue's lock.
+    var _inject: InjectQueue
 
     def __init__(out self):
         self._ready = FifoQueue[TaskRecord]()
@@ -110,6 +140,7 @@ struct Runtime:
         self._skipped = 0
         self._fiber_drives = 0
         self._fiber_switches = 0
+        self._inject = InjectQueue(Self.INJECT_CAPACITY)
 
     # --- root-task execution (A0-T1) ----------------------------------------
 
@@ -157,7 +188,7 @@ struct Runtime:
         if self._shutdown:
             raise Error("runtime.enqueue: runtime is shut down")
         self._ready.push(TaskRecord(tcb_addr, task_id))
-        self._enqueued += 1
+        self._bump_enqueued()
 
     def enqueue_local(mut self, tcb_addr: Int, task_id: Int) raises:
         """Register a RUNNABLE record on THIS worker's local deque (unstarted
@@ -218,6 +249,66 @@ struct Runtime:
         intake + local deque + remote queue)."""
         return len(self._ready) + self._local.count() + self._remote.count()
 
+    # --- A2.3 global injection intake (issue #69) ----------------------------
+
+    def enqueue_global(mut self, tcb_addr: Int, task_id: Int, current_worker: Int) raises:
+        """Spawn-policy classification for the RUNNABLE registration of a
+        task submitted OUTSIDE any worker's local deque.
+
+        `current_worker` is the known worker identity when the spawn hails
+        from a task already running on worker W (b2 has no TLS, so worker
+        identity is threaded by value; 0 = no known current worker):
+          - current_worker != 0 -> enqueue_local(W) — the per-worker deque
+            lane is E2/#68's; until it lands this routes through the A1 FIFO
+            `_ready` (the single-worker local queue), so a worker-local
+            enqueue NEVER takes the injection lock (acceptance: no global
+            lock on the local hot path).  [E2-OWNED seam]
+          - current_worker == 0 -> _inject.push — the shared bounded MPSC
+            intake; the record is an INJECTION (UNSTARTED, stealable per
+            §19.1) any worker may run.  At capacity `_inject.push` raises a
+            clear full error instead of blocking any worker (ADR-009); the
+            caller retries on its next loop iteration (spec §86).
+        Registration counts against `_enqueued` exactly once either way.
+        """
+        if self._shutdown:
+            raise Error("runtime.enqueue_global: runtime is shut down")
+        if current_worker == 0:
+            # INJECTED (UNSTARTED, stealable per §19.1): any worker may run
+            # this record — it lands on the shared bounded MPSC intake.  At
+            # capacity `_inject.push` raises a clear full error instead of
+            # blocking any worker (ADR-009); the caller retries on its next
+            # loop iteration (spec §86 backpressure).  The ACCEPTED record
+            # is counted inside the queue's own lock (accepted()); the local
+            # `_enqueued` counter stays untouched here.
+            self._inject.push(TaskRecord(tcb_addr, task_id))
+        else:
+            # enqueue_local(W): the per-worker deque lane is E2/#68's — this
+            # branch consumes that seam when it lands; until then it routes
+            # through the A1 FIFO `_ready` (the single-worker local queue).
+            # A worker-local enqueue NEVER takes the injection lock here
+            # (acceptance: no global lock on the local hot path).
+            # [E2-OWNED]
+            self._ready.push(TaskRecord(tcb_addr, task_id))
+            self._bump_enqueued()
+
+    def inject_queue(mut self) -> UnsafePointer[InjectQueue, MutAnyOrigin]:
+        """The shared injection queue (drain seam for scheduler_loop)."""
+        return UnsafePointer[InjectQueue, MutAnyOrigin](to=self._inject)
+
+    def inject_pending(mut self) -> Int:
+        """Records currently waiting in the global injection queue."""
+        return self._inject.pending()
+
+    def inject_capacity(self) -> Int:
+        """The injection queue bound (spec §86 limits)."""
+        return self._inject.capacity()
+
+    def inject_rejected(self) -> Int:
+        """Capacity rejections the injection queue has observed (backpressure
+        evidence — the bounded intake shed load cleanly instead of blocking a
+        worker)."""
+        return self._inject.rejected()
+
     # --- observability -------------------------------------------------------
 
     def tasks_started(self) -> Int:
@@ -227,7 +318,17 @@ struct Runtime:
         return self._tasks_completed
 
     def enqueued(self) -> Int:
-        return self._enqueued
+        """Total runnable registrations: local (A1 paths) + accepted into
+        the shared injection queue (counted under the queue's own lock —
+        cross-thread-safe for external producers)."""
+        return self._enqueued + self._inject.accepted()
+
+
+    def _bump_enqueued(mut self):
+        self._enqueued += 1
+
+    def _bump_skipped(mut self):
+        self._skipped += 1
 
     def note_skipped(mut self):
         """Count a popped RUNNABLE record that was skipped (its TCB was not

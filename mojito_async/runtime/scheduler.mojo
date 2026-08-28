@@ -52,6 +52,7 @@ from mojito_async.integration.sys import BytePtr
 from mojito_async.runtime.queue import TaskRecord
 from mojito_async.runtime.runtime import Nil, Runtime
 from mojito_async.runtime.task_control_block import ResultValue, TaskControlBlock
+from mojito_async.runtime.inject_queue import InjectQueue
 
 
 # ---------------------------------------------------------------------------
@@ -92,6 +93,7 @@ def scheduler_loop[F: def(mut Runtime, Int, Int, BytePtr) raises -> Int, R: Resu
     ud: BytePtr,
     worker_id: Int = 0,
 ) raises -> Int:
+<<<<<<< HEAD
     """Drive ONE worker until its run queues are quiet (A2.2, issue #68).
 
     Per-worker queues (spec §21): the worker's LOCAL deque is drained
@@ -117,6 +119,22 @@ def scheduler_loop[F: def(mut Runtime, Int, Int, BytePtr) raises -> Int, R: Resu
     # E3-OWNED: injection intake (issue #69) — #69's bounded injection poll
     # (optional `inject`/`inject_budget` params, default None) drops in at
     # the seam below, BEFORE pop_local, keeping the A1 call form.
+=======
+    """Drive the ONE worker until its runnable queue is quiet (A1 single
+    worker, local FIFO only).  For each popped record, SKIP it (counted)
+    when its TCB is not RUNNABLE (stale duplicate — never dispatched), else
+    hand (rt, tcb_addr, task_id, ud) to `dispatcher`, which executes that
+    task to its next state.  Returns the number of records SERVED; skipped
+    records are observable via `rt.skipped()`.
+
+    A2.3 (issue #69): the GLOBAL-INJECTION poll is driver-drained through
+    the concrete InjectQueue seam (try_pop/pending) with the loop shape
+    documented below — the poll must live where the dispatcher is
+    statically known (b2: cross-module generic instantiation of the
+    multi-param loop is miscompiled, verified by probe).  This plain loop
+    keeps the A1 signature EXACTLY — so every existing callsite is
+    untouched and injection-free.
+>>>>>>> origin/a2/69-inject
     """
     var slices = 0
     while True:
@@ -142,6 +160,39 @@ def scheduler_loop[F: def(mut Runtime, Int, Int, BytePtr) raises -> Int, R: Resu
         slices += 1
         _ = dispatcher(rt, rec.tcb_addr, rec.task_id, ud)
     return slices
+
+
+# ---------------------------------------------------------------------------
+# A2.3 (issue #69) — the bounded GLOBAL-INJECTION poll
+#
+# The poll's LOOP lives at the call site that statistically knows the task
+# bodies (this module's stated doctrine: "Executing an unstarted record is
+# a GENERIC operation performed at a call site that statically knows the
+# task body ... never dynamic dispatch through the record"; b2 additionally
+# miscompiles cross-module generic instantiations of this multi-param loop
+# shape, verified by probe).  The library therefore exposes the poll as the
+# CONCRETE InjectQueue seam — try_pop (by-ref TaskRecord), pending,
+# try_push/push — that a worker loop drives:
+#
+#     while True:
+#         polled = 0
+#         while polled < INJECT_BUDGET:        # bounded: global intake cannot
+#             rec = TaskRecord(0, 0)           # starve under a busy local
+#             if not inject[].try_pop(rec):    # queue; budget = fairness (E7
+#                 break                        # sharpens it)
+#             ... skip-or-dispatch(rec) ...
+#             polled += 1
+#         if rt has local work: dispatch ONE local record (continue)
+#         if inject[].pending() > 0: continue  # injection is the fallthrough
+#         break                                # when the worker is quiet
+#
+# Non-blocking discipline (ADR-009): try_pop never blocks; a FULL injection
+# queue never wedges a worker — the worker spins past injection and
+# services its LOCAL deques, retrying injection on the next loop iteration
+# (issue step 3).  Spec §18/§21 topology: every worker drains the shared
+# intake between its local/remote deques, so injected work is dequeued
+# identically on every worker — WITHOUT a global lock on the local hot path.
+# ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
 # A1.5 fiber seam (issue #53): the fiber-backed DRIVE lives in
