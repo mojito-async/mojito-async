@@ -106,6 +106,12 @@ def scheduler_loop[F: def(mut Runtime, Int, Int, BytePtr) raises -> Int, R: Resu
     return slices
 
 # ---------------------------------------------------------------------------
+# A1.5 fiber seam (issue #53): the fiber-backed DRIVE lives in
+# runtime/fiber_seam.mojo — seam_drive returns the frame-reported
+# DriveVerdict (Parked | Completed; T3), seam_park_switch stamps the frame,
+# and seam_destroy_slot raises on a parked/suspended (live) frame.  The
+# runtime fiber-path counters are comptime-gated (FIBER_TOGGLE).
+#
 # A1.3 affinity seam (issue #51) — worker-affine started fibers (ADR-006/007)
 # ---------------------------------------------------------------------------
 #
