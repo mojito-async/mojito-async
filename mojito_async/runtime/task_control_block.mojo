@@ -166,7 +166,6 @@ struct TaskControlBlock[T: ResultValue](ImplicitlyCopyable, ImplicitlyDeletable)
     # remote-ready queue spinlock, alongside `_early` and the claim
     # decision (issue #68 memory-ordering banner).
     var _claim_epoch: Int
-
     def __init__(out self):
         self._state = TaskControlBlock.NEW
         self._generation = 1
@@ -180,7 +179,6 @@ struct TaskControlBlock[T: ResultValue](ImplicitlyCopyable, ImplicitlyDeletable)
         self._owner_runtime = 0
         self._early = False
         self._claim_epoch = 0
-
     # --- construction ------------------------------------------------------
 
     @staticmethod
@@ -346,7 +344,6 @@ struct TaskControlBlock[T: ResultValue](ImplicitlyCopyable, ImplicitlyDeletable)
         OWNER's remote-ready queue spinlock (with `_early` and the claim
         decision)."""
         return self._claim_epoch
-
     def is_completed(self) -> Bool:
         """Query the A0.5 machine: COMPLETED (the run/join paths)."""
         return self._state == TaskControlBlock.COMPLETED
