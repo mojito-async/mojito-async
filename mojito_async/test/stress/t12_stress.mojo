@@ -493,12 +493,13 @@ def main() raises:
     var sap = UnsafePointer[SceneA, MutAnyOrigin](to=sca)
     var ud_a = sap.bitcast[Byte]()
 
-    # B is spawned FIRST (FIFO head): its slice is served before A's first
-    # slice — the wake-before-park forcing.
-    var tcb_b = TB.create()
-    var h_b = spawn(rt, UnsafePointer[TB, MutAnyOrigin](to=tcb_b), 0)
+    # A2.2 (issue #68): owner pop is LIFO, so register A FIRST and B after
+    # -> B (the notifier) pops first and wakes A while A is still RUNNABLE
+    # (enqueue-once no-op; A re-checks readiness on its own slice below).
     var tcb_a = TB.create()
     var h_a = spawn(rt, UnsafePointer[TB, MutAnyOrigin](to=tcb_a), 0)
+    var tcb_b = TB.create()
+    var h_b = spawn(rt, UnsafePointer[TB, MutAnyOrigin](to=tcb_b), 0)
     buf[3] = h_b.id()
     buf[2] = h_a.id()
     buf[1] = Int(UnsafePointer[TB, MutAnyOrigin](to=tcb_a))
@@ -518,10 +519,12 @@ def main() raises:
         red("A1: bodies did not run exactly once each")
 
     # ---------------- A2: park-then-wake ------------------------------------
-    var tcb_a2 = TB.create()
-    var h_a2 = spawn(rt, UnsafePointer[TB, MutAnyOrigin](to=tcb_a2), 0)
+    # LIFO owner pop (issue #68): B registered first, A after -> A parks on
+    # slice 0 before B notifies+wakes it.
     var tcb_b2 = TB.create()
     var h_b2 = spawn(rt, UnsafePointer[TB, MutAnyOrigin](to=tcb_b2), 0)
+    var tcb_a2 = TB.create()
+    var h_a2 = spawn(rt, UnsafePointer[TB, MutAnyOrigin](to=tcb_a2), 0)
     buf[3] = h_b2.id()
     buf[2] = h_a2.id()
     buf[1] = Int(UnsafePointer[TB, MutAnyOrigin](to=tcb_a2))
@@ -541,10 +544,12 @@ def main() raises:
         red("A2: stale records skipped")
 
     # ---------------- A3: double-wake ---------------------------------------
-    var tcb_a3 = TB.create()
-    var h_a3 = spawn(rt, UnsafePointer[TB, MutAnyOrigin](to=tcb_a3), 0)
+    # LIFO owner pop (issue #68): B registered first, A after -> A parks on
+    # slice 0 before B notifies+wakes it (twice; the duplicate is a no-op).
     var tcb_b3 = TB.create()
     var h_b3 = spawn(rt, UnsafePointer[TB, MutAnyOrigin](to=tcb_b3), 0)
+    var tcb_a3 = TB.create()
+    var h_a3 = spawn(rt, UnsafePointer[TB, MutAnyOrigin](to=tcb_a3), 0)
     buf[3] = h_b3.id()
     buf[2] = h_a3.id()
     buf[1] = Int(UnsafePointer[TB, MutAnyOrigin](to=tcb_a3))

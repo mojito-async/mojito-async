@@ -147,10 +147,12 @@ def main() raises:
     var ud = scp.bitcast[Byte]()
 
     var rt = create()
-    var tcb_a = TB.create()
-    var h_a = spawn(rt, UnsafePointer[TB, MutAnyOrigin](to=tcb_a), 0)
+    # A2.2 (issue #68): owner pop is LIFO (spawn locality), so register B
+    # first, A second -> A (parks) runs before B (inside A's sleep window).
     var tcb_b = TB.create()
     var h_b = spawn(rt, UnsafePointer[TB, MutAnyOrigin](to=tcb_b), 0)
+    var tcb_a = TB.create()
+    var h_a = spawn(rt, UnsafePointer[TB, MutAnyOrigin](to=tcb_a), 0)
     buf[9] = h_a.id()
     buf[10] = h_b.id()
 
