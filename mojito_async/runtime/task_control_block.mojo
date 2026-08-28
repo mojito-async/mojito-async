@@ -187,14 +187,36 @@ struct TaskControlBlock[T: ResultValue](ImplicitlyCopyable, ImplicitlyDeletable)
             raise Error(err.message)
         self._apply(to)
 
-    def try_transition(mut self, from_: Int, to: Int) -> Bool:
-        """CAS-style transition for race tests: applies `from_` to `to` only
-        when current state equals `from_` AND the pair is legal.  Never
-        raises."""
+    def conditional_transition(mut self, from_: Int, to: Int) -> Bool:
+        """Ordered check-then-store transition (NOT compare-and-swap): applies
+        `from_` -> `to` only when the current state equals `from_` AND the
+        pair is legal.  Never raises, and — unlike a real CAS — claims no M:N
+        atomic ordering.  A true compare-exchange (or the acquire/consume
+        generation discipline in `wake_claim`) is the A2/EPIC#2 seam; on the
+        single cooperative worker there is no interleaving inside a dispatch
+        slice, so the plain check is exact for today."""
         if self._state == from_ and Self._is_allowed(from_, to):
             self._apply(to)
             return True
         return False
+
+    def wake_claim(mut self, required_gen: Int = 0) -> Bool:
+        """Consume the waiter generation on the WAITING -> RUNNABLE wake
+        edge (spec §23, T5 issue #51): transition WAITING -> RUNNABLE and
+        claim the epoch ONLY when the expected generation matches the current
+        one.  `required_gen` is the generation a producer captured at WAITING
+        commit; pass 0 to always claim when WAITING (today's single worker:
+        the epoch is trivially current).  Returns False — WITHOUT touching
+        state — when the state is not WAITING, or when a stale `required_gen`
+        from a previous epoch does not match the current generation (a cross-
+        worker producer, EPIC#2, must not let a stale wake re-transition a
+        task that already woke).  Never raises."""
+        if self._state != TaskControlBlock.WAITING:
+            return False
+        if required_gen != 0 and self._generation != required_gen:
+            return False
+        self._apply(TaskControlBlock.RUNNABLE)
+        return True
 
     # --- queries -----------------------------------------------------------
 
