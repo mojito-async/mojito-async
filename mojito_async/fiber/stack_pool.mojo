@@ -12,12 +12,21 @@
 #
 # Bounds (spec §15): the cache is bounded by stack COUNT (capacity) AND
 # reserved bytes AND committed bytes.  Every live stack is one uniform
-# reservation (page-rounded + guard page by ms_stack_alloc), so the count
-# bound implies the reserved-byte bound (capacity * (stack_bytes+guard),
-# computed with the vendored ms_page_size).  The committed-byte bound is
-# observed via ms_stack_total_size() and stays within the same capacity
-# budget.  A warm acquire() (reuse of an equal-size released stack) performs
-# NO fresh ms_stack_alloc: warm-path OS allocation is flat.
+# reservation (round_up(stack_bytes, page) + guard page by ms_stack_alloc),
+# so the count bound implies the reserved-byte bound (capacity * (usable +
+# guard), computed with the vendored ms_page_size).  The committed-byte
+# bound is observed via ms_stack_total_size() and stays within the same
+# capacity budget.  A warm acquire() (reuse of a still-live released stack)
+# performs NO fresh ms_stack_alloc: warm-path OS allocation is flat.
+#
+# Liveness (T6 fold, issue #52): the pool owns the *Mojo* policy but the C
+# substrate owns liveness.  Fiber.destroy() munmaps a pooled reservation
+# directly via ms_stack_free; if the pool simply re-acquired that cell it
+# would hand out a dangling base (SIGSEGV on use).  The vendored
+# ms_stack_is_live(base) extern closes the gap: release() verifies the cell's
+# reservation is still live and raises loudly otherwise ("fiber destroy
+# before release?"); the warm acquire() path re-checks and falls back to a
+# cold allocation rather than recycling a freed reservation.
 #
 # Reuse gate (spec §15 "never recycle until unquestionably complete"): a
 # cache entry is handed to a NEW caller only after an explicit release(),
@@ -53,6 +62,7 @@ from mojito_async.vendor.mojito_sys import (
     ms_page_size,
     ms_stack_alloc,
     ms_stack_free,
+    ms_stack_is_live,
     ms_stack_total_size,
 )
 
@@ -95,8 +105,14 @@ def _native_stack_stride() -> Int:
 # StackCache — per-worker stack allocator/cache.
 # ---------------------------------------------------------------------------
 
-struct StackCache(ImplicitlyCopyable, ImplicitlyDeletable):
+struct StackCache(Movable, ImplicitlyDeletable):
     """Bounded per-worker stack cache over mojito-sys (issue #52).
+
+    MOVABLE, NOT ImplicitlyCopyable: a copy would alias the pool's single
+    mutable backing slab (shared freelist / state arrays), silently
+    corrupting both the original and the copy.  The only legal transfer is a
+    move (factory return / explicit move); an accidental copy is a compile
+    error.
 
     Fixed-capacity, no per-alloc heap traffic: backing cells are carved once
     at construction.  acquire() prefers a warm (exact-size) freelist hit;
@@ -119,7 +135,7 @@ struct StackCache(ImplicitlyCopyable, ImplicitlyDeletable):
     var _state: UnsafePointer[Int, MutAnyOrigin]
     var _next: UnsafePointer[Int, MutAnyOrigin]
 
-    var _live: Int      # cells currently acquired (live)
+    var _live: Int      # cells/avail currently live (reserved cells in use)
     var _cached: Int    # cells in the free set (released, reusable)
     var _head: Int      # freelist head cell ordinal (NO_NEXT when empty)
 
@@ -185,12 +201,20 @@ struct StackCache(ImplicitlyCopyable, ImplicitlyDeletable):
         return self._cell_bytes
 
     def reserved_bytes(self) -> Int:
-        """Reserved-byte budget (spec §15): every pooled stack reservation is
-        exactly stack_bytes + one guard page."""
-        return self._capacity * (self._stack_bytes + self._page_size)
+        """Reserved-byte budget (spec §15).  ms_stack_alloc rounds the usable
+        size up to a full page and adds one guard page, so for `capacity`
+        stacks the total is capacity * (round_up(stack_bytes, page) + page)."""
+        var ps = self._page_size
+        var usable = (self._stack_bytes + ps - 1) // ps * ps
+        return self._capacity * (usable + ps)
 
     def total_live_bytes(self) -> Int:
-        """Committed bytes currently held by this process (ms_stack_total_size)."""
+        """Committed bytes currently held by THIS PROCESS (ms_stack_total_size).
+
+        Process-global, not per-pool: the substrate registry counts every
+        live reservation in the process (this cache's cells plus any stacks
+        acquired elsewhere through mojito-sys), so the value is the process
+        watermark, not this cache's working set."""
         return Int(ms_stack_total_size())
 
     # -- acquire -----------------------------------------------------------
@@ -200,16 +224,28 @@ struct StackCache(ImplicitlyCopyable, ImplicitlyDeletable):
     # acquired).
     def acquire(mut self) raises -> UnsafePointer[NativeStack, MutAnyOrigin]:
         if self._cached > 0:
-            # Warm hit: pop the head cell, reuse its existing reservation.
+            # Warm hit: pop the head cell.  A Object.destroy may have munmapped
+            # the reservation under us since release() (fiber destroy before
+            # release?), so verify it is still live before pooling it out.
             var idx = self._head
             self._head = self._next[idx]
             self._next[idx] = NO_NEXT
             self._state[idx] = STATE_LIVE
             self._cached -= 1
             self._live += 1
+            if ms_stack_is_live(self._cells[idx].base) == 0:
+                # Reservation freed underneath us: cold-reallocate into this
+                # cell instead of handing out a dangling base.
+                var slots = stack_allocation[2, BytePtr]()
+                var rc = ms_stack_alloc(self._stack_bytes, slots, slots + 1)
+                if rc != 0:
+                    raise Error(
+                        "stack_pool.acquire: ms_stack_alloc failed rc=" + String(rc)
+                    )
+                self._cells[idx] = NativeStack(slots[], (slots + 1)[])
             return self._cells + idx
 
-        # Cold: is the pool at capacity (all cells either live or cached)?
+        # Cold: is the pool at capacity (all cells live or cached)?
         if self._live + self._cached >= self._capacity:
             raise Error(
                 "stack_pool.acquire: pool exhausted (capacity "
@@ -218,9 +254,6 @@ struct StackCache(ImplicitlyCopyable, ImplicitlyDeletable):
 
         # Find a STATE_FREE (never-allocated) cell to allocate into.
         var idx = self._find_free()
-        # Enforce the reserved-byte budget explicitly before mmap-ing.
-        if not self._reserved_ok():
-            raise Error("stack_pool.acquire: reserved-byte budget exceeded")
         var slots = stack_allocation[2, BytePtr]()
         var rc = ms_stack_alloc(self._stack_bytes, slots, slots + 1)
         if rc != 0:
@@ -229,14 +262,6 @@ struct StackCache(ImplicitlyCopyable, ImplicitlyDeletable):
         self._state[idx] = STATE_LIVE
         self._live += 1
         return self._cells + idx
-
-    def _reserved_ok(self) -> Bool:
-        """True if allocating one more stack stays within the reserved-byte
-        budget (capacity * (stack_bytes+guard)).  Equal-size reservoirs make
-        count-capacity the binding bound; kept as an explicit, testable gate."""
-        var per_stack = self._stack_bytes + self._page_size
-        var could_total = (self._live + self._cached + 1) * per_stack
-        return could_total <= self.reserved_bytes()
 
     def _find_free(self) raises -> Int:
         var i = 0
@@ -261,14 +286,22 @@ struct StackCache(ImplicitlyCopyable, ImplicitlyDeletable):
                 "stack_pool.release: cell " + String(idx)
                 + " not live (reuse-gate violation: recycle of a non-terminal task)"
             )
+        # Verify the reservation is still live (not freed by a Fiber.destroy
+        # that munmapped it underneath us) before marking it CACHED.  A freed
+        # reservation must never re-enter the free set.
+        if ms_stack_is_live(self._cells[idx].base) == 0:
+            raise Error(
+                "stack_pool.release: cell " + String(idx)
+                + " reservation already freed (fiber destroy before release?)"
+            )
         self._next[idx] = self._head
         self._head = idx
         self._state[idx] = STATE_CACHED
         self._live -= 1
         self._cached += 1
 
-    # Drop ONE cached reservation back to the OS (eviction / decommit-
-    # equivalent).  Only valid on a CACHED cell; the cell returns to FREE.
+    # Drop ONE cached reservation back to the OS (eviction / decommit-...).
+    # Only valid on a CACHED cell; the cell returns to FREE.
     def retire(mut self, cell: UnsafePointer[NativeStack, MutAnyOrigin]) raises:
         var idx = self._index_of(cell)
         if idx < 0:
@@ -285,7 +318,7 @@ struct StackCache(ImplicitlyCopyable, ImplicitlyDeletable):
 
     # Return every cached reservation to the OS; pool stays usable with
     # capacity hot cells re-acquirable on demand.
-    def drain(mut self) raises:
+    def drain(mut self):
         var idx = self._head
         while idx != NO_NEXT:
             var nxt = self._next[idx]
@@ -334,17 +367,11 @@ struct StackCache(ImplicitlyCopyable, ImplicitlyDeletable):
 # ---------------------------------------------------------------------------
 
 # Build a fresh StackCache, allocating its backing cells internally (one
-# calloc of the whole slab) so the returned cache is immediately usable.
+# calloc of the whole slab) so the pool is immediately usable.
 def make_stack_cache(
     capacity: Int,
     stack_bytes: Int = DEFAULT_STACK_BYTES,
 ) raises -> StackCache:
-    """Create a per-worker stack cache with `capacity` slots.
-
-    Allocates the internal cell slab (caller-owns-cells pattern realised
-    inside the pool: storage set up once up-front, never on the hot path).
-    Raises when the backing block cannot be allocated.
-    """
     if capacity <= 0:
         raise Error("stack_pool.make_stack_cache: capacity must be positive")
     var ps = Int(ms_page_size())
@@ -354,10 +381,9 @@ def make_stack_cache(
     var cell_bytes = _native_stack_stride()
     if cell_bytes <= 0:
         cell_bytes = 16
-    var total = capacity * (cell_bytes + 2 * 8)
     var block = _c_calloc(capacity, cell_bytes + 2 * 8)
     if Int(block) == 0:
         raise Error("stack_pool.make_stack_cache: backing allocation failed")
 
     var c = StackCache(capacity, stack_bytes, ps, cell_bytes, block)
-    return c
+    return c^
