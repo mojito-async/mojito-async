@@ -73,7 +73,8 @@ from mojito_async.runtime.thread_entry import (
     CELL_ENTRY,
     CELL_WORKER,
     WorkerEntryCell,
-1: @both
+    spawn_all_workers as spawn_all_worker_threads,
+    cell_size_gate,
 )
 from mojito_async.runtime.worker import Worker
 from mojito_async.vendor.mojito_sys import (
@@ -210,7 +211,7 @@ struct WorkerPool:
     # --- lifecycle ----------------------------------------------------------
 
     def start(mut self, entry: BytePtr) raises:
-"""Prepare the pool for spawning: validate the config (M6 fold, PR
+        """Prepare the pool for spawning: validate the config (M6 fold, PR
         #104 — RuntimeConfig.validate() runs FIRST, every start), arm the
         latch, write the worker/entry cells, create the three TLS slots.
         `entry` is the embedding binary's trampoline address
@@ -256,6 +257,10 @@ struct WorkerPool:
                 total += self.entry_at(i)[].units_seeded
             acct_announce(self._acct, total)
         Atomic[DType.uint8].store[ordering=Ordering.RELEASE](self._latch, 0)
+        self._build_cells()
+        self._started = True
+        self._joined = 0
+
     def current_worker_key(mut self) -> NativeTlsKey:
         """The pool's current_worker TLS slot (spec §69), read BEFORE the
         spawn loop and passed by value into the per-worker driver spawn
