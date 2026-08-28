@@ -78,6 +78,11 @@ struct Runtime:
     var _skipped: Int
     var _fiber_drives: Int
     var _fiber_switches: Int
+    # E4 (issue #70) — successful unstarted-task steals (spec §71
+    # `task_steals_total`).  Bumped exactly once per successful steal; a
+    # failed probe (empty deque or a STARTED record returned to its owner)
+    # bumps nothing — no fake counters.
+    var _steal_total: Int
 
     def __init__(out self):
         self._ready = FifoQueue[TaskRecord]()
@@ -90,6 +95,7 @@ struct Runtime:
         self._skipped = 0
         self._fiber_drives = 0
         self._fiber_switches = 0
+        self._steal_total = 0
 
     # --- root-task execution (A0-T1) ----------------------------------------
 
@@ -185,6 +191,19 @@ struct Runtime:
         """Actual fiber stack switches (issue #53 cheap-path guard: a
         non-parking run must observe 0)."""
         return self._fiber_switches
+
+    # --- E4 (issue #70): steal observability (spec §71) ----------------------
+
+    def note_steal(mut self):
+        """Count one successful unstarted-task steal (issue #70 step 5)."""
+        self._steal_total += 1
+
+    def task_steals_total(self) -> Int:
+        """Successful unstarted-task steals on this runtime (spec §71
+        `task_steals_total`).  Exact: one bump per steal, zero on failed
+        probes; a started-fiber steal is never counted (the STARTED guard
+        returns the record before the counter is reached)."""
+        return self._steal_total
 
     def scope_handle(self) -> Int:
         return self._scope
