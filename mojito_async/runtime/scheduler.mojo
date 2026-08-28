@@ -24,10 +24,23 @@
 #     A popped record whose TCB is not RUNNABLE (stale duplicate) is
 #     SKIPPED — counted via rt.skipped(), never dispatched.
 #
-# No per-suspension allocation on the hot path (AMORTIZED: no allocation
-# beyond the runnable queue's amortized ring growth): yield/park reuse the
-# TCB's embedded WaitNode and the Runtime's FIFO; the caller supplies every
-# TCB cell (stack-allocated) — code, not heap, owns task storage.
+#
+# A1.5 (issue #53) — the FIBER-BACKED drive.  This module stays EXTERN-FREE
+# and UNCHANGED in its mechanics: the single-worker loop pops a RUNNABLE
+# record and hands it to the statically-known dispatcher.  The frame
+# migration lives one module over, in runtime/fiber_seam.mojo, and the
+# fiber handle is THREADED THROUGH THE DRIVER VALUE (b2 design decision #4,
+# never dynamic dispatch): an *_aot driver's dispatcher drives each record's
+# fiber via the seam — first entry makes the fresh context (ms_ctx_make),
+# a park is the body's seam_park_switch (fiber -> caller; the frame leaves
+# the worker's native context), the park/wake state commit is
+# fiber_suspend_current / fiber_yield_now / fiber_resume_current (#39 kernel
+# spellings), and the next slice re-enters the fiber at its exact saved
+# frame.  Non-parking tasks never touch a fiber: the cheap path is this
+# loop + plain execute() on the worker's native context, and the Runtime
+# fiber-path toggle (fiber_drives/fiber_switches) stays flat — the fast-path
+# regression guard.  Keep this module import-free of fibers so the JIT unit
+# drivers (t11..t18/t20..t22) keep linking without the dylib (#6971).
 from mojito_async.integration.sys import BytePtr
 from mojito_async.runtime.runtime import Nil, Runtime
 from mojito_async.runtime.task_control_block import ResultValue, TaskControlBlock
@@ -91,3 +104,43 @@ def scheduler_loop[F: def(mut Runtime, Int, Int, BytePtr) raises -> Int, R: Resu
         slices += 1
         _ = dispatcher(rt, rec.tcb_addr, rec.task_id, ud)
     return slices
+
+# ---------------------------------------------------------------------------
+# A1.5 fiber seam (issue #53): the fiber-backed DRIVE lives in
+# runtime/fiber_seam.mojo — seam_drive returns the frame-reported
+# DriveVerdict (Parked | Completed; T3), seam_park_switch stamps the frame,
+# and seam_destroy_slot raises on a parked/suspended (live) frame.  The
+# runtime fiber-path counters are comptime-gated (FIBER_TOGGLE).
+#
+# A1.3 affinity seam (issue #51) — worker-affine started fibers (ADR-006/007)
+# ---------------------------------------------------------------------------
+#
+# spec §19.2: STARTED tasks are NOT stealable; a started fiber's wake is
+# routed to its OWNER worker's run queue ("remote-ready routing"), NEVER the
+# general stealable set.  On the single worker the owner IS the sole worker,
+# so this always resolves to the local FIFO (spec §88 — today's behavior,
+# preserved unchanged).  The decision surface below is what EPIC #2's M:N
+# worker pool snaps to (E5 started-fiber remote-ready): the pool calls
+# wake_target_worker(f.owner_worker(), this_worker_id) at wake time and
+# enqueues onto that worker's (remote-ready) queue when the returned target
+# differs from the waker; on one worker the target is always the sole queue.
+def wake_target_worker(owner_worker: Int, local_worker: Int) -> Int:
+    """Resolve the enqueue target for a woken (started) task/fiber.
+
+    owner_worker — the woken fiber's pinned owner (from Fiber.owner_worker();
+                   0 = not started / not pinned: no affinity yet).
+    local_worker — the worker performing the wake (explicit identity; b2 has
+                   no TLS, so worker identity is threaded by value).
+
+    Returns the worker whose run queue must receive the wake:
+      - owner == local_worker (intra-worker wake, spec §88) -> local_worker,
+        the wake stays on this worker's FIFO (today's behavior);
+      - owner == 0 (unstarted/unpinned) -> local_worker, the general
+        runnable-set fallback (nothing to be affine to yet);
+      - otherwise (foreign wake) -> owner_worker: the wake lands on the
+        OWNER worker's remote-ready queue (spec §19.2), never the stealable
+        set.  EPIC #2 enqueues there in the E5 seam.
+    """
+    if owner_worker == 0 or owner_worker == local_worker:
+        return local_worker
+    return owner_worker

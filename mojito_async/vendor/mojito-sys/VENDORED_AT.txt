@@ -1,0 +1,40 @@
+Vendored mojito-sys S0 substrate — mojito_async/vendor/mojito-sys/
+
+Source repository: github.com/mojito-async/mojito-sys
+Source tree:       spike/context_switch/ (frozen S0 substrate, A0.1 lane)
+Source commit:     0ad48315bebc1fcb02834074afbff6e59173cdb1
+Frozen contract:   8454212 (S0 SPIKE_REPORT: GO — feasibility proven, all 14 tests green)
+Vendored on:       2026-08-28T00:00:00Z (A1.1 productionization, issue #49)
+RE-PINNED on:      2026-08-28 (A2.0 issue #101 — in-repo substrate rework:
+                    ms_ctx_t v2 168B -> v3 176B, resume-table/global removal)
+
+FILES (byte-identical between the PROD and SPIKE vendored trees, `diff -r`
+is empty, as the spike harness links this same dylib):
+  include/mojito_spike.h   # ms_ctx_t v3 layout (176 B: x19-x30, d8-d15, sp,
+                           #   return_to @168)
+  native_stack.c           # ms_stack_alloc/free with PROT_NONE guard page
+  aarch64_switch.S         # ms_ctx_make/ms_ctx_switch (Apple arm64; #if
+                           #   !__APPLE__ guard)
+  ms_ctx.c                 # compile-time layout asserts + sentinel probe
+                           #   (guarded off)
+
+DEVIATION FROM FROZEN (issue #101, A2.0 M:N rework) — RECORDED:
+  The frozen S0 substrate was single-OS-thread-only and capped at 32 live
+  fibers: `_ms_ctx_switch` kept a process-global 64-row `_ms_resume_tab`
+  (2 rows/fiber, never evicted -> brk #0x67 on exhaustion) and updated
+  `_ms_last_from`/`_ms_last_to` on every switch; the exit trampoline read
+  `_ms_last_to` to learn its own ctx (clobbered the moment a 2nd OS thread
+  switched).  This a2/00 re-pin REMOVES those globals and the O(64) scan:
+  the return link now rides INSIDE the context as ms_ctx_t.return_to (O(1)),
+  and the trampoline derives its own ctx from a marker ms_ctx_make stashes
+  at [stack_top-8] on the fiber's own stack (no shared writable state on the
+  switch path) => thread-safe for M:N, no live-fiber cap.  Layout grows
+  168 B -> 176 B; every consumer uses MS_CTX_SIZE (mojito_async vendor
+  firewall, spike mojito_spike.mojo), so block offsets follow automatically.
+  Verified by the A1 suite (t23/t25/t26/t16 exact-switch proofs intact),
+  t27_concurrency (40 live fibers, was capped), t27_multithread (two-pthread
+  probe, was clobbered), and the spike harness.
+
+The prod and spike vendored copies are byte-identical and both carry this
+rework.  See the aarch64_switch.S header comment for the full ISSUE #101
+rationale, and precommit/known-red.tsv for the RED->GREEN evidence.
