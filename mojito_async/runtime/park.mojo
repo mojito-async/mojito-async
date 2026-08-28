@@ -11,40 +11,48 @@
 #   - task.suspend_commit / wake (+ dead park_prepare / park_commit);
 #   - parking_lot.park_current / unpark_current + the ParkingLot struct;
 #   - sync/event.WaitEvent (a readiness cell nobody consumed).
-# Those four spellings are now ONE pair here; every consumer (mutex,
+# Those four spellings are now ONE kernel here; every consumer (mutex,
 # semaphore, channel, timer, scheduler, the *_aot drivers and the lane test
-# drivers) calls park_current / unpark_current.  The dead duplicates were
+# drivers) calls the primitives below.  The dead duplicates were
 # deleted (task.park_prepare/park_commit/suspend_commit/wake, parking_lot,
 # WaitEvent).
 #
-# Execution discipline:
-#   park_current  — commit the CURRENT task as a waiter: RUNNING -> PARKING
-#       -> WAITING, stamping the wait REASON on the embedded WaitNode (spec
-#       §24/§25, generation-bumped epoch).  Raises IllegalTransitionError if
-#       the task is not RUNNING.
-#   unpark_current — deliver readiness ONCE per epoch: WAITING -> RUNNABLE +
-#       re-enqueue onto the worker's REMOTE-ready queue.  A wake may come
-#       from ANY worker (spec §19.2), so the post-wake enqueue target is the
-#       per-worker remote queue (issue #68; E5 routes it to the OWNER worker
-#       before pushing).  An already-RUNNABLE task is a no-op (enqueue-once);
-#       any other state (e.g. COMPLETED) raises — a stale wake never silently
-#       double-enqueues (t15 asserts this).
+# Execution discipline (A2.5, issue #71 — the PARKING-LOT-ADAPTER at the
+# bottom was PROMOTED to live code; see the two-phase section for the full
+# protocol):
+#   park_current       — the single-worker WAITING-side pair: RUNNING ->
+#       PARKING -> WAITING, stamping the wait REASON on the embedded
+#       WaitNode (spec §24/§25, generation-bumped epoch).  Raises
+#       IllegalTransitionError if the task is not RUNNING.
+#   park_prepare / park_validate / park_commit — the two-phase PREPARE /
+#       VALIDATE / COMMIT promotion for the cross-worker wake (spike
+#       event.mojo model, spec §23 / A0-T11 / A0-T12).
+#   unpark_current    — deliver readiness ONCE per epoch: claim the waiter's
+#       generation EXACTLY ONCE (A0-T12) and re-enqueue onto the OWNER
+#       worker's REMOTE-ready queue (spec §19.2; started fibers never route
+#       to injection or to a steal candidate).  A wake may come from ANY
+#       worker; the owner is resolved from the TCB's owner_runtime stamp
+#       (set at first dispatch), so no global worker registry is needed.
+#       An already-RUNNABLE task is a no-op (enqueue-once); a COMPLETED /
+#       CANCELLED task raises — a stale wake never silently double-enqueues
+#       (t15 asserts this).
 #
-# No hidden allocation, no OS-thread synchronization.  The worker owns no
-# task storage: every TCB cell is caller-allocated and the caller passes its
-# own JoinHandle.
+# No hidden allocation.  OS-thread synchronization is confined to the OWNER
+# worker's remote-ready queue spinlock (issue #68's P0 queue guard — the one
+# lock every wake path already serializes through), used to make the
+# two-phase latch/claim and the parker's COMMIT atomic with respect to each
+# other.  The worker owns no task storage: every TCB cell is caller-
+# allocated and the caller passes its own JoinHandle.
 #
-# RACE-PROTOCOL NOTE (A0.7 two-phase parking, issue #16): the spike's
+# RACE-PROTOCOL NOTE (A0.7 two-phase parking, issues #16/#71): the spike's
 # PREPARE/VALIDATE/COMMIT pipeline exists to close a lost-wakeup window
 # between publishing a waiter and parking.  On the A1 SINGLE cooperative
 # worker there is no interleaving inside a dispatcher slice: publish+park
 # (register_* then park_current) is atomic with respect to other tasks, so a
 # release always finds its waiter already parked, and the protocol's
-# VALIDATE re-check is a no-op.  The lanes proved this (mutex/channel
-# hands-off are FIFO handoffs to parked waiters; no lost wakeups in the
-# stress suites).  The two-phase protocol is therefore carried as the MODEL
-# for the A2 multi-worker seam (where real races return), documented in
-# PARKING-LOT-ADAPTER below, instead of ceremony on a race-free worker.
+# VALIDATE re-check is a no-op.  On the A2 M:N scheduler a wake may come
+# from ANOTHER worker MID-PARK, so the two-phase protocol is LIVE (below);
+# the single-worker path (owner_runtime == 0) keeps the exact A1 behavior.
 from mojito_async.runtime.runtime import Runtime
 from mojito_async.runtime.task_control_block import ResultValue, TaskControlBlock
 from mojito_async.runtime.join_handle import JoinHandle, SuspendReason
@@ -70,62 +78,219 @@ def unpark_current[R: ResultValue](
     h: JoinHandle[R],
     required_gen: Int = 0,
 ) raises:
-    """Deliver readiness ONCE: WAITING -> RUNNABLE and re-enqueue onto the
-    worker's REMOTE-ready queue (issue #68 — a wake may come from ANY
-    worker, so it lands on the per-worker remote queue; E5 routes it to the
-    OWNER worker, spec §19.2, before pushing).
-    Keeps the task's original scheduler id.  Enqueue-once: an already-RUNNABLE
-    task is not re-enqueued; any other state (COMPLETED etc.) is an illegal
-    transition and raises (never silently enqueued twice).
+    """Deliver readiness ONCE per epoch — the two-phase WAKE leg
+    (spec §23 / A0-T12), routed to the OWNER worker (spec §19.2).
 
-    Generation consumption (T5, issue #51): the wake path consumes the
-    waiter's epoch via TaskControlBlock.wake_claim.  Pass `required_gen` = the
+    Under the OWNER's remote-ready queue guard (resolved from the TCB's
+    owner_runtime stamp; the A1 single worker keeps `rt`):
+      - a WAITING task at `required_gen` (or any epoch when 0) has its
+        generation claimed EXACTLY ONCE — wake_claim — and the wake record
+        is pushed onto the OWNER's REMOTE-ready queue: a STARTED fiber's
+        wake NEVER lands in injection and is NEVER a steal candidate;
+      - a RUNNING/PARKING task (the early-wake window, A0-T11) has its
+        readiness LATCHED — the parker's VALIDATE/COMMIT consumes it and
+        unwinds WITHOUT WAITING and WITHOUT a generation bump;
+      - an already-RUNNABLE task is a no-op (enqueue-once, Q6);
+      - a WAITING task at a STALE `required_gen` is rejected silently —
+        nothing is claimed, nothing enqueued (fresh-generation guard);
+      - a COMPLETED/CANCELLED task raises (the A1 loud surface; a stale
+        wake never silently double-enqueues).
+
+    Generation consumption (T5, issue #51): pass `required_gen` = the
     generation a producer captured at WAITING commit to REJECT a stale wake
-    from a previous epoch (a no-op when the current generation no longer
-    matches — required for EPIC #2's cross-worker producer so a stale wake can
-    never re-transition a task that already woke).  Pass 0 (default) for
-    today's single worker, where the epoch is trivially current; the state
-    edge and enqueue-once still hold."""
+    from a previous epoch.  Pass 0 (default) to always claim when WAITING
+    (today's single worker: the epoch is trivially current)."""
     if h.state() == TaskControlBlock.RUNNABLE:
         return
-    if h.tcb()[].wake_claim(required_gen):
-        rt.push_remote(Int(h.tcb()), h.id())
+    var owner = _owner_rt(h, rt)
+    # The latch/claim section: serialized against the parker's park_commit
+    # under the SAME guard, so an epoch can never be both latched (early)
+    # and claimed (WAITING) — exactly one winner (A0-T10).
+    owner[].remote_queue()[]._guard.lock()
+    var claimed = False
+    var st = h.tcb()[].state()
+    if st == TaskControlBlock.WAITING:
+        claimed = h.tcb()[].wake_claim(required_gen)
+        if claimed:
+            h.tcb()[].clear_early_readiness()
+    elif st == TaskControlBlock.PARKING or st == TaskControlBlock.RUNNING:
+        # Early-wake window: latch readiness for the parker's VALIDATE
+        # re-check (A0-T11).  No claim, no transition, no enqueue here —
+        # the parker's COMMIT decides the unwind (Q6).
+        h.tcb()[].set_early_readiness()
+    owner[].remote_queue()[]._guard.unlock()
+    if claimed:
+        # STARTED with a known owner: deliver to the OWNER's REMOTE-ready
+        # queue (spec §19.2) — never injection, never a steal candidate.
+        owner[].push_remote(Int(h.tcb()), h.id())
         return
-    if h.state() == TaskControlBlock.WAITING:
-        # blocked WAITING but required_gen was stale -> reject silently; never
-        # double-enqueue, never transition.
-        return
-    # not RUNNABLE and not successfully claimed -> transition (raises for an
-    # illegal pair, preserving the A1 loud surface on COMPLETED etc.).
+    if st == TaskControlBlock.WAITING or st == TaskControlBlock.PARKING or st == TaskControlBlock.RUNNING:
+        return  # stale/duplicate rejected, or early latch delivered
+    # COMPLETED / CANCELLED / NEW: preserve the A1 loud surface — the
+    # transition raises for the illegal pairs (a stale wake never silently
+    # enqueues twice).
     h.tcb()[].transition(TaskControlBlock.RUNNABLE)
 
 
+def _owner_rt[R: ResultValue](
+    h: JoinHandle[R],
+    mut rt: Runtime,
+) -> UnsafePointer[Runtime, MutAnyOrigin]:
+    """Resolve the wake target Runtime for task `h`: the OWNER worker's
+    runtime (TCB owner_runtime stamp, set at first dispatch — A2.5 issue
+    #71), or the caller's `rt` on the A1 single worker (owner_runtime == 0:
+    no pool, the sole worker IS the owner; the A1 behavior is preserved
+    exactly)."""
+    var addr = h.tcb()[].owner_runtime()
+    if addr == 0:
+        return UnsafePointer[Runtime, MutAnyOrigin](to=rt)
+    return UnsafePointer[Runtime, MutAnyOrigin](unsafe_from_address=addr)
+
+
 # ---------------------------------------------------------------------------
-# PARKING-LOT-ADAPTER (A2 seam; not wired on A1)
+# TWO-PHASE PARK (A2.5, issue #71 — promoted from the PARKING-LOT-ADAPTER
+# at the bottom to LIVE code; spike event.mojo PREPARE/VALIDATE/COMMIT
+# calling convention restored).
 # ---------------------------------------------------------------------------
 #
-# On the A2 M:N scheduler a wake may come from another worker, so the A0.7
-# two-phase protocol applies and the primitive set grows to:
+# On the A2 M:N scheduler a wake may come from ANOTHER worker, so the A0.7
+# two-phase protocol applies.  The primitive set:
 #
-#   park_prepare(h)   — RUNNING -> PARKING, open the early-wake window;
-#                        publish the embedded WaitNode + waiter id;
-#   park_validate()   — re-check readiness; ready => runnable WITHOUT a
-#                        generation bump (task never left RUNNING);
-#   park_commit(h, r) — close the window: readiness/cancel unwinds via
-#                        PARKING -> RUNNABLE (WAITING never entered); else
-#                        PARKING -> WAITING, fresh generation, reason `r`;
-#   unpark_current     — as above, claiming the waiter's generation EXACTLY
-#                        ONCE per epoch (spec §23; A0-T11/A0-T12).
+#   park_prepare(h)   — RUNNING -> PARKING, open the early-wake window.  The
+#                        embedded WaitNode + waiter id are ALREADY published
+#                        in the TCB (spec §24: no allocation, no re-
+#                        registration — the wake side reaches them through
+#                        the handle); PREPARE neither sets nor clears the
+#                        epoch readiness latch (a producer that latched
+#                        while the task was still RUNNING — the release-
+#                        before-park case — must stay observable).
+#   park_validate(h)  — re-check readiness inside the window (the lost-
+#                        wakeup window, spec §23.2 / A0-T11), under the
+#                        owner's remote-ready queue guard (the same lock the
+#                        WAKE leg latches through, so a concurrent cross-
+#                        worker wake is never missed).  READY => the caller
+#                        closes with park_commit, which unwinds PARKING ->
+#                        RUNNABLE WITHOUT a generation bump and WITHOUT
+#                        entering WAITING (the task never slept; no enqueue
+#                        — Q6).
+#   park_commit(h, r)  — close the window under the same guard: readiness
+#                        latched => consume the latch and unwind PARKING ->
+#                        RUNNABLE (WAITING never entered, no gen bump);
+#                        else PARKING -> WAITING, FRESH generation, wait
+#                        reason `r` stamped (spec §25).  Exactly ONE winner
+#                        (A0-T10) and enqueue-once (Q6) by construction:
+#                        the commit's readiness check and the WAKE leg's
+#                        latch/claim are serialized under one guard.
+#   unpark_current     — the WAKE leg above, claiming the waiter's
+#                        generation EXACTLY ONCE per epoch (A0-T12).
 #
+# Cancellation integration seam: the settle policy (cancellation FIRST, then
+# readiness, spike race_hooks.settle) is the caller's pre-check — the A1
+# cancellation surface (CancellationToken / CancellationError at the next
+# checkpoint) already precedes every park on the consumer side; the commit's
+# readiness unwind covers the no-cancel geometry this lane owns.
+# ---------------------------------------------------------------------------
+
+def park_prepare[R: ResultValue](h: JoinHandle[R]) raises:
+    """Two-phase park step 1 — PREPARE (spec §23 / A0-T11): RUNNING ->
+    PARKING opens the early-wake window.  The embedded WaitNode + this
+    task's scheduler id are already published in the TCB (spec §24 —
+    allocation-free; the wake side reaches them through the handle).  The
+    epoch readiness latch is consumed at COMMIT; PREPARE does not clear it
+    (a producer that latched while the task was still RUNNING — the release-
+    before-park case — must stay observable for the VALIDATE re-check)."""
+    h.tcb()[].transition(TaskControlBlock.PARKING)
+
+
+def park_validate[R: ResultValue](h: JoinHandle[R]) -> Bool:
+    """Two-phase park step 2 — VALIDATE (A0-T11): re-check readiness inside
+    the early-wake window (the lost-wakeup window, spec §23.2).  Returns
+    True when a wake was delivered before the check; the caller then closes
+    the window with park_commit, which unwinds to RUNNABLE WITHOUT a
+    generation bump and WITHOUT entering WAITING (the task never slept; no
+    enqueue — Q6: the record was already dequeued, the slice continues).
+    Reads the latch under the OWNER's remote-ready queue guard — the same
+    lock the WAKE leg latches through — so a concurrent cross-worker wake is
+    never missed (PREPARE then VALIDATE re-check catches readiness-before-
+    COMMIT) and never observed twice."""
+    var addr = h.tcb()[].owner_runtime()
+    if addr == 0:
+        # A1 single worker: no cross-worker interleaving — plain read.
+        return h.tcb()[].early_readiness()
+    var owner = UnsafePointer[Runtime, MutAnyOrigin](unsafe_from_address=addr)
+    owner[].remote_queue()[]._guard.lock()
+    var rdy = h.tcb()[].early_readiness()
+    owner[].remote_queue()[]._guard.unlock()
+    return rdy
+
+
+def park_commit[R: ResultValue](
+    h: JoinHandle[R],
+    reason: Int = SuspendReason.PARK,
+) raises:
+    """Two-phase park step 3 — COMMIT: close the early-wake window.
+
+    Under the OWNER's remote-ready queue guard (the same lock the WAKE leg
+    latches/claims through):
+      - readiness latched (an early wake was delivered in the window):
+        consume the latch and unwind PARKING -> RUNNABLE — WAITING is NEVER
+        entered and the wait generation is NEVER bumped (A0-T11).  No
+        enqueue here (Q6): the record was already dequeued; the caller keeps
+        running the task in this slice.
+      - else: PARKING -> WAITING — FRESH wait epoch (generation bump) and
+        the wait reason `r` stamped on the embedded node (spec §25).  The
+        wake producer claims the new generation exactly once.
+
+    Exactly ONE winner (A0-T10): the commit's readiness check and the WAKE
+    leg's latch/claim are serialized under the same guard, so a wake can
+    never both latch (early) and claim (WAITING) for the same epoch.  Raises
+    unless the task is PARKING (the window must be open)."""
+    if h.state() != TaskControlBlock.PARKING:
+        raise Error("park_commit: task must be PARKING to commit the park")
+    var addr = h.tcb()[].owner_runtime()
+    if addr == 0:
+        # A1 single worker: no cross-worker interleaving — lock-free commit.
+        if h.tcb()[].early_readiness():
+            h.tcb()[].clear_early_readiness()
+            h.tcb()[].transition(TaskControlBlock.RUNNABLE)
+        else:
+            h.tcb()[].wait_node()[].set_reason(reason)
+            h.tcb()[].transition(TaskControlBlock.WAITING)
+        return
+    var owner = UnsafePointer[Runtime, MutAnyOrigin](unsafe_from_address=addr)
+    owner[].remote_queue()[]._guard.lock()
+    if h.tcb()[].early_readiness():
+        h.tcb()[].clear_early_readiness()
+        h.tcb()[].transition(TaskControlBlock.RUNNABLE)
+    else:
+        h.tcb()[].wait_node()[].set_reason(reason)
+        h.tcb()[].transition(TaskControlBlock.WAITING)
+    owner[].remote_queue()[]._guard.unlock()
+
+
+# ---------------------------------------------------------------------------
+# PARKING-LOT-ADAPTER (A2 seam history — the two-phase protocol above is the
+# PROMOTED live code; this block is retained as the design record).
+# ---------------------------------------------------------------------------
 #
-# A2.1 (issue #67) NAME RESERVATIONS (surface only — this lane proves the
-# pool threads can COEXIST with the A1 park kernel; the two-phase protocol
-# itself is E5's):
+# The A0.7 spike model (event.mojo) the promotion follows:
+#
+#   PREPARE  — publish the waiter as DATA: task id + embedded WaitNode;
+#              RUNNING -> PARKING opens the early-wake window
+#   VALIDATE — recheck readiness — the lost-wakeup window; readiness here
+#              returns WITHOUT sleeping and WITHOUT a generation bump (the
+#              task never left RUNNING)                              [A0-T11]
+#   COMMIT   — close the window: readiness/cancel unwinds via PARKING ->
+#              RUNNABLE (WAITING never entered); otherwise PARKING ->
+#              WAITING bumps the generation and stamps the node
+#   WAKE     — unpark_current claims the waiter's generation EXACTLY ONCE,
+#              records ONE enqueue, and resumes the waiter via the WAITING
+#              -> RUNNABLE claim edge                                [A0-T12]
+#
+# A2.1 (issue #67) NAME RESERVATIONS (kept):
 #   - park_current / unpark_current stay the WAITING-side pair; their
 #     signatures are unchanged and remain the single park/wake kernel.
-#   - the A2 worker loop (thread_entry.pool_worker_loop, E2-OWNED seam)
-#     polls the pool's shutdown latch as its IDLE motion until E6 provides
-#     park_current-on-NativeEvent; a worker NEVER blocks inside
-#     park_current while holding the pool latched.
+#   - the A2 worker loop (thread_entry.pool_worker_loop, E2-OWNED seam) is
+#     issue #68's; the NativeEvent idle path is E6 (#72).
 #   - cross-worker wakes route through wake_target_worker (scheduler.mojo,
-#     A1.3 affinity seam) + the E5 adapter; nothing here changes for A2.1.
+#     A1.3 affinity seam) + the owner-routing in unpark_current above.

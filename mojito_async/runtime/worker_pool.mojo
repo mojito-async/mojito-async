@@ -50,6 +50,16 @@
 from std.atomic import Atomic, Ordering
 from mojito_async.integration.sys import BytePtr
 from mojito_async.runtime.config import RuntimeConfig, make_pool_config
+from mojito_async.runtime.idle import (
+    ACCT_BYTES,
+    acct_parked,
+    acct_pending,
+    acct_park_total,
+    acct_spurious_total,
+    acct_wake_total,
+    announce_work as acct_announce,
+    complete_work as acct_complete,
+)
 from mojito_async.runtime.thread_entry import (
     CELL_ENTRY,
     CELL_WORKER,
@@ -57,12 +67,15 @@ from mojito_async.runtime.thread_entry import (
 )
 from mojito_async.runtime.worker import Worker
 from mojito_async.vendor.mojito_sys import (
+    NativeEvent,
     NativeTlsKey,
     c_free,
     c_malloc,
     join_native_thread,
-    make_native_thread,
+    make_native_event,
     make_tls_key,
+    ms_event_destroy,
+    native_event_signal,
     spawn_native_thread,
 )
 
@@ -110,13 +123,15 @@ struct WorkerPool:
 
     var _config: RuntimeConfig
     var _tls: WorkerTls
-    var _workers_base: BytePtr        # worker_count * CELL_WORKER heap cells
-    var _entries_base: BytePtr        # worker_count * CELL_ENTRY heap cells
+    var _workers_base: BytePtr
+    var _entries_base: BytePtr
     var _latch: UnsafePointer[Scalar[DType.uint8], MutAnyOrigin]
     var _seeded: Bool
     var _started: Bool
     var _joined: Int
     var _freed: Bool
+    var _event: NativeEvent   # A2.6/E6: the per-pool idle park NativeEvent
+    var _acct: BytePtr        # A2.6/E6: idle-accounting block (atomics)
 
     def __init__(out self):
         self._config = make_pool_config()
@@ -130,6 +145,11 @@ struct WorkerPool:
         self._entries_base = c_malloc(n * CELL_ENTRY)
         self._latch = c_malloc(8).bitcast[Scalar[DType.uint8]]()
         Atomic[DType.uint8].store[ordering=Ordering.RELEASE](self._latch, 0)
+        self._event = NativeEvent()
+        # Accounting block allocated AT CONSTRUCTION (crash fix, A2.6): no
+        # copy/read may ever dereference the address-1 sentinel; _ensure_idle_
+        # state() keeps re-arming it across restarts without reallocating.
+        self._acct = c_malloc(ACCT_BYTES)
 
     def __init__(out self, config: RuntimeConfig):
         self._config = config
@@ -143,6 +163,11 @@ struct WorkerPool:
         self._entries_base = c_malloc(n * CELL_ENTRY)
         self._latch = c_malloc(8).bitcast[Scalar[DType.uint8]]()
         Atomic[DType.uint8].store[ordering=Ordering.RELEASE](self._latch, 0)
+        self._event = NativeEvent()
+        # Accounting block allocated AT CONSTRUCTION (crash fix, A2.6): no
+        # copy/read may ever dereference the address-1 sentinel; _ensure_idle_
+        # state() keeps re-arming it across restarts without reallocating.
+        self._acct = c_malloc(ACCT_BYTES)
 
     # --- addressing ---------------------------------------------------------
 
@@ -170,10 +195,9 @@ struct WorkerPool:
         file).  Refuses a second start before join_all().  Any seam units
         seeded before start() are drained by the workers on entry, then they
         idle on the latch."""
-        if self._started:
-            raise Error("worker_pool.start: pool already started")
         self._tls = make_worker_tls()
-        Atomic[DType.uint8].store[ordering=Ordering.RELEASE](self._latch, 0)
+        self._ensure_idle_state()
+        self._zero_acct()
         self._build_cells()
         self._started = True
         self._joined = 0
@@ -184,21 +208,23 @@ struct WorkerPool:
         workaround shape)."""
         return self._tls.current_worker
 
-    def spawn_worker(
-        mut self,
-        entry: BytePtr,
-        wptr: UnsafePointer[Worker, MutAnyOrigin],
-        cell_addr: BytePtr,
-        key: NativeTlsKey,
-    ) raises:
-        """Spawn ONE worker thread: trampoline `entry`, entry-cell at
-        `cell_addr`, bound to worker cell `wptr` with TLS key `key`.  The
-        embedder computes the per-worker pointers via pool.worker_at(i) /
-        pool.entry_at(i) and loops range(worker_count) — the b2 compiler
-        crash workaround (see NOTE at top): this method touches NO `self`
-        state, which 1.0.0b2 compiles."""
-        var t = spawn_native_thread(entry, cell_addr)
-        wptr[].mark_started(t, key)
+    def _ensure_idle_state(mut self) raises:
+        """(Lazily) create the A2.6/E6 shared idle state: the per-pool
+        NativeEvent (the idle park target) + the lock-free accounting block
+        (idle sleepers / announced work / spec §71 counters).  Created on the
+        first start(); reused across restarts; destroyed at finalize()."""
+        if not self._event.alive():
+            self._event = make_native_event()
+        if Int(self._acct) <= 1:
+            self._acct = c_malloc(ACCT_BYTES)
+
+    def _zero_acct(mut self):
+        """Reset the accounting block's five counters (each start() re-arms)."""
+        for off in range(5):
+            var p = UnsafePointer[Int64, MutAnyOrigin](
+                unsafe_from_address=Int(self._acct) + off * 8
+            )
+            Atomic[DType.int64].store[ordering=Ordering.SEQUENTIAL](p, 0)
 
     def _build_cells(mut self):
         """Write the worker cells (id = i) + entry cells (fresh when no seed
@@ -216,8 +242,9 @@ struct WorkerPool:
 
     def _workers_reinit(mut self, i: Int):
         """(Re)write one worker + entry cell: the Worker's id + the entry
-        cell's worker pointer + TLS slots.  Called on every start() so a
-        restarted pool re-arms a fresh Worker (Runtime reset)."""
+        cell's worker pointer + TLS slots + the A2.6/E6 idle park state
+        (NativeEvent handle + accounting block).  Called on every start() so
+        a restarted pool re-arms a fresh Worker (Runtime reset)."""
         var w = self.worker_at(i)
         w[0] = Worker(i)
         var e = self.entry_at(i)
@@ -225,6 +252,9 @@ struct WorkerPool:
         e[].cw = self._tls.current_worker
         e[].ct = self._tls.current_task
         e[].cs = self._tls.current_scope
+        e[].event = self._event.handle()
+        e[].acct = self._acct
+        w[].set_pool_idle(self._event.handle(), self._acct)
 
     # E2-OWNED seam surface (issue #67 acceptance; issue #68 replaces this
     # with real enqueue once the local queues exist): seed `per_worker` seam
@@ -259,11 +289,54 @@ struct WorkerPool:
         self._seeded = True
 
     def request_shutdown(mut self) raises:
-        """Latch the shutdown request (RELEASE store); every worker loop
-        observes it on its next latch poll and exits.  Idempotent."""
+        """Latch the shutdown request (RELEASE store) AND wake every parked
+        idle worker so they exit promptly (A2.6/E6, issue #72 step 4): a
+        parked worker is asleep on the pool NativeEvent, so the latch alone
+        would not wake it until its next 50 ms deadline slice.  We therefore
+        signal the event once per currently-parked sleeper (breadth-one);
+        a just-parked worker that raced the signals is still woken by its
+        deadline-slice backstop.  Idempotent."""
         if not self._started:
             raise Error("worker_pool.request_shutdown: pool not started")
         Atomic[DType.uint8].store[ordering=Ordering.RELEASE](self._latch, 1)
+        var sleepers = acct_parked(self._acct)
+        if sleepers < 1:
+            sleepers = 1
+        for i in range(sleepers):
+            native_event_signal(self._event)
+
+    # --- E6 producer-side wake budget (issue #72 step 3) --------------------
+
+    def wake_one(mut self) raises:
+        """Producer side: signal the pool NativeEvent ONLY IF at least one
+        worker is parked as an idle sleeper (never burn a signal into
+        nobody).  Breadth-one (the C event wakes at most one waiter); a
+        producer that injects K work units calls wake_one() up to K times —
+        K units wake at most K sleepers."""
+        if not self._started:
+            raise Error("worker_pool.wake_one: pool not started")
+        if acct_parked(self._acct) > 0:
+            native_event_signal(self._event)
+
+    def wake_one_force(mut self) raises:
+        """Unconditionally signal the event (used by shutdown / driver
+        teardown); sticky tokens are harmless."""
+        if not self._started:
+            raise Error("worker_pool.wake_one_force: pool not started")
+        native_event_signal(self._event)
+
+    def announce_work(mut self, n: Int) raises:
+        """A producer injected `n` work units: bump the announced-work count
+        the workers' wake re-check classifies against."""
+        if not self._started:
+            raise Error("worker_pool.announce_work: pool not started")
+        acct_announce(self._acct, n)
+
+    def complete_work(mut self, n: Int) raises:
+        """The embedder drained `n` units (real tasks completed)."""
+        if not self._started:
+            raise Error("worker_pool.complete_work: pool not started")
+        acct_complete(self._acct, n)
 
     def shutdown(mut self) raises:
         """request_shutdown() + join_all(): the complete stop path (never
@@ -303,6 +376,12 @@ struct WorkerPool:
             self._latch = UnsafePointer[Scalar[DType.uint8], MutAnyOrigin](
                 unsafe_from_address=1
             )
+        if Int(self._acct) > 1:
+            c_free(self._acct)
+            self._acct = BytePtr(unsafe_from_address=1)
+        if self._event.alive():
+            ms_event_destroy(self._event.handle())
+            self._event = NativeEvent()
         self._freed = True
 
     # --- observability ------------------------------------------------------
@@ -342,6 +421,37 @@ struct WorkerPool:
 
     def obs_done(mut self, i: Int) -> Int:
         return self.entry_at(i)[].obs_done
+
+    # --- A2.6/E6 idle observability (issue #72) ----------------------------
+
+    def idle_parked(mut self) -> Int:
+        """Number of workers currently parked as idle sleepers (a SPINNING
+        worker never holds one of these — this is the no-busy-spin proof)."""
+        return acct_parked(self._acct)
+
+    def pending_work(mut self) -> Int:
+        """Announced (injected, not yet drained) work units."""
+        return acct_pending(self._acct)
+
+    def park_total(mut self) -> Int:
+        """park_total (spec §71): OS-level idle parks."""
+        return acct_park_total(self._acct)
+
+    def wake_total(mut self) -> Int:
+        """wake_total (spec §71): token-consumed wakes."""
+        return acct_wake_total(self._acct)
+
+    def spurious_total(mut self) -> Int:
+        """spurious_wake_total (spec §71): consumed tokens that found no work."""
+        return acct_spurious_total(self._acct)
+
+    def idle_parks(mut self, i: Int) -> Int:
+        """Times worker i parked as a sleeper (per-worker, post-join)."""
+        return self.entry_at(i)[].idle_parks
+
+    def pool_event(mut self) -> Int:
+        """The pool's NativeEvent handle (A2.6/E6)."""
+        return self._event.handle()
 
 
 

@@ -123,19 +123,38 @@ struct TaskControlBlock[T: ResultValue](ImplicitlyCopyable, ImplicitlyDeletable)
     # Structured-concurrency links.  Cell handles (0 = none).
     var _parent: Int
     var _scope: Int
+    # A2.5 (issue #71) — STARTED latch: True once the task has EVER entered
+    # user code (the first RUNNABLE -> RUNNING transition — latched in
+    # `_apply`, never unlatched).  A started task is worker-affine (spec
+    # §19.2 / ADR-006): even when a later yield or wake returns it to
+    # RUNNABLE and re-enqueues it, the latch stays True so the steal guard
+    # (E4's is_pre_start consumption, issue #70) can tell "never ran" from
+    # "ran, then re-queued".  The stealability test is therefore "latched
+    # False", not "state==RUNNABLE".
+    var _started: Bool
     # Owner-affinity (A2.2, issue #68 — E2 reserves the field for E5):
     # worker id stamped at FIRST RUN by the scheduler loop.  0 = not
     # started / not pinned (matches scheduler.wake_target_worker's
     # unpinned sentinel).  E5 reads this to route remote-ready wakes to
     # the OWNER worker (spec §19.2).
     var _owner_worker: Int
-    # E4 (issue #70) — STARTED latch: True once the task has EVER entered
-    # user code (the first RUNNABLE -> RUNNING transition).  A started task
-    # is worker-affine (spec §19.2 / ADR-006): even when a later yield
-    # returns it to RUNNABLE and re-enqueues it, the latch stays True so the
-    # steal guard can tell "never ran" from "ran, then re-queued".  The
-    # stealability test is therefore "latched False", not "state==RUNNABLE".
-    var _started: Bool
+    # A2.5 (issue #71) — owner RUNTIME address + the two-phase early-wake
+    # readiness latch.  `_owner_runtime` is the address of the owner
+    # worker's Runtime cell (0 = none), stamped at first run by the
+    # scheduler loop: the cross-worker wake route target, so a wake NEVER
+    # needs a global worker registry (b2 has no function-typed fields and
+    # park.mojo is JIT-importable — it cannot depend on the pool).  `_early`
+    # is the PREPARE/VALIDATE/COMMIT early-wake latch (spec §23.2 / A0-T11):
+    # a wake delivered while the task is still RUNNING/PARKING (before the
+    # WAITING commit) latches it; park_validate() re-checks it and
+    # park_commit() consumes it (unwind to RUNNABLE, never WAITING, never a
+    # generation bump).  GUARD: every read/write of `_early` (and of the
+    # claim decision it feeds) happens under the OWNER worker's remote-ready
+    # queue spinlock — the one lock every wake path already serializes
+    # through (issue #68 memory-ordering banner) — so the latch/claim and
+    # the parker's commit are atomic with respect to each other.
+    var _owner_runtime: Int
+    var _early: Bool
     def __init__(out self):
         self._state = TaskControlBlock.NEW
         self._generation = 1
@@ -144,8 +163,10 @@ struct TaskControlBlock[T: ResultValue](ImplicitlyCopyable, ImplicitlyDeletable)
         self._has_result = False
         self._parent = 0
         self._scope = 0
-        self._owner_worker = 0
         self._started = False
+        self._owner_worker = 0
+        self._owner_runtime = 0
+        self._early = False
     # --- construction ------------------------------------------------------
 
     @staticmethod
@@ -183,8 +204,9 @@ struct TaskControlBlock[T: ResultValue](ImplicitlyCopyable, ImplicitlyDeletable)
     def _apply(mut self, to: Int):
         self._state = to
         if to == TaskControlBlock.RUNNING:
-            # E4 (issue #70): the first body entry latches STARTED (never
-            # unlatches — a re-queued started task stays observable).
+            # A2.5 (issue #71): the first body entry latches STARTED (never
+            # unlatches — a re-queued started task stays observable; spec
+            # §14.1/§19.1, ADR-006).
             self._started = True
         if to == TaskControlBlock.WAITING:
             self._generation += 1
@@ -260,6 +282,7 @@ struct TaskControlBlock[T: ResultValue](ImplicitlyCopyable, ImplicitlyDeletable)
 
     def set_scope_handle(mut self, h: Int):
         self._scope = h
+
     def owner_worker(self) -> Int:
         """The worker that first ran this task (0 = not started / not
         pinned; A2.2 issue #68, E5 surface)."""
@@ -269,6 +292,29 @@ struct TaskControlBlock[T: ResultValue](ImplicitlyCopyable, ImplicitlyDeletable)
         """Stamp the first-run worker (called by the scheduler loop at
         dispatch; A2.2 issue #68)."""
         self._owner_worker = worker_id
+
+    def owner_runtime(self) -> Int:
+        """Address of the owner worker's Runtime cell (0 = none; stamped
+        with owner_worker at first dispatch — A2.5 issue #71)."""
+        return self._owner_runtime
+
+    def set_owner_runtime(mut self, addr: Int):
+        """Stamp the owner Runtime address (scheduler loop, first dispatch;
+        A2.5 issue #71)."""
+        self._owner_runtime = addr
+
+    def early_readiness(self) -> Bool:
+        """Two-phase early-wake latch (A0-T11): True once a wake was
+        delivered while the task was RUNNING/PARKING (before the WAITING
+        commit).  Guarded by the OWNER's remote-ready queue spinlock;
+        consumed by park_commit (the unwind-vs-WAITING decision)."""
+        return self._early
+
+    def set_early_readiness(mut self):
+        self._early = True
+
+    def clear_early_readiness(mut self):
+        self._early = False
 
     def is_completed(self) -> Bool:
         """Query the A0.5 machine: COMPLETED (the run/join paths)."""
@@ -282,7 +328,7 @@ struct TaskControlBlock[T: ResultValue](ImplicitlyCopyable, ImplicitlyDeletable)
         """Query the A0.5 machine: WAITING (the park paths)."""
         return self._state == TaskControlBlock.WAITING
 
-    # --- E4 (issue #70): STARTED consumption ---------------------------------
+    # --- STARTED latch consumption (A2.5 issue #71; E4 #70 shares) ---------
 
     def is_started(self) -> Bool:
         """Spec §14.1 `started`, TCB form: True exactly once this task has
@@ -325,5 +371,10 @@ struct TaskControlBlock[T: ResultValue](ImplicitlyCopyable, ImplicitlyDeletable)
 
 def is_illegal_transition(e: Error) -> Bool:
     """True when `e` is an IllegalTransitionError (message begins with the
-    stable "IllegalTransitionError:" prefix)."""
-    return "IllegalTransitionError:" in String(e)
+    documented prefix)."""
+    return String(e).startswith("IllegalTransitionError: illegal transition ")
+
+
+def is_cancellation_error(e: Error) -> Bool:
+    """True when `e` is a cancellation checkpoint error."""
+    return String(e).startswith("CancellationError")
