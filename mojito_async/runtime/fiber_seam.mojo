@@ -109,14 +109,14 @@ struct DriveVerdict:
 # SeamSlot — one task's fiber + lifecycle state
 # ---------------------------------------------------------------------------
 
-struct SeamSlot(ImplicitlyCopyable, ImplicitlyDeletable):
+struct SeamSlot(Movable, ImplicitlyDeletable):
     """One task's fiber and its drive lifecycle (A1.5, issue #53).
 
     DRIVER-OWNED and STABLE: each slot lives in a heap cell or a stable
     local the driver never moves once the fiber is WIRED (ADR-007 — the
     fiber sidecar and in-flight entry hold pointers into its block slots).
-    A slot is implicitly copyable (all-scalar Fiber handle) but a WIRED
-    slot must never be copied; only its address is threaded.
+    A slot is Movable and never copied (its Fiber is Movable post-#49-fold);
+    a WIRED slot must never be moved either — only its address is threaded.
 
     Lifecycle:
       make_seam_slot()        inert slot (no fiber)

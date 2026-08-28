@@ -1,21 +1,14 @@
 # mojito_async/test/stress/t17_fiber_oversub_red_aot.mojo
 #
-# A1.5 (issue #53, consensus T1) — >32-concurrent-fiber oversubscription
-# regression, RED by design on the FROZEN substrate.
+# A1.5 (issue #53, consensus T1) — >32-concurrent-fiber no-cap regression
+# after the substrate M:N rework (issue #101).
 #
-# The vendored mojito-sys keeps a FIXED 64-row resume table (2 rows per
-# fiber), so a process can host at most 32 concurrently live fibers.  The
-# binder's oversubscription guard (fiber.make_fiber / bind, MS_MAX_LIVE_
-# FIBERS) raises a CATCHABLE Error at the 33rd live fiber instead of letting
-# the 33rd switch trap SIGILL (brk #0x67).  This driver asserts that loud
-# Error path.
-#
-# RED-BY-DESIGN: the driver VERIFIES the guard fires and then reports RED +
-# exit 1 — the substrate limit is the documented, tracked constraint
-# (tracking issue #101, EPIC #2 substrate rework lifts it), allow-listed via
-# precommit/known-red.tsv (`suite\t<issue-101>`).  When #101 lands and the
-# limit is gone, this driver flips to a PASS-style assertion (33+ fibers
-# bind and run) and the known-red row is removed.
+# The vendored resume table (64 rows, 2 per fiber => 32-live-fiber cap,
+# brk #0x67 SIGILL) was REMOVED by #101: ms_ctx_t carries its own return_to
+# and the switch path is thread-safe.  This driver asserts the post-#101
+# contract: N_OVERS concurrent bindings succeed (no Error, no trap) and
+# lifetime churn of >64 distinct blocks does not trap — the old cap and the
+# old row per-address leak are both gone.
 #
 # EXTERN DISCIPLINE (modular/modular#6971): imports the extern-bearing
 # fiber seam, so it MUST be AOT (*_aot.mojo — picked up by test/run.sh).
@@ -47,8 +40,7 @@ from std.memory import stack_allocation
 def _iso_exit(code: Int32) abi("C"): ...
 
 
-comptime N_OVERS = Int(34)   # 32 is the cap; the 33rd bind must raise
-comptime MS_CAP = Int(32)
+comptime N_OVERS = Int(34)   # > the old 32-fiber cap: all must bind
 
 
 @export("t17_ovr_entry")
@@ -73,50 +65,53 @@ def main() raises:
     for i in range(N_OVERS):
         (slots + i)[0] = make_seam_slot()
 
-    var raised = False
-    var msg = ""
     var bound = 0
     for i in range(N_OVERS):
         var scell = sbuf + 2 * i
         if ms_stack_alloc(stack_bytes, scell, scell + 1) != 0:
-            print("T17 oversub: stack alloc failed at " + String(i))
+            print("T17 no-cap: stack alloc failed at " + String(i))
             _iso_exit(2)
         var ns = NativeStack(scell[0], (scell + 1)[0])
-        try:
-            seam_bind_slot(
-                slots + i, ns, entry_pointer["t17_ovr_entry"](),
-                UnsafePointer[Byte, MutAnyOrigin](unsafe_from_address=1),
-            )
-            bound = i + 1
-        except e:
-            msg = String(e)
-            raised = True
-            break
-        if i == N_OVERS - 1:
-            break
+        seam_bind_slot(
+            slots + i, ns, entry_pointer["t17_ovr_entry"](),
+            UnsafePointer[Byte, MutAnyOrigin](unsafe_from_address=1),
+        )
+        bound = i + 1
+
+    # --- teardown slot 0 (bound in the concurrency loop above) ------------
+    seam_destroy_slot(slots + 0)
+
+    # --- churn: repeated bind/destroy over one slot must never trap -------
+    # (the old per-address row leak would trap after 64 distinct block
+    # addresses over a lifetime; the no-cap substrate must not)
+    var churn = 0
+    for i in range(200):
+        var rbuf = UnsafePointer[BytePtr, MutUntrackedOrigin](
+            unsafe_from_address=Int(c_malloc(2 * 8))
+        )
+        if ms_stack_alloc(stack_bytes, rbuf, rbuf + 1) != 0:
+            print("T17 no-cap: churn stack alloc failed at " + String(i))
+            _iso_exit(2)
+        var ns2 = NativeStack(rbuf[0], (rbuf + 1)[0])
+        seam_bind_slot(
+            slots + 0, ns2, entry_pointer["t17_ovr_entry"](),
+            UnsafePointer[Byte, MutAnyOrigin](unsafe_from_address=1),
+        )
+        seam_destroy_slot(slots + 0)
+        c_free(UnsafePointer[Byte, MutAnyOrigin](unsafe_from_address=Int(rbuf)))
+        churn += 1
 
     # --- verdict ----------------------------------------------------------
-    if not raised:
-        print("T17 oversub: FAIL (no oversubscription Error raised; " +
-              String(bound) + " fibers bound)")
-        _iso_exit(1)
-    if "oversubscription" not in msg:
-        print("T17 oversub: FAIL (raised, but not the oversubscription " +
-              "guard: " + msg + ")")
-        _iso_exit(1)
-    if bound != MS_CAP:
-        print("T17 oversub: FAIL (guard fired at " + String(bound) +
-              " bound fibers, expected " + String(MS_CAP) + ")")
+    if bound != N_OVERS:
+        print("T17 no-cap: FAIL (bound " + String(bound) + ", expected " +
+              String(N_OVERS) + ")")
         _iso_exit(1)
 
-    # --- teardown (the 32 bound fibers are inert; destroy is safe) --------
-    for i in range(bound):
+    # --- teardown (all slots inert; destroy is safe) ----------------------
+    for i in range(N_OVERS):
         seam_destroy_slot(slots + i)
     c_free(slots_block)
     c_free(UnsafePointer[Byte, MutAnyOrigin](unsafe_from_address=Int(sbuf)))
 
-    # RED by design: the frozen-substrate 32-fiber cap is a documented,
-    # tracked constraint (issue #101); allow-listed via known-red.
-    print("T17 oversub: RED (32-fiber substrate cap raised loudly at the "
-          + "33rd bind, as documented; issue #101 lifts this)")
-    _iso_exit(1)
+    print("T17 no-cap: PASS (34 concurrent bindings + 200-churn lifetime, "
+          + "no cap, no trap; issue #101)")

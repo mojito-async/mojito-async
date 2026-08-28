@@ -148,14 +148,11 @@ int ms_stack_is_live(void *base) {
     return 0;
 }
 
-int ms_live_stack_count(void) {
-    /* Concurrently live stack reservations (A1.1 fold, issue #49); the A1.5
-     * seam's oversubscription guard uses it to bound live FIBERS at 32 (the
-     * substrate resume-table cap, 2 rows/fiber) and raise a catchable Error
-     * in the binder instead of trapping SIGILL (brk #0x67). */
-    int n = 0;
+
+/* Sum of all live reservations, guard pages included (reporting only). */
+size_t ms_stack_total_size(void) {
+    size_t total = 0;
     for (size_t i = 0; i < g_resv_len; ++i)
-        if (g_resv[i].base != NULL)
-            n += 1;
-    return n;
+        total += g_resv[i].total;
+    return total;
 }

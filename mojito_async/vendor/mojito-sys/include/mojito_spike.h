@@ -27,6 +27,12 @@ int      ms_stack_alloc(size_t bytes, void **out_base, void **out_top);
 int      ms_live_stack_count(void); /* live reservations (oversubscription
                                        guard: 64-row resume tab / 2 per fiber
                                        = 32 fibers; EPIC #2/#101 removes cap) */
+void     ms_stack_free(void *base);
+/* Liveness probe: 1 when `base` is a still-registered (not-yet-freed)
+ * reservation, 0 when it was never allocated or already ms_stack_free'd
+ * (munmap'd).  Used by the stack pool (issue #52) to refuse release()/warm-
+ * acquire of a reservation a Fiber.destroy already freed. */
+int      ms_stack_is_live(void *base);
 
 /* Prepare ctx so ms_ctx_switch resumes at entry(userdata) on stack_top,
  * with AAPCS64 prologue assumptions (sp 16-aligned at entry). */

@@ -151,7 +151,6 @@ def ms_stack_is_live(base: BytePtr) abi("C") -> Int32:
 @extern("ms_stack_total_size")
 def ms_stack_total_size() abi("C") -> Int:
     ...
-    ...
 
 
 # ctx: 176-byte ms_ctx_t write target; stack_top: initial sp (16-aligned);

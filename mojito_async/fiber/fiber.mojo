@@ -93,6 +93,11 @@ struct FiberFrame:
     var self_ctx: BytePtr
     var caller_ctx: BytePtr
     var user: BytePtr
+    # T3 (issue #53): set by seam_park_switch right BEFORE the fiber->caller
+    # switch; cleared on entry.  seam_drive reads it after resume() returns to
+    # report Parked vs Completed — the frame-reported verdict a generic EPIC
+    # #2 dispatcher keys on (no driver slice arithmetic).
+    var parked: Bool
 
     def __init__(out self):
         self.self_ctx = UnsafePointer[Byte, MutAnyOrigin](unsafe_from_address=1)
@@ -108,7 +113,7 @@ struct Fiber(Movable, ImplicitlyDeletable, FiberMotion):
     # initial SP of the synthetic stack.
     # Layout constants for the out-of-line heap block (single source of truth
     # for the block size AND the set_targets/accessor offsets).
-    comptime FRAME_BYTES = 24   # sizeof(FiberFrame): 3 BytePtr
+    comptime FRAME_BYTES = 32   # sizeof(FiberFrame): 3 BytePtr + parked Bool
     comptime SCRATCH_BYTES = 16  # entry fn ptr + userdata ptr
     # Cross-switch flags (3 Ints) live in the heap block tail so the fiber
     # body (running on its own stack) and the driver see ONE consistent copy:
@@ -124,7 +129,7 @@ struct Fiber(Movable, ImplicitlyDeletable, FiberMotion):
     # and traps with SIGILL (brk 0x67).  bind()/make_fiber() raise a catchable
     # Error BEFORE allocating, so A1 fails loudly instead of trapping.
     # EPIC #2 (issue #101) removes the cap.
-    comptime MS_MAX_LIVE_FIBERS = 32
+    # (retired: the 32-live-fiber substrate cap was removed by issue #101)
 
     var _stack: Int
     var _top: Int
@@ -449,18 +454,10 @@ def bind(
     arithmetic + heap-block allocation (c_malloc is also a firewall extern),
     so it is safe under mojo build + execute (verified end-to-end).
     """
-    # Oversubscription guard (T1): fail loudly BEFORE the 33rd live fiber.
-    # The vendored resume table caps the process at 32 fibers (64 rows, 2 per
-    # fiber) and traps (SIGILL) on overflow; A1 raises a catchable Error.
-    # This fiber's OWN stack is already in the live-reservation count, so the
-    # ceiling on live count IS the fiber ceiling.  EPIC #2 (#101) removes the
-    # cap; this is the fail-loud seam until then.
-    if ms_live_stack_count() > Fiber.MS_MAX_LIVE_FIBERS:
-        raise Error(
-            "fiber.bind: live-fiber limit reached ("
-            + String(Fiber.MS_MAX_LIVE_FIBERS)
-            + "); EPIC #2 (#101) removes the cap"
-        )
+    # The substrate resume table that once capped the process at 32 live
+    # fibers (2 rows/fiber, brk #0x67 SIGILL) was REMOVED by issue #101
+    # (A2.0 M:N rework): ms_ctx_t carries its own return_to and the switch
+    # path is thread-safe, so there is no live-fiber cap to guard.
     var block = Int(c_malloc(2 * MS_CTX_SIZE + Fiber.TAIL_BYTES))
     if block == 0:
         raise Error("fiber.bind: heap allocation failed")
@@ -485,14 +482,7 @@ def make_fiber(
     userdata: BytePtr,
 ) raises -> Fiber:
     var f0 = Fiber(stack[])
-    # Oversubscription guard (T1): fail loudly before the 33rd live fiber
-    # (see bind() for the provenance).  EPIC #2 (#101) removes the cap.
-    if ms_live_stack_count() > Fiber.MS_MAX_LIVE_FIBERS:
-        raise Error(
-            "fiber.make_fiber: live-fiber limit reached ("
-            + String(Fiber.MS_MAX_LIVE_FIBERS)
-            + "); EPIC #2 (#101) removes the cap"
-        )
+    # The 32-live-fiber substrate cap was removed by issue #101 (see bind()).
     var block = Int(c_malloc(2 * MS_CTX_SIZE + Fiber.TAIL_BYTES))
     if block == 0:
         raise Error("fiber.make_fiber: heap allocation failed")
