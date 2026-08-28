@@ -25,9 +25,18 @@
 # must not be relocated while a switch is in flight -- see the invariants
 # below).  destroy() is idempotent (its alive() guards make a second call a
 # no-op) and frees BOTH the synthetic stack and the heap block.  Fiber is
-# ImplicitlyCopyable (all-scalar handles): exactly ONE destroy() per live
-# Fiber, on the OWNING handle -- destroying a copy double-frees (no __del__
-# protects aliases).  The driver keeps the owning Fiber in one stable local.
+# MOVABLE (non-copyable), NOT ImplicitlyCopyable: copying a Fiber is a COMPILE
+# error, so destruction is single-owner by construction -- a move (make_fiber
+# value-return, bind's slot fill, slot[].fiber = f) transfers ownership to
+# exactly one handle, and only that handle may destroy().  This closes the
+# copy->destroy->destroy double-free / use-after-destroy alias hazard the
+# previous ImplicitlyCopyable handle left open.
+#
+# A1.1 fold (issue #49): `_completed` + finished().  resume() raises a loud
+# Error (not a raw brk 0x66 trap) on an already-completed fiber.
+# mark_completed() is the driver/carrier seam that records "the body unwound";
+# finished() unblocks the FiberContinuation conformance (#50/#96) which
+# reconciles via finished()/is_suspended().
 #
 # --- b2 EXTERN DISCIPLINE (modular/modular#6971/#7004 family) -------------
 # ALL extern declarations live at concrete module scope in the vendored
@@ -47,8 +56,8 @@
 #     resume(mut self) raises        # prepare + resume the one-shot continuation
 #     suspend(mut self) raises       # fiber-side: yield back to the driver
 #     destroy(mut self)              # idempotent teardown (stack + block)
-#     has_resumed() -> Bool
-#     is_suspended() -> Bool
+#     finished() -> Bool              # the body unwound (mark_completed set it)
+#     mark_completed()                # driver/carrier seam: records completion
 #     stack_ptr() -> NativeStack     # the bound reservation (for pool reclaim)
 #     alive() -> Bool
 #     stack_base()/stack_top()/fiber_ctx()/caller_ctx()/frame_ptr()/
@@ -70,6 +79,7 @@ from mojito_async.vendor.mojito_sys import (
     c_malloc,
     ms_ctx_make,
     ms_ctx_switch,
+    ms_live_stack_count,
     stack_free,
 )
 
@@ -91,8 +101,9 @@ struct FiberFrame:
 
 
 # All state is scalar addresses; the bodies live OUT of line (one heap block +
-# the ms_stack_alloc'd synthetic stack), so the struct is trivially copy-safe.
-struct Fiber(ImplicitlyCopyable, ImplicitlyDeletable):
+# the ms_stack_alloc'd synthetic stack).  MOVABLE (NOT ImplicitlyCopyable): a
+# copy is a COMPILE error, so destruction stays single-owner by construction.
+struct Fiber(Movable, ImplicitlyDeletable):
     # ms_stack_alloc base (0 = not allocated; passed to ms_stack_free) and the
     # initial SP of the synthetic stack.
     # Layout constants for the out-of-line heap block (single source of truth
@@ -100,6 +111,13 @@ struct Fiber(ImplicitlyCopyable, ImplicitlyDeletable):
     comptime FRAME_BYTES = 24   # sizeof(FiberFrame): 3 BytePtr
     comptime SCRATCH_BYTES = 16  # entry fn ptr + userdata ptr
     comptime TAIL_BYTES = Self.FRAME_BYTES + Self.SCRATCH_BYTES
+    # Oversubscription cap (A1.1 fold, issue #49): the vendored substrate's
+    # process-global resume table holds 64 rows (2 per fiber), so the process
+    # can have at most 32 concurrently live fibers; a 33rd saturates the table
+    # and traps with SIGILL (brk 0x67).  bind()/make_fiber() raise a catchable
+    # Error BEFORE allocating, so A1 fails loudly instead of trapping.
+    # EPIC #2 (issue #101) removes the cap.
+    comptime MS_MAX_LIVE_FIBERS = 32
 
     var _stack: Int
     var _top: Int
@@ -128,6 +146,11 @@ struct Fiber(ImplicitlyCopyable, ImplicitlyDeletable):
     # switch; the assertion is a single compare (no allocation).
     comptime FAULT_CHECKS = True
 
+    # True once the body unwound (the driver/carrier called mark_completed()).
+    # resume() raises on a completed fiber instead of letting the asm
+    # trampoline re-entry trap (brk 0x66).
+    var _completed: Bool
+
     # Zero-arg ctor: inert Fiber (nothing allocated).  The driver may hold
     # `var f = Fiber()` and hand `to=f` to bind()/init.
     def __init__(out self):
@@ -138,6 +161,7 @@ struct Fiber(ImplicitlyCopyable, ImplicitlyDeletable):
         self._started = False
         self._suspended = False
         self._owner = 0
+        self._completed = False
 
     # All-scalar ctor binding an existing reservation: `stack` (base/top from
     # ms_stack_alloc).  The block is not yet allocated (deferred to the
@@ -150,6 +174,7 @@ struct Fiber(ImplicitlyCopyable, ImplicitlyDeletable):
         self._started = False
         self._suspended = False
         self._owner = 0
+        self._completed = False
 
     # -- queries -----------------------------------------------------------
 
@@ -190,6 +215,18 @@ struct Fiber(ImplicitlyCopyable, ImplicitlyDeletable):
 
     def is_suspended(self) -> Bool:
         return self._suspended
+
+    # True once the body unwound (mark_completed set it).  The continuation
+    # seam (#50/#96) reconciles on finished()/is_suspended(); a caller should
+    # never resume() a finished fiber (resume() raises loudly instead).
+    def finished(self) -> Bool:
+        return self._completed
+
+    # Driver/carrier seam: record that the body unwound (the single-shot
+    # continuation is done).  No-op-safe: does not itself free anything
+    # (destroy() owns teardown).
+    def mark_completed(mut self):
+        self._completed = True
 
     def stack_ptr(self) -> NativeStack:
         return NativeStack(
@@ -264,10 +301,20 @@ struct Fiber(ImplicitlyCopyable, ImplicitlyDeletable):
     # -- switching ---------------------------------------------------------
 
     def resume(mut self) raises:
+        # A completed fiber's body has unwound; re-entering it through the asm
+        # trampoline would trap (brk 0x66).  Raise a loud Error instead.
+        if self._completed:
+            raise Error("fiber.resume: fiber already complete")
         if self._stack == 0:
             raise Error("fiber.resume: no bound stack")
         comptime if Self.FAULT_CHECKS:
             self.assert_never_relocated()  # ADR-007 before every switch
+        # The public `Fiber(stack)` ctor builds a Fiber with no out-of-line
+        # block yet (deferred to a factory/bind); resume() writes the sidecar
+        # into that block, so guard _block (not just _stack) to raise rather
+        # than SEGV on an un-bound block.
+        if self._block == 0:
+            raise Error("fiber.resume: no bound block (Fiber not factory-bound)")
         if not self._prepared:
             self._prepared = True
             var fp = self.frame_ptr()
@@ -291,6 +338,13 @@ struct Fiber(ImplicitlyCopyable, ImplicitlyDeletable):
             raise Error("fiber.suspend: no bound stack")
         comptime if Self.FAULT_CHECKS:
             self.assert_never_relocated()  # ADR-007 before every switch
+        # Guard _block too (mirror of resume()): the public Fiber(stack) ctor
+        # has no block yet; a driver suspending a stack-only Fiber must raise,
+        # not SEGV (fold T4).
+        if self._block == 0:
+            raise Error("fiber.suspend: no bound block (Fiber not factory-bound)")
+        if self._completed:
+            raise Error("fiber.suspend: fiber already complete")
         self._suspended = True
         ms_ctx_switch(self.fiber_ctx(), self.caller_ctx())
 
@@ -309,6 +363,7 @@ struct Fiber(ImplicitlyCopyable, ImplicitlyDeletable):
             self._started = False
             self._suspended = False
             self._owner = 0
+            self._completed = False
         if self._block != 0:
             c_free(UnsafePointer[Byte, MutAnyOrigin](unsafe_from_address=self._block))
             self._block = 0
@@ -336,6 +391,18 @@ def bind(
     arithmetic + heap-block allocation (c_malloc is also a firewall extern),
     so it is safe under mojo build + execute (verified end-to-end).
     """
+    # Oversubscription guard (T1): fail loudly BEFORE the 33rd live fiber.
+    # The vendored resume table caps the process at 32 fibers (64 rows, 2 per
+    # fiber) and traps (SIGILL) on overflow; A1 raises a catchable Error.
+    # This fiber's OWN stack is already in the live-reservation count, so the
+    # ceiling on live count IS the fiber ceiling.  EPIC #2 (#101) removes the
+    # cap; this is the fail-loud seam until then.
+    if ms_live_stack_count() > Fiber.MS_MAX_LIVE_FIBERS:
+        raise Error(
+            "fiber.bind: live-fiber limit reached ("
+            + String(Fiber.MS_MAX_LIVE_FIBERS)
+            + "); EPIC #2 (#101) removes the cap"
+        )
     var block = Int(c_malloc(2 * MS_CTX_SIZE + Fiber.TAIL_BYTES))
     if block == 0:
         raise Error("fiber.bind: heap allocation failed")
@@ -343,7 +410,7 @@ def bind(
     var f0 = Fiber(stack[])
     f0._block = block
     f0.set_targets(Int(entry), Int(userdata))
-    dst[0] = f0
+    dst[0] = f0^
 
 
 # Module-level factory creating a Fiber over an ACQUIRED stack (the stack-pool
@@ -359,6 +426,14 @@ def make_fiber(
     userdata: BytePtr,
 ) raises -> Fiber:
     var f0 = Fiber(stack[])
+    # Oversubscription guard (T1): fail loudly before the 33rd live fiber
+    # (see bind() for the provenance).  EPIC #2 (#101) removes the cap.
+    if ms_live_stack_count() > Fiber.MS_MAX_LIVE_FIBERS:
+        raise Error(
+            "fiber.make_fiber: live-fiber limit reached ("
+            + String(Fiber.MS_MAX_LIVE_FIBERS)
+            + "); EPIC #2 (#101) removes the cap"
+        )
     var block = Int(c_malloc(2 * MS_CTX_SIZE + Fiber.TAIL_BYTES))
     if block == 0:
         raise Error("fiber.make_fiber: heap allocation failed")
