@@ -339,9 +339,21 @@ def _verify(failures: UnsafePointer[Int, MutAnyOrigin], sc: UnsafePointer[Scene,
         _fail(failures, "task_steals_total mismatch: observed "
                         + String(sc[].observed_steals) + " successful steals, "
                         "counters w0+" + String(d0) + " w1+" + String(d1))
-    if d0 != 0:
-        _fail(failures, "worker 0 reported " + String(d0)
-                        + " steals (must be 0: it only probes, never steals)")
+    # The worker that OWNS the seeded local work only probes — it drains its
+    # own deque and never steals: worker 0 in the steal-share scenario (its
+    # local budget caps serving; the idle thief is worker 1), and the
+    # STARTED-task owner in the migration scenario (the idle thief is worker
+    # 0, per the scenario comment — the owner worker drains, the thief
+    # steals the fresh tail).  The idle thief's successful steals are
+    # counted exactly once via the d0+d1 == observed check above.
+    var owner_probe = sc[].owner_of_started
+    var d_owner = d0
+    if owner_probe == 1:
+        d_owner = d1
+    if d_owner != 0:
+        _fail(failures, "worker " + String(owner_probe) + " reported "
+                        + String(d_owner) + " steals (owner/probe-only worker "
+                        + "must only drain its own deque — no fake counters)")
 
 
 def _report_pass(sc: UnsafePointer[Scene, MutAnyOrigin]) raises:
@@ -400,7 +412,7 @@ def seed_tasks(
     for k in range(count):
         var tid = first + k
         seed_cell(sc, tid)
-        wp[]._local.push(TaskRecord(sc[].tcb_addrs[tid], tid))
+        wp[]._local.push_back(TaskRecord(sc[].tcb_addrs[tid], tid))
 
 
 def mark_started_reenqueued(sc: UnsafePointer[Scene, MutAnyOrigin], tid: Int) raises:
@@ -561,11 +573,11 @@ def _scenario_migration(
         seed_cell(sc, k + 8)
     seed_cell(sc, STARTED)
     for k in range(6):
-        w1p[]._local.push(TaskRecord(sc[].tcb_addrs[k + 1], k + 1))
+        w1p[]._local.push_back(TaskRecord(sc[].tcb_addrs[k + 1], k + 1))
     for k in range(5):
-        w1p[]._local.push(TaskRecord(sc[].tcb_addrs[k + 8], k + 8))
+        w1p[]._local.push_back(TaskRecord(sc[].tcb_addrs[k + 8], k + 8))
     mark_started_reenqueued(sc, STARTED)
-    w1p[]._local.push(TaskRecord(sc[].tcb_addrs[STARTED], STARTED))
+    w1p[]._local.push_back(TaskRecord(sc[].tcb_addrs[STARTED], STARTED))
     run_scenario(failures, sc)
 
 

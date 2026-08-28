@@ -63,7 +63,13 @@ from mojito_async.vendor.mojito_sys import (
 
 # Worker/entry cell byte-strides for the pool's heap arrays (b2 exposes no
 # public sizeof; >= real struct sizes is the documented t28-style contract).
-comptime CELL_WORKER = Int(512)
+# CELL_WORKER must cover the post-#68/#69/#70 Worker: its Runtime embeds the
+# @align(128) LocalDeque + RemoteReadyQueue (cache-line isolation, issue #68
+# step 5) plus the bounded InjectQueue, so the real struct is far larger
+# than the A2.1 five-field Worker — 512 bytes overflowed and corrupted the
+# heap (tcmalloc aborted freeing a bogus pointer in t30).  4096 keeps the
+# headroom for the E-lanes' further field growth.
+comptime CELL_WORKER = Int(4096)
 comptime CELL_ENTRY = Int(256)
 
 
