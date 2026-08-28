@@ -23,6 +23,7 @@
 #   stay in the embedding *_aot drivers).
 from mojito_async.runtime.queue import FifoQueue, TaskRecord
 from mojito_async.runtime.task_control_block import ResultValue, TaskControlBlock
+from mojito_async.runtime.inject_queue import InjectQueue
 
 
 # ---------------------------------------------------------------------------
@@ -50,6 +51,10 @@ struct Runtime:
     State:
       _ready     — FIFO of RUNNABLE TaskRecords (mutex-free: single worker,
                      no cross-thread handoff exists).
+      _inject    — A2.3 (issue #69) shared bounded MPSC injection queue: the
+                     global intake for non-worker-local spawns/foreign
+                     enqueues; drained by every worker (see enqueue_global
+                     and scheduler_loop's bounded poll).
       _shutdown  — latched by shutdown(); run()/spawn refuse afterwards.
       _scope     — root scope handle (Int cell handle; refined upward).
       _next_id   — monotonic task-id allocator (ids start at 1; 0 = none).
@@ -67,6 +72,9 @@ struct Runtime:
     """
 
     comptime NO_SCOPE = Int(0)
+    # A2.3 (issue #69): default bound for the shared injection queue (spec
+    # §86 — limits for externally submitted unbounded work).
+    comptime INJECT_CAPACITY = Int(1024)
 
     var _ready: FifoQueue[TaskRecord]
     var _shutdown: Bool
@@ -78,6 +86,15 @@ struct Runtime:
     var _skipped: Int
     var _fiber_drives: Int
     var _fiber_switches: Int
+    # A2.3 (issue #69): the shared global injection queue — the MPSC intake
+    # for tasks submitted outside any worker's local deque (external spawn
+    # entry, cross-worker/foreign enqueues, reactor/timer submissions).
+    # DISTINCT from the A1 `_ready` FIFO: `_ready` stays the LOCAL runnable
+    # queue of this Runtime (single worker today; per-worker deque lane is
+    # E2/#68), while `_inject` is the global bounded intake any worker
+    # drains (see scheduler_loop's bounded poll).  Worker-local enqueues
+    # NEVER take this queue's lock.
+    var _inject: InjectQueue
 
     def __init__(out self):
         self._ready = FifoQueue[TaskRecord]()
@@ -90,6 +107,7 @@ struct Runtime:
         self._skipped = 0
         self._fiber_drives = 0
         self._fiber_switches = 0
+        self._inject = InjectQueue(Self.INJECT_CAPACITY)
 
     # --- root-task execution (A0-T1) ----------------------------------------
 
@@ -144,6 +162,49 @@ struct Runtime:
     def pending(self) -> Int:
         """Number of currently RUNNABLE records."""
         return len(self._ready)
+
+    # --- A2.3 global injection intake (issue #69) ----------------------------
+
+    def enqueue_global(mut self, tcb_addr: Int, task_id: Int, current_worker: Int) raises:
+        """Spawn-policy classification for the RUNNABLE registration of a
+        task submitted OUTSIDE any worker's local deque.
+
+        `current_worker` is the known worker identity when the spawn hails
+        from a task already running on worker W (b2 has no TLS, so worker
+        identity is threaded by value; 0 = no known current worker):
+          - current_worker != 0 -> enqueue_local(W) — the per-worker deque
+            lane is E2/#68's; until it lands this routes through the A1 FIFO
+            `_ready` (the single-worker local queue), so a worker-local
+            enqueue NEVER takes the injection lock (acceptance: no global
+            lock on the local hot path).  [E2-OWNED seam]
+          - current_worker == 0 -> _inject.push — the shared bounded MPSC
+            intake; the record is an INJECTION (UNSTARTED, stealable per
+            §19.1) any worker may run.  At capacity `_inject.push` raises a
+            clear full error instead of blocking any worker (ADR-009); the
+            caller retries on its next loop iteration (spec §86).
+        Registration counts against `_enqueued` exactly once either way.
+        """
+        raise Error(
+            "Runtime.enqueue_global: not implemented yet (issue #69)"
+        )
+
+    def inject_queue(mut self) -> UnsafePointer[InjectQueue, MutAnyOrigin]:
+        """The shared injection queue (drain seam for scheduler_loop)."""
+        return UnsafePointer[InjectQueue, MutAnyOrigin](to=self._inject)
+
+    def inject_pending(mut self) -> Int:
+        """Records currently waiting in the global injection queue."""
+        return self._inject.pending()
+
+    def inject_capacity(self) -> Int:
+        """The injection queue bound (spec §86 limits)."""
+        return self._inject.capacity()
+
+    def inject_rejected(self) -> Int:
+        """Capacity rejections the injection queue has observed (backpressure
+        evidence — the bounded intake shed load cleanly instead of blocking a
+        worker)."""
+        return self._inject.rejected()
 
     # --- observability -------------------------------------------------------
 

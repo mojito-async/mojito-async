@@ -5,3 +5,10 @@
 # commit of the same PR) and does NOT block the commit; the failure is still
 # logged. Remove the row as soon as the implementation turns the test green —
 # an unlisted failure blocks the commit.
+#
+# TDD-red quarter (A2.3, issue #69): t32_injection — the new acceptance
+# driver runs against the E3 scaffolds (enqueue_global / push_wake / the
+# scheduler injection poll all raise "not implemented"), so the driver
+# prints RED (exit 1) with 20 scaffold failures; removed once the GREEN
+# commit lands.
+suite	https://github.com/mojito-async/mojito-async/issues/69
