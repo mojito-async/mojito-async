@@ -84,7 +84,12 @@ mkdir -p "$BUILD_DIR" || true
 for t in $AOT_TESTS; do
     name=$(basename "$t" .mojo)
     bin="$BUILD_DIR/$name"
-    if ! "$MOJO" build "$t" -o "$bin" -I "$REPO_ROOT" $LINK_FLAGS \
+    # Per-driver build flags: t35's wake-burst probe (issue #72/M7) trips a
+    # 1.0.0b2 codegen SEGV at -O 3, so it builds with -O 0 (the burst loop
+    # is the acceptance evidence; the unoptimized build lowers it cleanly).
+    extra=""
+    if [ "$name" = "t35_idle_sleep_aot" ]; then extra="-O 0"; fi
+    if ! "$MOJO" build "$t" -o "$bin" -I "$REPO_ROOT" $LINK_FLAGS $extra \
             >"$BUILD_DIR/$name.build.log" 2>&1; then
         row="$name FAIL (AOT build error)"
         failures=$((failures+1))
