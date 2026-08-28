@@ -21,7 +21,7 @@ int      ms_page_size(void);
  * (initial SP = highest usable address, 16-byte aligned). Non-moving. */
 int      ms_stack_alloc(size_t bytes, void **out_base, void **out_top);
 void     ms_stack_free(void *base);
-size_t   ms_stack_total_size(void); /* reserved incl guard, for reporting */
+int      ms_live_stack_count(void); /* live reservations (oversubscription guard) */
 
 /* Prepare ctx so ms_ctx_switch resumes at entry(userdata) on stack_top,
  * with AAPCS64 prologue assumptions (sp 16-aligned at entry). */

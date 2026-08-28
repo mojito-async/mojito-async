@@ -70,6 +70,7 @@ from mojito_async.vendor.mojito_sys import (
     c_malloc,
     ms_ctx_make,
     ms_ctx_switch,
+    ms_live_stack_count,
     stack_free,
 )
 
@@ -83,11 +84,17 @@ struct FiberFrame:
     var self_ctx: BytePtr
     var caller_ctx: BytePtr
     var user: BytePtr
+    # A1.5 (issue #53, T3): frame-reported park verdict.  The body's
+    # seam_park_switch sets this BEFORE the fiber->caller switch so the
+    # driver can distinguish a mid-frame PARK from a completed UNWIND after
+    # resume() returns.  Cleared on every seam_drive entry and at __init__.
+    var parked: Bool
 
     def __init__(out self):
         self.self_ctx = UnsafePointer[Byte, MutAnyOrigin](unsafe_from_address=1)
         self.caller_ctx = UnsafePointer[Byte, MutAnyOrigin](unsafe_from_address=1)
         self.user = UnsafePointer[Byte, MutAnyOrigin](unsafe_from_address=1)
+        self.parked = False
 
 
 # All state is scalar addresses; the bodies live OUT of line (one heap block +
@@ -97,7 +104,7 @@ struct Fiber(ImplicitlyCopyable, ImplicitlyDeletable):
     # initial SP of the synthetic stack.
     # Layout constants for the out-of-line heap block (single source of truth
     # for the block size AND the set_targets/accessor offsets).
-    comptime FRAME_BYTES = 24   # sizeof(FiberFrame): 3 BytePtr
+    comptime FRAME_BYTES = 32   # sizeof(FiberFrame): 3 BytePtr + parked Bool
     comptime SCRATCH_BYTES = 16  # entry fn ptr + userdata ptr
     comptime TAIL_BYTES = Self.FRAME_BYTES + Self.SCRATCH_BYTES
 
@@ -127,6 +134,14 @@ struct Fiber(ImplicitlyCopyable, ImplicitlyDeletable):
     # enabled builds the switch helpers assert stack-locality before every
     # switch; the assertion is a single compare (no allocation).
     comptime FAULT_CHECKS = True
+
+    # A1.1 fold (issue #49) / for the A1.5 oversubscription RED driver
+    # (issue #53): the vendored substrate keeps a FIXED 64-row resume table
+    # (2 rows per fiber), so a process can host at most 32 concurrently live
+    # fibers.  bind()/make_fiber() raise a catchable Error BEFORE allocating
+    # the 33rd so A1 fails loudly instead of trapping SIGILL (brk 0x67).
+    # EPIC #2 (#101) lifts this with the M:N substrate rework.
+    comptime MS_MAX_LIVE_FIBERS = Int(32)
 
     # Zero-arg ctor: inert Fiber (nothing allocated).  The driver may hold
     # `var f = Fiber()` and hand `to=f` to bind()/init.
@@ -335,7 +350,16 @@ def bind(
     vendor firewall's concrete module scope; this factory only does pointer
     arithmetic + heap-block allocation (c_malloc is also a firewall extern),
     so it is safe under mojo build + execute (verified end-to-end).
-    """
+
+    Oversubscription guard (issue #49 / #53): at the substrate's 32-live-
+    fiber resume-table cap this raises a catchable Error BEFORE allocating,
+    so A1 fails loudly instead of trapping SIGILL (brk 0x67)."""
+    if ms_live_stack_count() > Fiber.MS_MAX_LIVE_FIBERS:
+        raise Error(
+            "fiber.bind: live-fiber oversubscription (at the "
+            + String(Fiber.MS_MAX_LIVE_FIBERS)
+            + "-fiber substrate resume-table cap; EPIC #2 #101 lifts this)"
+        )
     var block = Int(c_malloc(2 * MS_CTX_SIZE + Fiber.TAIL_BYTES))
     if block == 0:
         raise Error("fiber.bind: heap allocation failed")
@@ -358,6 +382,14 @@ def make_fiber(
     entry: BytePtr,
     userdata: BytePtr,
 ) raises -> Fiber:
+    # Oversubscription guard (issue #49 / #53): raises a catchable Error at
+    # the substrate's 32-live-fiber resume-table cap instead of SIGILL.
+    if ms_live_stack_count() > Fiber.MS_MAX_LIVE_FIBERS:
+        raise Error(
+            "fiber.make_fiber: live-fiber oversubscription (at the "
+            + String(Fiber.MS_MAX_LIVE_FIBERS)
+            + "-fiber substrate resume-table cap; EPIC #2 #101 lifts this)"
+        )
     var f0 = Fiber(stack[])
     var block = Int(c_malloc(2 * MS_CTX_SIZE + Fiber.TAIL_BYTES))
     if block == 0:

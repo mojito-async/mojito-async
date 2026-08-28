@@ -130,6 +130,11 @@ def ms_stack_total_size() abi("C") -> Int:
     ...
 
 
+@extern("ms_live_stack_count")
+def ms_live_stack_count() abi("C") -> Int:
+    ...
+
+
 # ctx: 168-byte ms_ctx_t write target; stack_top: initial sp (16-aligned);
 # entry: ms_entry_fn code pointer (see entry_pointer above);
 # userdata: passed through unmodified to entry(userdata).
