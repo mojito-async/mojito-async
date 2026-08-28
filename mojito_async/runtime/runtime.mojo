@@ -15,6 +15,19 @@
 #                                 routes owner-affine wakes here);
 #   enqueue()                  — E3-OWNED injection intake (unchanged path).
 #
+# A2.7 (issue #73) — the FAIRNESS surface (spec §21/§67/§71): the worker
+# loop's fairness budget counts CONSECUTIVELY LOCALLY-SOURCED slices
+# (slices_local) against Budget.K; on hitting K it sweeps remote-ready
+# (slices_remote), the injection intake (slices_inject), and the caller's
+# timer/reactor service callback (service_sweeps), then resumes local work
+# (budget_resets).  The kill-0 starvation watch counts a task that exceeded
+# the budget without an intervening cooperative handoff (yields(), any park)
+# or service sweep — starvation_events; never-yielding CPU-bound user code
+# is the documented §67 cooperative limitation (NO preemption in MVP, §68),
+# measured rather than hidden.  The E6 idle-sleep handoff: a worker that
+# parks its OS thread MUST do so only AFTER fair_scheduler_loop returned on
+# a fully-serviced drain (slices_* + service_sweeps visible).
+#
 # Productionized from spike/colorless_runtime/runtime.mojo (A0.2 + A0.6,
 # issues #11, #15); semantics carried forward.  `Runtime` owns this worker's
 # run queues, the shutdown flag, the task-id allocator, and the observable
@@ -75,7 +88,8 @@ struct Runtime:
       _inject    — A2.3 (issue #69) shared bounded MPSC injection queue: the
                      global intake for non-worker-local spawns/foreign
                      enqueues; drained by every worker (see enqueue_global
-                     and scheduler_loop's bounded poll).      _shutdown  — latched by shutdown(); run()/spawn refuse afterwards.
+                     and scheduler_loop's bounded poll).
+      _shutdown  — latched by shutdown(); run()/spawn refuse afterwards.
       _scope     — root scope handle (Int cell handle; refined upward).
       _next_id   — monotonic task-id allocator (ids start at 1; 0 = none).
       counters   — observable scheduling effects: _tasks_started/_completed
@@ -88,6 +102,12 @@ struct Runtime:
                      completion trampoline).  CHEAP (non-parking) tasks never
                      touch these — the fast-path regression guard asserts a
                      non-parking run observes 0.
+      _steal_total — E4 (issue #70): successful unstarted-task steals
+                     (spec §71 `task_steals_total`); exact, one bump each.
+      _slices_* / _budget_resets / _service_sweeps / _yields /
+      _starvation_events — A2.7 (issue #73) fairness observability: the
+                     fair loop (scheduler.mojo) classifies every served
+                     slice and counts budget/service/starvation events here.
     """
 
     comptime NO_SCOPE = Int(0)
@@ -139,6 +159,33 @@ struct Runtime:
 # wired in enqueue_global per ACCEPTED record and enqueue_local/
     # push_remote; the SIGNAL (wake_one) is #112-OWNED.
     var _acct: BytePtr
+    # A2.7 (issue #73) — fairness counters (spec §21/§67/§71): work-class
+    # slice accounting + budget/service/starvation observability.  The
+    # starve-watch and budget state LIVE in the fair loop (scheduler.mojo);
+    # the runtime only OBSERVES the drives' effects here.
+    var _slices_local: Int
+    var _slices_remote: Int
+    var _slices_inject: Int
+    var _budget_resets: Int
+    var _service_sweeps: Int
+    var _yields: Int
+    var _starvation_events: Int
+
+    # M9 (review fold, issue #73): PER-SLICE COUNTER COST, documented and
+    # bounded.  Every served slice costs exactly ONE non-atomic Int
+    # increment on a worker-LOCAL field (note_slice_{local,remote,inject}
+    # from the fair loop — the scheduler touches no other counter on the
+    # slice path; budget_resets/service_sweeps/yields/starvation_events
+    # bump only on their events, never per slice).  The block is GROUPED
+    # at the TAIL of the struct (M9): the seven Ints share one cache line
+    # pair that the hot queue fields (_ready/_local/_remote/_inject) never
+    # share, so the per-slice write stays off the dispatch hot line — no
+    # atomic RMW, no lock, no cross-thread contention (all seven are
+    # touched by exactly one worker thread; the pool's acct atomics for the
+    # #72 idle counters live on a separate heap block for that reason).
+    # Cost envelope: one plain store (worker-local, line-resident) per
+    # dispatch slice — negligible vs the dispatch itself; observable only
+    # in slice-heavy microbenchmarks and never on a foreign/atomic path.
     def __init__(out self):
         self._ready = FifoQueue[TaskRecord]()
         self._local = LocalDeque()
@@ -155,6 +202,13 @@ struct Runtime:
         self._inject = InjectQueue(Self.INJECT_CAPACITY)
         self._steal_total = 0
         self._acct = BytePtr(unsafe_from_address=1)
+        self._slices_local = 0
+        self._slices_remote = 0
+        self._slices_inject = 0
+        self._budget_resets = 0
+        self._service_sweeps = 0
+        self._yields = 0
+        self._starvation_events = 0
     # --- root-task execution (A0-T1) ----------------------------------------
 
     def run[T: def() raises -> None](mut self, task: T) raises:
@@ -281,6 +335,24 @@ struct Runtime:
     def has_remote(mut self) -> Bool:
         return not self._remote.is_empty()
 
+    def has_inject(mut self) -> Bool:
+        """True when the E3 injection intake holds a record (A2.7 fairness-
+        budget drain probe, issue #73; scheduler.fair_scheduler_loop polls
+        this between budget windows).  With #69's InjectQueue merged, the
+        intake IS the shared bounded injection queue (the A1 `_ready` FIFO
+        is only the legacy `enqueue()` path — never a live intake)."""
+        return self._inject.pending() > 0
+
+    def pop_inject(mut self) raises -> TaskRecord:
+        """Dequeue the next injection-intake record; raises on an empty
+        intake.  The A2.7 fair loop drains the intake to quiet between
+        budget windows (spec §21 'service reactor/timers'); records come
+        from the shared bounded InjectQueue (issue #69)."""
+        var rec = TaskRecord(0, 0)
+        if self._inject.try_pop(rec):
+            return rec
+        raise Error("runtime.pop_inject: injection intake is empty")
+
     def has_ready(mut self) -> Bool:
         """A1-compat probe: is there LOCAL work?  (The scheduler now uses
         has_local/has_remote; kept for the A1 callers.)"""
@@ -389,7 +461,6 @@ struct Runtime:
         cross-thread-safe for external producers)."""
         return self._enqueued + self._inject.accepted()
 
-
     def _bump_enqueued(mut self):
         self._enqueued += 1
 
@@ -404,6 +475,78 @@ struct Runtime:
     def skipped(self) -> Int:
         """Number of stale/duplicate records the scheduler loop skipped."""
         return self._skipped
+
+    # --- A2.7 fairness observability (issue #73; spec §21/§67/§71) ----------
+
+    def note_slice_local(mut self):
+        """Count one LOCALLY-SOURCED task slice served by the fair loop
+        (spawn/yield residency on this worker's own deque)."""
+        self._slices_local += 1
+
+    def note_slice_remote(mut self):
+        """Count one REMOTE-ready slice served (a wake of a STARTED task,
+        spec §19.2 — delivered but deferred at most K local slices)."""
+        self._slices_remote += 1
+
+    def note_slice_inject(mut self):
+        """Count one INJECTION-intake slice served (the E3 seam; issue #69's
+        inject queue drains here)."""
+        self._slices_inject += 1
+
+    def note_budget_reset(mut self):
+        """Count one fairness-budget RESET: the fair loop hit Budget.K
+        locally-sourced slices and serviced the other work classes before
+        resuming local work (spec §21 'run at most K ready tasks then
+        service reactor/timers')."""
+        self._budget_resets += 1
+
+    def note_service_sweep(mut self):
+        """Count one timer/reactor service pass between budget drains (the
+        caller's service callback — timer_service sweep and/or a reactor
+        nonblocking poll)."""
+        self._service_sweeps += 1
+
+    def note_yield(mut self):
+        """Count one COOPERATIVE yield (yield_now runnable re-registration):
+        the task's own handoff — a fresh budget window for the starve-watch."""
+        self._yields += 1
+
+    def note_starvation(mut self):
+        """Bump the kill-0 starve counter: a task ran more than Budget.K
+        CONSECUTIVE slices without a yield/park or an intervening service
+        sweep — the documented §67 cooperative limitation (no preemption in
+        MVP, §68), measured rather than hidden.  Surfaced to the benchmarks
+        (E8, issue #74)."""
+        self._starvation_events += 1
+
+    def slices_local(self) -> Int:
+        """Locally-sourced slices served (spawn/yield residency)."""
+        return self._slices_local
+
+    def slices_remote(self) -> Int:
+        """Remote-ready slices served (STARTED-task wakes, spec §19.2)."""
+        return self._slices_remote
+
+    def slices_inject(self) -> Int:
+        """Injection-intake slices served (E3 seam)."""
+        return self._slices_inject
+
+    def budget_resets(self) -> Int:
+        """Fairness-budget resets (deferred local work after K local slices)."""
+        return self._budget_resets
+
+    def service_sweeps(self) -> Int:
+        """Timer/reactor service passes between budget drains."""
+        return self._service_sweeps
+
+    def yields(self) -> Int:
+        """Cooperative yield_now re-registrations observed."""
+        return self._yields
+
+    def starvation_events(self) -> Int:
+        """Kill-0 starve counter: never-yielding tasks that held a worker
+        past Budget.K consecutive slices (spec §67/§71)."""
+        return self._starvation_events
 
     # --- A1.5 fiber-path toggle (issue #53) ---------------------------------
 
