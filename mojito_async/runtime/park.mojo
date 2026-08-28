@@ -93,13 +93,26 @@ def unpark_current[R: ResultValue](
       - an already-RUNNABLE task is a no-op (enqueue-once, Q6);
       - a WAITING task at a STALE `required_gen` is rejected silently —
         nothing is claimed, nothing enqueued (fresh-generation guard);
-      - a COMPLETED/CANCELLED task raises (the A1 loud surface; a stale
-        wake never silently double-enqueues).
+      - a COMPLETED/CANCELLED task raises (the A1 loud surface) — but ONLY
+        for a genuinely illegal NON-duplicate wake (H2, PR #109).
 
     Generation consumption (T5, issue #51): pass `required_gen` = the
     generation a producer captured at WAITING commit to REJECT a stale wake
     from a previous epoch.  Pass 0 (default) to always claim when WAITING
-    (today's single worker: the epoch is trivially current)."""
+    (today's single worker: the epoch is trivially current).
+
+    H2 (PR #109) — DUPLICATE/STALE claims are QUIET NO-OPs in EVERY task
+    state: a wake whose `required_gen` no longer matches the current
+    generation (stale) or whose epoch was already claimed (duplicate — the
+    TCB's claimed-epoch marker) returns WITHOUT enqueueing and WITHOUT
+    raising, no matter where the task is — RUNNING, PARKING, RUNNABLE,
+    COMPLETED or CANCELLED.  A racing duplicate must never corrupt a later
+    park via a spurious early latch, and must never raise against a task
+    that legitimately completed after the winning claim.  The loud
+    IllegalTransitionError surface is preserved ONLY for genuinely illegal
+    NON-duplicate wakes: a fresh wake (no epoch claim, e.g. `required_gen`
+    = 0, the A1 single-worker call form) delivered to a COMPLETED/CANCELLED
+    task (t15/t27 assert this)."""
     if h.state() == TaskControlBlock.RUNNABLE:
         return
     var owner = _owner_rt(h, rt)
@@ -116,8 +129,12 @@ def unpark_current[R: ResultValue](
     elif st == TaskControlBlock.PARKING or st == TaskControlBlock.RUNNING:
         # Early-wake window: latch readiness for the parker's VALIDATE
         # re-check (A0-T11).  No claim, no transition, no enqueue here —
-        # the parker's COMMIT decides the unwind (Q6).
-        h.tcb()[].set_early_readiness()
+        # the parker's COMMIT decides the unwind (Q6).  A STALE or
+        # DUPLICATE claim (H2) must NOT latch: the epoch it references is
+        # already consumed, so latching would fabricate a phantom early
+        # wake for the task's NEXT park.
+        if not _stale_or_duplicate(h, required_gen):
+            h.tcb()[].set_early_readiness()
     owner[].remote_queue()[]._guard.unlock()
     if claimed:
         # STARTED with a known owner: deliver to the OWNER's REMOTE-ready
@@ -126,10 +143,33 @@ def unpark_current[R: ResultValue](
         return
     if st == TaskControlBlock.WAITING or st == TaskControlBlock.PARKING or st == TaskControlBlock.RUNNING:
         return  # stale/duplicate rejected, or early latch delivered
-    # COMPLETED / CANCELLED / NEW: preserve the A1 loud surface — the
-    # transition raises for the illegal pairs (a stale wake never silently
-    # enqueues twice).
+    # COMPLETED / CANCELLED / NEW: the loud A1 surface applies ONLY to
+    # genuinely illegal NON-duplicate wakes (a stale wake never silently
+    # enqueues twice).  A stale/duplicate generation claim is a quiet no-op
+    # here too — the racing duplicate that lands after the task completed
+    # must not raise (H2).
+    if _stale_or_duplicate(h, required_gen):
+        return
     h.tcb()[].transition(TaskControlBlock.RUNNABLE)
+
+
+def _stale_or_duplicate[R: ResultValue](
+    h: JoinHandle[R],
+    required_gen: Int,
+) -> Bool:
+    """H2 (PR #109): True when the wake carries an epoch that is NOT a live
+    first delivery — `required_gen` != 0 AND either the task's generation
+    has moved past it (STALE: the epoch is gone, superseded by a re-park or
+    consumed) or the epoch was already claimed by a previous wake
+    (DUPLICATE: the TCB's claimed-epoch marker matches).  Such a wake is a
+    QUIET NO-OP in every task state — never a claim, never an early latch,
+    never a transition, never a raise.  Only the caller-visible state under
+    the OWNER's remote-ready queue guard feeds this (the guard serializes
+    it against park_commit and all other wake legs)."""
+    if required_gen == 0:
+        return False
+    var t = h.tcb()[]
+    return t.generation() != required_gen or t.claimed_epoch() == required_gen
 
 
 def _owner_rt[R: ResultValue](
