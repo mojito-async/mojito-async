@@ -14,17 +14,45 @@
 # Extern-free, allocation-discipline kept: the Worker holds no task storage;
 # every TaskControlBlock cell is caller-allocated.
 from mojito_async.integration.sys import BytePtr
-from mojito_async.runtime.runtime import Runtime, create
 from mojito_async.runtime.scheduler import scheduler_loop
+from mojito_async.vendor.mojito_sys import (
+    NativeThread,
+    NativeTlsKey,
+    make_native_thread,
+    tls_get,
+)
 
 
 struct Worker:
-    """One cooperative worker = one Runtime + run/drive entry points."""
+    """One worker = one Runtime + (A1) run/drive entry points + (A2.1)
+    per-OS-thread identity: worker id, the owned NativeThread handle once
+    the pool spawns it, and the current_worker TLS key this worker's thread
+    writes at entry (issue #67).  The A1 motions are UNCHANGED: on ONE
+    worker everything is cooperative — run the root task, or drive the
+    runnable queue with a statically-known dispatcher.  A2.1 adds the
+    OS-thread carrier; the scheduler_loop integration on the worker thread
+    is the queue lane's (#68) E2-OWNED seam fill.
+    """
 
     var _runtime: Runtime
+    var _id: Int
+    var _thread: NativeThread
+    var _started: Bool
+    var _tls_current_worker: NativeTlsKey
 
     def __init__(out self):
         self._runtime = create()
+        self._id = 0
+        self._thread = make_native_thread()
+        self._started = False
+        self._tls_current_worker = NativeTlsKey()
+
+    def __init__(out self, id: Int):
+        self._runtime = create()
+        self._id = id
+        self._thread = make_native_thread()
+        self._started = False
+        self._tls_current_worker = NativeTlsKey()
 
     # --- access ----------------------------------------------------------
 
@@ -33,6 +61,34 @@ struct Worker:
 
     def handle(mut self) -> UnsafePointer[Runtime, MutAnyOrigin]:
         return UnsafePointer[Runtime, MutAnyOrigin](to=self._runtime)
+
+    def id(mut self) -> Int:
+        """Distinct per-worker id (0 for an unpooled A1 worker; the pool
+        numbers its workers 0..N-1)."""
+        return self._id
+
+    def thread(mut self) -> NativeThread:
+        """The OS thread this worker runs on once the pool spawned it."""
+        return self._thread
+
+    def started(mut self) -> Bool:
+        """True once the pool spawned this worker's OS thread."""
+        return self._started
+
+    def tls_key(mut self) -> NativeTlsKey:
+        return self._tls_current_worker
+
+    def mark_started(mut self, t: NativeThread, key: NativeTlsKey):
+        """Pool-owned: bind the spawned thread + the current_worker TLS key."""
+        self._thread = t
+        self._tls_current_worker = key
+        self._started = True
+
+    def tls_worker_ptr(mut self) -> BytePtr:
+        """Read THIS OS thread's current_worker slot (coarse entry-only
+        value; address 0 when unset).  Only the worker thread itself reads
+        its own slot — the pool side never calls this."""
+        return tls_get(self._tls_current_worker)
 
     # --- entry points -------------------------------------------------------
 
@@ -52,7 +108,6 @@ struct Worker:
 
     def shutdown(mut self) -> None:
         self._runtime.shutdown()
-
 
 # Module-level factory (b2 has no static methods).
 def make_worker() -> Worker:
