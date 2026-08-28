@@ -50,9 +50,12 @@ fi
 # M10 of PR #109): their cross-thread handshake cells are PLAIN Ints
 # published with release/acquire fences, so these drivers MUST be built at
 # -O 0 — a higher optimization level can hoist the plain handshake reads and
-# deadlock or desynchronize the driver.  Every OTHER AOT driver keeps the
-# default optimization level (the suite is NOT rebuilt at -O 0).
-AOT_O0_DRIVERS="t34_two_phase_aot t34b_affinity_aot t34c_duplicate_wake_aot"
+# deadlock or desynchronize the driver.  A2.6 t35 (PR #110, issue #72): the
+# wake-burst probe trips a 1.0.0b2 codegen SEGV at -O 3, so it also builds
+# at -O 0 (the unoptimized build lowers the burst loop cleanly).  Every
+# OTHER AOT driver keeps the default optimization level (the suite is NOT
+# rebuilt at -O 0).
+AOT_O0_DRIVERS="t34_two_phase_aot t34b_affinity_aot t34c_duplicate_wake_aot t35_idle_sleep_aot"
 
 failures=0; reds=0; matrix=""
 
