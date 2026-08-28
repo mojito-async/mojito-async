@@ -82,31 +82,22 @@ def scheduler_loop[F: def(mut Runtime, Int, Int, BytePtr) raises -> Int, R: Resu
     mut rt: Runtime,
     dispatcher: F,
     ud: BytePtr,
-    inject: Optional[UnsafePointer[InjectQueue, MutAnyOrigin]] = None,
-    inject_budget: Int = 4,
 ) raises -> Int:
-    """Drive the ONE worker until its runnable queue is quiet.
+    """Drive the ONE worker until its runnable queue is quiet (A1 single
+    worker, local FIFO only).  For each popped record, SKIP it (counted)
+    when its TCB is not RUNNABLE (stale duplicate — never dispatched), else
+    hand (rt, tcb_addr, task_id, ud) to `dispatcher`, which executes that
+    task to its next state.  Returns the number of records SERVED; skipped
+    records are observable via `rt.skipped()`.
 
-    For each popped record, SKIP it (counted) when its TCB is not RUNNABLE
-    (stale duplicate — never dispatched), else hand (rt, tcb_addr, task_id,
-    ud) to `dispatcher`, which executes that task to its next state.  A task
-    that parks (via `park_current`), yields (via `yield_now`), or is
-    completed is handled by the dispatcher over rt.  Returns the number of
-    records SERVED (observable progress); skipped records are observable via
-    `rt.skipped()`.
-
-    A2.3 (issue #69) bounded injection poll: when `inject` names the shared
-    MPSC InjectQueue, each loop slice services at most `inject_budget`
-    injected records before returning to the worker's local queue — the
-    fairness bound that keeps one busy worker from starving global intake
-    (spec §21/§86; E7 sharpens the budget).  TDD-RED SCAFFOLD: the poll
-    raises "not implemented" until the GREEN commit; callers passing no
-    `inject` keep the A1 single-worker semantics below unchanged.
+    A2.3 (issue #69): the GLOBAL-INJECTION poll is driver-drained through
+    the concrete InjectQueue seam (try_pop/pending) with the loop shape
+    documented below — the poll must live where the dispatcher is
+    statically known (b2: cross-module generic instantiation of the
+    multi-param loop is miscompiled, verified by probe).  This plain loop
+    keeps the A1 signature EXACTLY — so every existing callsite is
+    untouched and injection-free.
     """
-    if inject:
-        raise Error(
-            "scheduler_loop: a2.3 injection poll not implemented yet (issue #69)"
-        )
     var slices = 0
     while rt.has_ready():
         var rec = rt.pop_ready()
@@ -119,6 +110,39 @@ def scheduler_loop[F: def(mut Runtime, Int, Int, BytePtr) raises -> Int, R: Resu
         slices += 1
         _ = dispatcher(rt, rec.tcb_addr, rec.task_id, ud)
     return slices
+
+
+# ---------------------------------------------------------------------------
+# A2.3 (issue #69) — the bounded GLOBAL-INJECTION poll
+#
+# The poll's LOOP lives at the call site that statistically knows the task
+# bodies (this module's stated doctrine: "Executing an unstarted record is
+# a GENERIC operation performed at a call site that statically knows the
+# task body ... never dynamic dispatch through the record"; b2 additionally
+# miscompiles cross-module generic instantiations of this multi-param loop
+# shape, verified by probe).  The library therefore exposes the poll as the
+# CONCRETE InjectQueue seam — try_pop (by-ref TaskRecord), pending,
+# try_push/push — that a worker loop drives:
+#
+#     while True:
+#         polled = 0
+#         while polled < INJECT_BUDGET:        # bounded: global intake cannot
+#             rec = TaskRecord(0, 0)           # starve under a busy local
+#             if not inject[].try_pop(rec):    # queue; budget = fairness (E7
+#                 break                        # sharpens it)
+#             ... skip-or-dispatch(rec) ...
+#             polled += 1
+#         if rt has local work: dispatch ONE local record (continue)
+#         if inject[].pending() > 0: continue  # injection is the fallthrough
+#         break                                # when the worker is quiet
+#
+# Non-blocking discipline (ADR-009): try_pop never blocks; a FULL injection
+# queue never wedges a worker — the worker spins past injection and
+# services its LOCAL deques, retrying injection on the next loop iteration
+# (issue step 3).  Spec §18/§21 topology: every worker drains the shared
+# intake between its local/remote deques, so injected work is dequeued
+# identically on every worker — WITHOUT a global lock on the local hot path.
+# ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
 # A1.5 fiber seam (issue #53): the fiber-backed DRIVE lives in
