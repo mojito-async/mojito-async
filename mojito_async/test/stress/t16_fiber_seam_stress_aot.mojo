@@ -169,8 +169,9 @@ def dispatch(mut rt: Runtime, tcb_addr: Int, tid: Int, ud: BytePtr) raises -> In
     if cell[].slices[] > PARKS:
         cell[].finish[] = 1
     claim_running(h)
-    seam_drive(rt, cell[].slot)
-    if cell[].finish[] == 1:
+    var v = seam_drive(rt, cell[].slot)  # T3 frame-reported verdict
+    if not v.is_parked():
+        # body unwound (finish was pre-set): terminal slice
         seam_mark_completed(cell[].slot)
         h.tcb()[].transition(TaskControlBlock.COMPLETED)
         h.tcb()[].mark_result(IntResult(k))
@@ -179,8 +180,39 @@ def dispatch(mut rt: Runtime, tcb_addr: Int, tid: Int, ud: BytePtr) raises -> In
     return 1
 
 
+# --- destroy-while-suspended negative driver (T6, issue #53) ------------------
+# A dedicated single-task fiber that parks ONCE; the slot is then destroyed
+# while its frame is live: seam_destroy_slot MUST raise loudly (never free a
+# live reservation).  After the raise the task is woken and completes, and a
+# second destroy succeeds (terminal/inert).
+@export("t16_neg_entry")
+def t16_neg_entry(ud: BytePtr) abi("C"):
+    var fr = ud.bitcast[FiberFrame]()
+    seam_park_switch(fr)  # park mid-frame once (suspended); unwind on resume
+    return
+
+
+def dispatch_neg(mut rt: Runtime, tcb_addr: Int, tid: Int, ud: BytePtr) raises -> Int:
+    var slot = UnsafePointer[SeamSlot, MutAnyOrigin](
+        unsafe_from_address=Int(ud)
+    )
+    var h = _handle(tcb_addr, tid)
+    claim_running(h)
+    var v = seam_drive(rt, slot)  # T3 verdict
+    if not v.is_parked():
+        seam_mark_completed(slot)
+        h.tcb()[].transition(TaskControlBlock.COMPLETED)
+        h.tcb()[].mark_result(IntResult(0))
+    else:
+        fiber_suspend_current(rt, h, SUSPEND_PARK)
+    return 1
+
+
 # --- per-task cell layout inside one Int scratch block ----------------------
-comptime CELL_INTS = Int(5)  # slices, parks, marker, ok, finish (tid maps via kof)
+# CELL_INTS = 6: slices, parks, marker, ok, finish AND tid occupy one row;
+# capping at 5 wrote tid (+5) past the row into the next task's first cell —
+# a real 8-byte heap OOB at task 29 (fold fix, issue #53).
+comptime CELL_INTS = Int(6)
 
 
 def main() raises:
@@ -347,6 +379,59 @@ def main() raises:
     c_free(UnsafePointer[Byte, MutAnyOrigin](unsafe_from_address=Int(ibuf)))
     c_free(UnsafePointer[Byte, MutAnyOrigin](unsafe_from_address=Int(kof)))
     c_free(UnsafePointer[Byte, MutAnyOrigin](unsafe_from_address=Int(warm)))
+
+    # ---- destroy-while-suspended negative (T6, issue #53) -----------------
+    var slot_neg_block = c_malloc(seam_slot_stride())
+    var slot_neg = UnsafePointer[SeamSlot, MutAnyOrigin](
+        unsafe_from_address=Int(slot_neg_block)
+    )
+    slot_neg[0] = make_seam_slot()
+    var neg_ud = Int(slot_neg)
+    var nsbuf = UnsafePointer[BytePtr, MutUntrackedOrigin](
+        unsafe_from_address=Int(c_malloc(2 * 8))
+    )
+    if ms_stack_alloc(stack_bytes, nsbuf, nsbuf + 1) != 0:
+        failures.append("negative driver stack alloc failed")
+    var ns_neg = NativeStack(nsbuf[0], (nsbuf + 1)[0])
+    seam_bind_slot(
+        slot_neg, ns_neg, entry_pointer["t16_neg_entry"](),
+        UnsafePointer[Byte, MutAnyOrigin](unsafe_from_address=0x99),
+    )
+    var rt3 = create()
+    var tcb_neg = TB.create()
+    var h_neg = spawn(
+        rt3, UnsafePointer[TB, MutAnyOrigin](to=tcb_neg), 0
+    )
+    var ud_neg = UnsafePointer[Byte, MutAnyOrigin](unsafe_from_address=neg_ud)
+    var ud_neg_bp = ud_neg.bitcast[Byte]()
+    var served_neg = scheduler_loop(rt3, dispatch_neg, ud_neg_bp)
+    if served_neg != 1:
+        failures.append("negative drive served " + String(served_neg))
+    if h_neg.state() != TaskControlBlock.WAITING:
+        failures.append("negative fiber not WAITING after drive")
+    # destroy-while-suspended MUST raise loudly
+    var destroyed_live = False
+    try:
+        seam_destroy_slot(slot_neg)
+    except e:
+        if "parked/suspended" in String(e):
+            destroyed_live = True
+    if not destroyed_live:
+        failures.append("destroy-while-suspended did NOT raise loudly")
+    # wake, complete, then destroy succeeds (terminal/inert)
+    fiber_resume_current(rt3, h_neg)
+    if h_neg.state() != TaskControlBlock.RUNNABLE:
+        failures.append("negative wake not RUNNABLE")
+    var served_neg2 = scheduler_loop(rt3, dispatch_neg, ud_neg_bp)
+    if served_neg2 != 1:
+        failures.append("negative final drive served " + String(served_neg2))
+    if not h_neg.is_completed():
+        failures.append("negative fiber did not complete after wake")
+    seam_destroy_slot(slot_neg)  # inert now: must NOT raise
+    if slot_neg[].fiber.alive():
+        failures.append("negative slot fiber still alive after destroy")
+    c_free(slot_neg_block)
+    c_free(UnsafePointer[Byte, MutAnyOrigin](unsafe_from_address=Int(nsbuf)))
 
     if len(failures) == 0:
         print("T16 fiber seam stress: parks=100020 drives="
