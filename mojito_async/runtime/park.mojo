@@ -111,6 +111,15 @@ def unpark_current[R: ResultValue](
 #   unpark_current     — as above, claiming the waiter's generation EXACTLY
 #                        ONCE per epoch (spec §23; A0-T11/A0-T12).
 #
-# That adapter is the spike's event.mojo park_pipeline promoted into this
-# module when #2 lands; A1 ships only the WAITING-side pair this worker can
-# actually race on (which is none).
+#
+# A2.1 (issue #67) NAME RESERVATIONS (surface only — this lane proves the
+# pool threads can COEXIST with the A1 park kernel; the two-phase protocol
+# itself is E5's):
+#   - park_current / unpark_current stay the WAITING-side pair; their
+#     signatures are unchanged and remain the single park/wake kernel.
+#   - the A2 worker loop (thread_entry.pool_worker_loop, E2-OWNED seam)
+#     polls the pool's shutdown latch as its IDLE motion until E6 provides
+#     park_current-on-NativeEvent; a worker NEVER blocks inside
+#     park_current while holding the pool latched.
+#   - cross-worker wakes route through wake_target_worker (scheduler.mojo,
+#     A1.3 affinity seam) + the E5 adapter; nothing here changes for A2.1.
