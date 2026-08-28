@@ -124,6 +124,17 @@ void ms_stack_free(void *base) {
     }
 }
 
+int ms_stack_is_live(void *base) {
+    /* 1 when `base` is a still-registered reservation (not freed), 0 when it
+     * was never allocated or has already been ms_stack_free'd (munmap'd). */
+    if (base == NULL || g_resv == NULL)
+        return 0;
+    for (size_t i = 0; i < g_resv_len; ++i)
+        if (g_resv[i].base == base)
+            return 1;
+    return 0;
+}
+
 size_t ms_stack_total_size(void) {
     /* Sum of all live reservations, guard pages included. */
     size_t total = 0;
