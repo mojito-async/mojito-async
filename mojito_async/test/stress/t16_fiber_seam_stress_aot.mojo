@@ -15,14 +15,13 @@
 #     drives  = N_WAVE * (PARKS + 1)            = 100_050  (dispatch slices)
 #     switches= 2 * drives                      = 200_100  (ms_ctx_switch)
 #
-# LIVE-FIBER BOUND (substrate constraint, verified): the vendored
-# mojito-sys bookkeeping keeps a FIXED 64-row resume table with no eviction
-# (aarch64_switch.S: _ms_resume_tab; the table full path traps loudly, brk
-# #0x67).  Every fiber claims 2 rows (its own ctx + its caller ctx), so a
-# process can host at most 32 live fibers.  30 live fibers (60 rows) is the
-# substrate-safe geometry for the 100k lifecycle; N-way interleave beyond
-# 32 concurrent fibers needs the EPIC #2 resume-table rework (recorded
-# consumption point, same as the #52 pool/fiber ownership transfer).
+# LIVE-FIBER BOUND (removed in a2/00, issue #101): the old vendored
+# mojito-sys bookkeeping kept a FIXED 64-row resume table with no eviction
+# (aarch64_switch.S: _ms_resume_tab), capping the process at 32 live fibers.
+# The rework replaced that table/globals with an O(1) in-ctx return link, so
+# there is NO live-fiber cap (see t27_concurrency_aot, which drives 40).
+# 30 live waves is kept here as the fixed geometry of the 100k exact-counter
+# proof (drives==100050, switches==200100).
 #
 # Assertions:
 #   - every task COMPLETED; every task parked exactly PARKS times; exact-
@@ -80,7 +79,7 @@ def _iso_exit(code: Int32) abi("C"): ...
 comptime TB = TaskControlBlock[IntResult]
 comptime SUSPEND_PARK = Int(3)  # SuspendReason.PARK
 
-comptime N_WAVE = Int(30)       # live tasks (<= 32: substrate resume-table bound)
+comptime N_WAVE = Int(30)       # live waves in the 100k exact-counter proof
 comptime PARKS = Int(3334)      # park episodes per task -> 100,020 parks
 comptime N_PARK_TOTAL = Int(100020)
 

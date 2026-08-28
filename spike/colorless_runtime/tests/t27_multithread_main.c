@@ -7,24 +7,22 @@
  * each switching its OWN set of fibers, asserting every fiber resumes exactly
  * its own frame (per-thread, per-fiber exact-resume markers + per-thread tags).
  * This is the regression probe for the cross-OS-thread clobber that makes the
- * frozen single-threaded spike unsafe under M:N (brief; the S2.2 2-worker
- * recipe).
+ * frozen single-threaded spike unsafe under M:N (the S2.2 2-worker recipe).
  *
  * RED (frozen substrate): ms_ctx_switch() writes process-global
  * _ms_last_from/_ms_last_to on every switch, and the exit trampoline reads
- * _ms_last_to to learn its own ctx (aarch64_switch.S).  The read is on a
- * fiber's FIRST entry only, and only a second thread's switch that lands
- * between a thread's own switch-write and that trampoline read clobbers it.
- * To widen that window deterministically-in-practice we create MANY fibers
- * per thread: every fiber's first entry fires the window once, so with
- * NFIBER per thread running concurrently the clobber is reached on a typical
- * schedule (A reads the OTHER thread's _ms_last_to, stashes the wrong self,
- * and later resumes the WRONG context -> cross-wired markers/tags or a
- * resume-table miss, brk #0x65, process crash).  The driver reports RED/FAIL
- * (no PASS).  LIMITATION (documented): the precise interleaving is
- * scheduler-dependent, so on a single, benign schedule the probe may not
- * observe a clobber; it is re-run and, on GNU/POSIX common schedulers with
- * real cores, the many-first-entry storm makes it reliably red on frozen.
+ * _ms_last_to to learn its own ctx (aarch64_switch.S).  That read is on a
+ * fiber's FIRST entry only; only a second thread's switch that lands between
+ * a thread's own switch-write and that trampoline read clobbers it.  To make
+ * the window observable in practice we create MANY fibers per thread: every
+ * fiber's first entry fires the window once, so with FIBERS per thread
+ * running concurrently the clobber is reached on a typical schedule (a
+ * worker reads the OTHER thread's _ms_last_to, stashes the wrong self, and
+ * later resumes the WRONG context -> cross-wired markers/tags or a resume-
+ * table miss, brk #0x65, process crash).  The driver reports RED/FAIL.
+ * LIMITATION (documented): the precise interleaving is scheduler-dependent,
+ * so on a single, benign schedule the probe may not observe a clobber; it is
+ * re-run and the many-first-entry storm makes it reliably red on frozen.
  * The rework removes the shared writable globals entirely, so the probe is
  * deterministically GREEN there (every run).
  *
@@ -37,7 +35,7 @@
  * Each worker builds FIBERS fibers over its own buffers and runs each fiber
  * once: enter (first entry -> trampoline), park, resume to completion.  The
  * per-fiber marker + the per-thread tag must survive each park/resume.
- * A slight spin-diceke loop makes the two workers start together for overlap.
+ * A go-barrier releases both workers together for overlap.
  *
  * Verdict: prints "PASS" only when every worker reports every fiber exact
  * (exit 0); else "FAIL" (exit 1); a trap/crash is a FAIL (no verdict).
@@ -74,14 +72,13 @@ static runner_t R[N_WORKERS];
 
 static volatile int go = 0;
 
-/* The fiber entry: record a frame-local on FIRST entry, park, verify exact
- * resume point (marker + per-thread tag), then return (completion). */
+/* The fiber entry: record a frame-local on FIRST entry, park, verify the
+ * exact resume point (marker + per-thread tag), then return (completion). */
 static void fiber_entry(void *ud)
 {
-    /* ud points at this fiber's (runner_id, fiber_index, tag) triple */
-    unsigned *tri = (unsigned *)ud;
-    int wid   = (int)tri[0];
-    int fk    = (int)tri[1];
+    unsigned *tri = (unsigned *)ud;   /* (wid, fk, tag) side channel */
+    int wid = (int)tri[0];
+    int fk  = (int)tri[1];
     runner_t *r = &R[wid];
     int local_slot = 0;
     uintptr_t lp = (uintptr_t)&local_slot;
@@ -89,10 +86,10 @@ static void fiber_entry(void *ud)
     if (r->markers[fk] == 0)
         r->markers[fk] = lp;
 
-    /* park once */
+    /* park once: switch back to this worker's driver context */
     ms_ctx_switch(&fiber_ctx[wid][fk], &driver_ctx[wid][fk]);
 
-    /* -- exact resume point -- same frame-local, same tag */
+    /* -- exact resume point -- same frame-local, same per-thread tag */
     if (r->markers[fk] != lp || r->tag != (0xABCDu + (unsigned)wid))
         r->ok[fk] = 0;
     r->done++;
@@ -105,7 +102,6 @@ static void *worker(void *arg)
 
     r->tag = 0xABCDu + (unsigned)wid;
 
-    /* one small heap cell per fiber: (wid, fk, tag) side-channel */
     unsigned *tri = (unsigned *)calloc(FIBERS, 3 * sizeof(unsigned));
     if (!tri)
         return NULL;
@@ -115,6 +111,7 @@ static void *worker(void *arg)
         tri[fk * 3 + 0] = (unsigned)wid;
         tri[fk * 3 + 1] = (unsigned)fk;
         tri[fk * 3 + 2] = r->tag;
+        r->ok[fk] = 1;   /* initialize before the fiber ever runs */
         ms_ctx_make(&fiber_ctx[wid][fk], top, fiber_entry, &tri[fk * 3]);
     }
 
