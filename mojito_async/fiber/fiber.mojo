@@ -15,7 +15,7 @@
 #     _caller — the driver's (caller's) continuation, saved by the first
 #               resume() and restored every time the fiber suspends.
 #
-# Layout: the two 176-byte save areas, the 24-byte FiberFrame sidecar and
+# Layout: the two 168-byte save areas, the 24-byte FiberFrame sidecar and
 # the entry/userdata scratch live in ONE malloc'd heap block
 # (2*MS_CTX_SIZE + 40 bytes, 16-aligned), referenced by addresses, freed in
 # destroy().  This keeps the Fiber struct all-scalar.
@@ -70,7 +70,6 @@
 #     pointers into its block slots).
 #   - resume()/suspend() raise on an unbound (no stack) fiber.
 #   - after destroy(), the fiber is an inert shell (alive() == False);
-#     a second destroy() is a no-op.
 from mojito_async.vendor.mojito_sys import (
     BytePtr,
     MS_CTX_SIZE,
@@ -82,7 +81,7 @@ from mojito_async.vendor.mojito_sys import (
     ms_live_stack_count,
     stack_free,
 )
-
+from mojito_async.fiber.continuation import FiberMotion
 
 # Sidecar handed to the entry thunk (as the ms_ctx_make userdata, unmodified).
 # self_ctx/caller_ctx are the addresses of this Fiber's two save areas;
@@ -103,14 +102,21 @@ struct FiberFrame:
 # All state is scalar addresses; the bodies live OUT of line (one heap block +
 # the ms_stack_alloc'd synthetic stack).  MOVABLE (NOT ImplicitlyCopyable): a
 # copy is a COMPILE error, so destruction stays single-owner by construction.
-struct Fiber(Movable, ImplicitlyDeletable):
+struct Fiber(Movable, ImplicitlyDeletable, FiberMotion):
     # ms_stack_alloc base (0 = not allocated; passed to ms_stack_free) and the
     # initial SP of the synthetic stack.
     # Layout constants for the out-of-line heap block (single source of truth
     # for the block size AND the set_targets/accessor offsets).
     comptime FRAME_BYTES = 24   # sizeof(FiberFrame): 3 BytePtr
     comptime SCRATCH_BYTES = 16  # entry fn ptr + userdata ptr
-    comptime TAIL_BYTES = Self.FRAME_BYTES + Self.SCRATCH_BYTES
+    # Cross-switch flags (3 Ints) live in the heap block tail so the fiber
+    # body (running on its own stack) and the driver see ONE consistent copy:
+    # b2 keeps struct fields register-resident across the register switch, so
+    # a struct-field flag written in one context would never be observed by
+    # the other.  Heap-thru-pointer fields DO synchronize across the opaque
+    # ms_ctx_switch (identical to the driver payload channel).
+    comptime FLAG_BYTES = 24
+    comptime TAIL_BYTES = Self.FRAME_BYTES + Self.SCRATCH_BYTES + Self.FLAG_BYTES
     # Oversubscription cap (A1.1 fold, issue #49): the vendored substrate's
     # process-global resume table holds 64 rows (2 per fiber), so the process
     # can have at most 32 concurrently live fibers; a 33rd saturates the table
@@ -134,18 +140,6 @@ struct Fiber(Movable, ImplicitlyDeletable):
     # True while the fiber has yielded back to the driver and is waiting for
     # the next resume (set by suspend(), cleared by a resume() that re-enters).
     var _suspended: Bool
-    # A1.3 (issue #51): the WORKER identity this fiber is affine to once
-    # started (spec §19.2 / ADR-006).  0 = not pinned.  b2 has no TLS, so
-    # worker identity is threaded explicitly: the creating worker (EPIC #2's
-    # pool) calls set_owner() before the first resume; the owner becomes
-    # OBSERVABLE only at first body entry (STARTED) and is immutable after.
-    var _owner: Int
-
-    # A1.3 (issue #51) — ADR-007: live stacks never relocate.  In fault-
-    # enabled builds the switch helpers assert stack-locality before every
-    # switch; the assertion is a single compare (no allocation).
-    comptime FAULT_CHECKS = True
-
     # True once the body unwound (the driver/carrier called mark_completed()).
     # resume() raises on a completed fiber instead of letting the asm
     # trampoline re-entry trap (brk 0x66).
@@ -160,7 +154,6 @@ struct Fiber(Movable, ImplicitlyDeletable):
         self._prepared = False
         self._started = False
         self._suspended = False
-        self._owner = 0
         self._completed = False
 
     # All-scalar ctor binding an existing reservation: `stack` (base/top from
@@ -173,7 +166,6 @@ struct Fiber(Movable, ImplicitlyDeletable):
         self._prepared = False
         self._started = False
         self._suspended = False
-        self._owner = 0
         self._completed = False
 
     # -- queries -----------------------------------------------------------
@@ -182,51 +174,30 @@ struct Fiber(Movable, ImplicitlyDeletable):
         return self._stack != 0
 
     def has_resumed(self) -> Bool:
-        """True once the fiber's first resume() has prepared+entered the
-        fresh context (the frozen batch seam spelling; alias of the spec
-        §14.1 `started` flag that is_started() also reports)."""
-        return self._started
-
-    def is_started(self) -> Bool:
-        """Spec §14.1 `started`: True exactly once the fiber has entered body
-        entry (set on the FIRST resume — not at construction)."""
-        return self._started
-
-    def owner_worker(self) -> Int:
-        """The worker identity this started fiber is affine to (spec §19.2 /
-        ADR-006).  An unstarted fiber has NO owner pinned until first entry:
-        0 means not started / no owner.  Once STARTED this never changes —
-        set_owner() rejects a conflicting re-pin."""
-        if not self._started:
-            return 0
-        return self._owner
-
-    def assert_never_relocated(self) raises:
-        """ADR-007 (issue #51): the live stack address is fixed at the first
-        ms_stack_alloc and never reassigned; this Fiber only ever releases
-        that SAME reservation (in destroy()).  Called from the switch helpers
-        in fault-enabled builds (FAULT_CHECKS) and by drivers/EPIC #2 as a
-        direct policy assertion.  Raises only on a fiber with no live stack
-        (unbound/destroyed)."""
-        if self._stack == 0:
-            raise Error(
-                "fiber.assert_never_relocated: no live stack (unbound/destroyed)"
-            )
+        if self._block == 0:
+            return False
+        return self._started_flag()[0] == 1
 
     def is_suspended(self) -> Bool:
-        return self._suspended
+        if self._block == 0:
+            return False
+        return self._suspended_flag()[0] == 1
 
     # True once the body unwound (mark_completed set it).  The continuation
     # seam (#50/#96) reconciles on finished()/is_suspended(); a caller should
     # never resume() a finished fiber (resume() raises loudly instead).
     def finished(self) -> Bool:
-        return self._completed
+        if self._block == 0:
+            return False
+        return self._completed_flag()[0] == 1
 
     # Driver/carrier seam: record that the body unwound (the single-shot
     # continuation is done).  No-op-safe: does not itself free anything
     # (destroy() owns teardown).
     def mark_completed(mut self):
         self._completed = True
+        if self._block != 0:
+            self._completed_flag()[0] = 1
 
     def stack_ptr(self) -> NativeStack:
         return NativeStack(
@@ -267,6 +238,28 @@ struct Fiber(Movable, ImplicitlyDeletable):
         )
         return UnsafePointer[Byte, MutAnyOrigin](unsafe_from_address=p[])
 
+    # Cross-switch flag accessors (heap).  Each returns an opaque pointer into
+    # the fiber's heap block; reads/writes through them are honored as memory
+    # by the compiler across the register switch.
+    def _flag_base(self) -> Int:
+        return self._block + 2 * MS_CTX_SIZE + Self.FRAME_BYTES + Self.SCRATCH_BYTES
+
+    def _suspended_flag(self) -> UnsafePointer[Int, MutAnyOrigin]:
+        return UnsafePointer[Int, MutAnyOrigin](unsafe_from_address=self._flag_base())
+
+    def _started_flag(self) -> UnsafePointer[Int, MutAnyOrigin]:
+        return UnsafePointer[Int, MutAnyOrigin](unsafe_from_address=self._flag_base() + 8)
+
+    def _completed_flag(self) -> UnsafePointer[Int, MutAnyOrigin]:
+        return UnsafePointer[Int, MutAnyOrigin](unsafe_from_address=self._flag_base() + 16)
+
+    def _zero_flags(mut self):
+        if self._block == 0:
+            return
+        self._suspended_flag()[0] = 0
+        self._started_flag()[0] = 0
+        self._completed_flag()[0] = 0
+
     # Wire the entry/userdata addresses into the heap scratch.  This is what
     # a late-bound driver calls AFTER make_fiber/bind with @export'd entry
     # pointers materialized at the driver's own scope.
@@ -281,40 +274,26 @@ struct Fiber(Movable, ImplicitlyDeletable):
         )
         up[] = ud
 
-    # -- A1.3 affinity (issue #51) ------------------------------------------
-
-    # Pin the owner WORKER this fiber is affine to (ADR-006).  Called by the
-    # worker that will START the fiber (the sole worker today; EPIC #2's pool
-    # pins at spawn, before the first resume).  Once the fiber has STARTED
-    # (entered body entry) the owner is immutable: a re-pin to a DIFFERENT
-    # worker raises; a re-pin to the SAME worker is an idempotent no-op.
-    def set_owner(mut self, worker_id: Int) raises:
-        if self._started:
-            if self._owner != worker_id:
-                raise Error(
-                    "fiber.set_owner: owner is immutable once started "
-                    "(pinned to " + String(self._owner) + ")"
-                )
-            return
-        self._owner = worker_id
-
     # -- switching ---------------------------------------------------------
 
+    # Driver side: save the current (driver) registers into the caller slot
+    # and resume this fiber.  On the FIRST call this also prepares the fresh
+    # context (ms_ctx_make) bound to the entry callback; afterwards it resumes
+    # the fiber at its exact suspension point.
     def resume(mut self) raises:
-        # A completed fiber's body has unwound; re-entering it through the asm
-        # trampoline would trap (brk 0x66).  Raise a loud Error instead.
-        if self._completed:
-            raise Error("fiber.resume: fiber already complete")
         if self._stack == 0:
             raise Error("fiber.resume: no bound stack")
-        comptime if Self.FAULT_CHECKS:
-            self.assert_never_relocated()  # ADR-007 before every switch
         # The public `Fiber(stack)` ctor builds a Fiber with no out-of-line
         # block yet (deferred to a factory/bind); resume() writes the sidecar
         # into that block, so guard _block (not just _stack) to raise rather
         # than SEGV on an un-bound block.
         if self._block == 0:
             raise Error("fiber.resume: no bound block (Fiber not factory-bound)")
+        # A completed fiber's body has unwound; re-entering it through the asm
+        # trampoline would trap (brk 0x66).  Raise a loud Error instead.  Read
+        # the heap flag (synced cross-switch).
+        if self._completed_flag()[0] != 0:
+            raise Error("fiber.resume: fiber already complete")
         if not self._prepared:
             self._prepared = True
             var fp = self.frame_ptr()
@@ -325,8 +304,10 @@ struct Fiber(Movable, ImplicitlyDeletable):
             ms_ctx_make(
                 self.fiber_ctx(), self.stack_top(), self.entry_ptr(), fp
             )
-            self._started = True  # spec §14.1: STARTED at first body entry
+            self._started = True
+            self._started_flag()[0] = 1
         self._suspended = False
+        self._suspended_flag()[0] = 0
         ms_ctx_switch(self.caller_ctx(), self.fiber_ctx())
 
     # Fiber side: save this fiber's registers and resume the driver.  Meant
@@ -336,16 +317,15 @@ struct Fiber(Movable, ImplicitlyDeletable):
     def suspend(mut self) raises:
         if self._stack == 0:
             raise Error("fiber.suspend: no bound stack")
-        comptime if Self.FAULT_CHECKS:
-            self.assert_never_relocated()  # ADR-007 before every switch
         # Guard _block too (mirror of resume()): the public Fiber(stack) ctor
         # has no block yet; a driver suspending a stack-only Fiber must raise,
         # not SEGV (fold T4).
         if self._block == 0:
             raise Error("fiber.suspend: no bound block (Fiber not factory-bound)")
-        if self._completed:
+        if self._completed_flag()[0] != 0:
             raise Error("fiber.suspend: fiber already complete")
         self._suspended = True
+        self._suspended_flag()[0] = 1
         ms_ctx_switch(self.fiber_ctx(), self.caller_ctx())
 
     # -- teardown ----------------------------------------------------------
@@ -362,8 +342,8 @@ struct Fiber(Movable, ImplicitlyDeletable):
             self._prepared = False
             self._started = False
             self._suspended = False
-            self._owner = 0
             self._completed = False
+            self._zero_flags()
         if self._block != 0:
             c_free(UnsafePointer[Byte, MutAnyOrigin](unsafe_from_address=self._block))
             self._block = 0
@@ -409,6 +389,7 @@ def bind(
 
     var f0 = Fiber(stack[])
     f0._block = block
+    f0._zero_flags()
     f0.set_targets(Int(entry), Int(userdata))
     dst[0] = f0^
 
@@ -438,5 +419,6 @@ def make_fiber(
     if block == 0:
         raise Error("fiber.make_fiber: heap allocation failed")
     f0._block = block
+    f0._zero_flags()
     f0.set_targets(Int(entry), Int(userdata))
     return f0 ^
