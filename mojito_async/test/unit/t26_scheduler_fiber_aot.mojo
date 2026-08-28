@@ -38,6 +38,7 @@
 # scheduler.mojo/park.mojo and are untouched.
 #
 # Verdict: exit 0 + "PASS"; any failure prints FAIL + raises (exit 1).
+from std.sys.intrinsics import inlined_assembly
 from mojito_async.vendor.mojito_sys import (
     BytePtr,
     NativeStack,
@@ -245,9 +246,12 @@ def _handle(tcb_addr: Int, tid: Int) -> JoinHandle[IntResult]:
 
 
 def _native_marker() -> Int:
-    """Address of a frame-local in THIS frame (worker native stack)."""
-    var slot: Int = 0
-    return Int(UnsafePointer[Int, MutAnyOrigin](to=slot))
+    """The live native SP (worker stack).  Read straight from the SP
+    register: the optimizer can neither reuse nor fold a frame slot, so
+    the depth signal survives codegen changes (aarch64, like the vendored
+    substrate; ADR-007 evidence)."""
+    var sp = inlined_assembly["mov ${0:x}, sp", UInt, constraints="=r"]()
+    return Int(sp)
 
 
 # fiber (entry or exact re-entry), then settle by the FRAME-REPORTED
@@ -312,7 +316,14 @@ def _loop_marked[F: def(mut Runtime, Int, Int, BytePtr) raises -> Int](
     if depth == 0:
         cell[0] = _native_marker()
         return scheduler_loop(rt, dispatcher, ud)
-    return _loop_marked(rt, dispatcher, ud, depth - 1, cell)
+    var out = _loop_marked(rt, dispatcher, ud, depth - 1, cell)
+    # Read THIS frame's SP after the child returns: the post-op keeps the
+    # frame alive, so the recursion cannot collapse (a tailcall would drop
+    # the depth signal this helper exists to measure).  cell accumulates
+    # one SP read per materialized frame: drive2 (depth 4) sums five
+    # frames' SPs, drive1 (depth 0) one — always distinct (ADR-007).
+    cell[0] = cell[0] + _native_marker()
+    return out
 
 
 comptime NATIVE_DEPTH_SHALLOW = Int(0)
@@ -426,9 +437,12 @@ def main() raises:
     var tcb_a = TB.create()
     var tcb_b = TB.create()
     var tcb_y = TB.create()
-    var h_a = spawn(rt, UnsafePointer[TB, MutAnyOrigin](to=tcb_a), 0)
-    var h_b = spawn(rt, UnsafePointer[TB, MutAnyOrigin](to=tcb_b), 0)
+    # A2.2 (issue #68): owner pop is LIFO, so register Y, B, A in that order
+    # -> the deque serves A (parks), B (completes), Y (yields + completes),
+    # preserving the drive-1 schedule.
     var h_y = spawn(rt, UnsafePointer[TB, MutAnyOrigin](to=tcb_y), 0)
+    var h_b = spawn(rt, UnsafePointer[TB, MutAnyOrigin](to=tcb_b), 0)
+    var h_a = spawn(rt, UnsafePointer[TB, MutAnyOrigin](to=tcb_a), 0)
     sc.a_tid[] = h_a.id()
     sc.b_tid[] = h_b.id()
     sc.y_tid[] = h_y.id()

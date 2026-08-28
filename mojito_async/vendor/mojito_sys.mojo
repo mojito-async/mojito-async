@@ -186,7 +186,275 @@ def ms_ctx_switch(from_: BytePtr, to: BytePtr) abi("C"):
 def c_malloc(size: Int) abi("C") -> BytePtr:
     ...
 
-
 @extern("free")
 def c_free(ptr: BytePtr) abi("C"):
     ...
+
+
+# ---------------------------------------------------------------------------
+# A2.1 (issue #67) — worker-pool substrate: logical CPU count, NativeThread,
+# NativeTlsKey.  The frozen mojito-sys S0 substrate exports NO thread-creation
+# primitive, so the documented S2.2 recipe applies: an @export'd abi("C")
+# entry (the pool trampoline, runtime/thread_entry.mojo) + the adrp/add
+# code-address recipe (entry_pointer above, AOT-proven in *_aot drivers) and
+# the pthread_* externs BELOW at concrete module scope (libc; per the A1
+# notes libc symbols resolve under both JIT and AOT, the ms_* dylib symbols
+# are AOT-only).  The producers/consumers of NativeThread must be core
+# scheduler threads (spec phase A2 "N mojito-sys.NativeThread workers").
+#
+# NULL-CAPABLE C PARAMETERS: typed UInt (zero passes through as the null
+# pointer ABI-wise) — Mojo pointers are non-nullable in 1.0.0b2
+# (std.memory.unsafe_pointer: "use Optional[UnsafePointer] to model
+# nullability"), and pthread_create/pthread_join/pthread_key_create all take
+# NULL in our usage (default attributes, no dtor, no exit value).
+# ---------------------------------------------------------------------------
+
+@extern("ms_cpu_logical_count")
+def cpu_logical_count() abi("C") -> Int:
+    ...
+
+
+@extern("pthread_create")
+def pthread_create(
+    thread: UnsafePointer[UInt, MutAnyOrigin],
+    attr: UInt,
+    start_routine: BytePtr,
+    arg: BytePtr,
+) abi("C") -> Int32:
+    ...
+
+
+@extern("pthread_join")
+def pthread_join(thread: UInt, retval: UInt) abi("C") -> Int32:
+    ...
+
+
+@extern("pthread_self")
+def pthread_self() abi("C") -> UInt:
+    ...
+
+
+@extern("pthread_key_create")
+def pthread_key_create(
+    key: UnsafePointer[UInt, MutAnyOrigin], destructor: UInt
+) abi("C") -> Int32:
+    ...
+
+
+@extern("pthread_key_delete")
+def pthread_key_delete(key: UInt) abi("C") -> Int32:
+    ...
+
+
+@extern("pthread_getspecific")
+def pthread_getspecific(key: UInt) abi("C") -> BytePtr:
+    ...
+
+
+@extern("pthread_setspecific")
+def pthread_setspecific(key: UInt, value: BytePtr) abi("C") -> Int32:
+    ...
+
+
+# ---------------------------------------------------------------------------
+# NativeThread — one OS thread handle (pthread_t on LP64 Darwin; the A2.1
+# worker pool's worker carrier).  Value type: holding a handle does not own
+# the thread; join_native_thread is the only release path (like
+# ms_stack_free for NativeStack).
+# ---------------------------------------------------------------------------
+
+struct NativeThread(ImplicitlyCopyable, ImplicitlyDeletable, Movable):
+    var _tid: UInt
+
+    def __init__(out self):
+        self._tid = 0
+
+    def tid(self) -> UInt:
+        return self._tid
+
+    def alive(self) -> Bool:
+        return self._tid != 0
+
+
+def make_native_thread() -> NativeThread:
+    """Module-level factory (b2 has no static methods)."""
+    return NativeThread()
+
+
+def spawn_native_thread(entry: BytePtr, arg: BytePtr) raises -> NativeThread:
+    """Create one OS thread running entry(arg) with default pthread attrs.
+
+    `entry` is the C-ABI code address of an @export'd abi("C") def obtained
+    via entry_pointer[...] (the S2.2 adrp/add recipe).  Raises when
+    pthread_create fails (thread limit / resource exhaustion); the caller
+    stays the thread's creator and MUST eventually join it.
+    """
+    var t = NativeThread()
+    var tp = UnsafePointer[UInt, MutAnyOrigin](to=t._tid)
+    var rc = pthread_create(tp, 0, entry, arg)
+    if rc != 0:
+        # NOTE (b2 1.0.0b2 #compiler-crash, probed in this lane): mixing a
+        # const String literal + a dynamic String(rc) in one concatenation
+        # inside a raise path that also calls an extern crashed the compiler;
+        # keep the message a SINGLE dynamic conversion.
+        raise Error(String(rc))
+    return t
+
+
+def join_native_thread(t: NativeThread) raises:
+    """Join one thread; its exit value is discarded (retval = NULL)."""
+    if not t.alive():
+        return
+    var rc = pthread_join(t._tid, 0)
+    if rc != 0:
+        raise Error(String(rc))
+
+
+# ---------------------------------------------------------------------------
+# NativeTlsKey — one OS-worker-local storage slot (pthread_key_t; spec §69:
+# current_worker / current_task / current_scope).  Native TLS is
+# OS-worker-local, never task-local (spec §69 documents the migration
+# caveat).  A2.1 writes current_worker at THREAD ENTRY only (coarse
+# granularity — the C layer behind pthread reads holds one global registry
+# mutex, per the S2.4 scalability note; no per-task get() hot paths this
+# lane).  current_task / current_scope are reserved slots for the E-lanes.
+# ---------------------------------------------------------------------------
+
+struct NativeTlsKey(ImplicitlyCopyable, ImplicitlyDeletable, Movable):
+    var _key: UInt
+
+    def __init__(out self):
+        self._key = 0
+
+    def raw(self) -> UInt:
+        return self._key
+
+
+def make_tls_key() raises -> NativeTlsKey:
+    """Create one pthread TLS key (no destructor; slots hold raw pointers to
+    runtime-owned cells, freed by the pool lifecycle, never the OS)."""
+    var k = NativeTlsKey()
+    var kp = UnsafePointer[UInt, MutAnyOrigin](to=k._key)
+    var rc = pthread_key_create(kp, 0)
+    if rc != 0:
+        raise Error(String(rc))
+    return k
+
+
+
+def delete_tls_key(key: NativeTlsKey) raises:
+    """Release one pthread TLS key (the pool's finalize path, PR #104 M5
+    fold).  After this returns the OS slot is gone: no thread may read or
+    write the key (the pool only calls this after every worker joined, or
+    at re-arm before new keys are created)."""
+    var rc = pthread_key_delete(key._key)
+    if rc != 0:
+        raise Error(String(rc))
+
+
+def tls_get(key: NativeTlsKey) -> BytePtr:
+    """Read this OS thread's value for `key` (address 0 when unset — the
+    null pointer; never dereferenced unguarded)."""
+    return pthread_getspecific(key._key)
+
+
+# ---------------------------------------------------------------------------
+# A2.6 (issue #72) — NativeEvent: the S3.5 OS-worker sleep/wake primitive.
+# The vendored S0 substrate exported NO event API, so this lane implements
+# it in-repo (vendor/mojito-sys/ms_event.c, auto-picked-up by the root
+# Makefile's source wildcards; byte-identical in the spike/prod trees).
+#
+# Semantics (S3.5, issue #72, spec §17/§21): AUTO-RESET + BREADTH-ONE (one
+# signal wakes at most ONE parked waiter), at most ONE token pending, STICKY
+# when nobody waits (a signal leaves a token a future waiter consumes
+# immediately — closes the lost-wakeup race), COALESCING (N signals while a
+# token is pending deliver one token), and CLOCK_MONOTONIC wait_until.  The
+# predicate loop (re-check token on every condvar wake) lives INSIDE the C so
+# wait_until returns ok ONLY on a consumed token — a spurious wake never
+# surfaces as a fake ready (spec §17 win).
+#
+# Handle model: ms_event_create() returns an opaque Int handle (0 == OOM);
+# the pool owns the backing and destroys it at finalize().  Mojo carries the
+# handle as an Int (b2 pointers are non-nullable; 0 is the null sentinel).
+# ---------------------------------------------------------------------------
+
+@extern("ms_event_create")
+def ms_event_create() abi("C") -> Int:
+    ...
+
+
+@extern("ms_event_destroy")
+def ms_event_destroy(handle: Int) abi("C"):
+    ...
+
+
+@extern("ms_event_signal")
+def ms_event_signal(handle: Int) abi("C"):
+    ...
+
+
+@extern("ms_event_wait")
+def ms_event_wait(handle: Int) abi("C") -> Int:
+    ...
+
+
+@extern("ms_event_wait_until")
+def ms_event_wait_until(handle: Int, deadline_ns: Int) abi("C") -> Int:
+    ...
+
+
+@extern("ms_monotonic_ns")
+def ms_monotonic_ns() abi("C") -> Int:
+    ...
+
+
+# NativeEvent — one OS-worker sleep/wake event (the per-pool idle park
+# target).  Value type: holding the handle does not own the backing; the
+# pool destroys it (ms_event_destroy).  Deadline computations use
+# ms_monotonic_ns().
+struct NativeEvent(ImplicitlyCopyable, ImplicitlyDeletable, Movable):
+    var _handle: Int
+
+    def __init__(out self):
+        self._handle = 0
+
+    def handle(self) -> Int:
+        return self._handle
+
+    def alive(self) -> Bool:
+        return self._handle != 0
+
+
+def make_native_event() raises -> NativeEvent:
+    """Create one NativeEvent (raises on allocation failure)."""
+    var e = NativeEvent()
+    e._handle = ms_event_create()
+    if e._handle == 0:
+        raise Error(String(1))  # single conversion (b2 extern-raise crash note)
+    return e
+
+
+def native_event_destroy(mut e: NativeEvent):
+    """Destroy the event's backing (idempotent; no waiters may be blocked —
+    call only after the pool joined every worker)."""
+    ms_event_destroy(e._handle)
+    e._handle = 0
+
+
+def native_event_signal(e: NativeEvent):
+    """Signal the event: set the sticky token + wake at most one waiter
+    (breadth-one; coalesces while a token is pending)."""
+    ms_event_signal(e._handle)
+
+
+def native_event_wait_until(handle: Int, deadline_ns: Int) -> Bool:
+    """Block until `deadline_ns` (absolute CLOCK_MONOTONIC); True iff a token
+    was CONSUMED (the C predicate loop means a spurious wake never returns
+    True).  False = timed out with no token (caller re-checks + re-parks).
+    `handle` is the opaque ms_event handle (Int; 0 = null, returns False)."""
+    return ms_event_wait_until(handle, deadline_ns) != 0
+
+
+def monotonic_now_ns() -> Int:
+    """Current CLOCK_MONOTONIC time in nanoseconds (deadline base)."""
+    return ms_monotonic_ns()

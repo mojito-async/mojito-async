@@ -62,7 +62,11 @@ def spawn[R: ResultValue](
     tcb[].set_parent_id(parent_id)
     tcb[].transition(TaskControlBlock.RUNNABLE)
     var id = rt.next_id()
-    rt.enqueue(Int(tcb), id)
+    # A2.2 (issue #68): spawns land on THIS worker's LOCAL deque (owner
+    # push_back — LIFO spawn locality).  #69's spawn-policy inject routing
+    # (inject_queue.mojo) is the E3-OWNED seam that classifies this call
+    # site when it lands.
+    rt.enqueue_local(Int(tcb), id)
     return JoinHandle[R](tcb, id)
 
 
