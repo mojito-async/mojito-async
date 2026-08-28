@@ -128,7 +128,7 @@ struct Runtime:
     # failed probe (empty deque or a STARTED record returned to its owner)
     # bumps nothing — no fake counters.
     var _steal_total: Int
-    # E6/M2 (PR #107 fold; issue #112) — the idle-accounting block for the
+# E6/M2 (PR #106/#107 folds; issue #112) — the idle-accounting block for the
     # producer-side wake budget (runtime/idle.mojo).  OPTIONAL pointer
     # field: the pool allocates the block and arms each worker runtime's
     # cell via arm_acct() once the E6 NativeEvent idle path exists; until
@@ -136,8 +136,8 @@ struct Runtime:
     # guarded exactly like the acct readers' pattern (`_acct_guarded`,
     # idle.mojo), so a cloned/moved Runtime (worker cells are rebuilt per
     # start) never announces against a sentinel.  The ANNOUNCE side is
-    # wired in enqueue_local/push_remote; the SIGNAL (wake_one) is
-    # #112-OWNED.
+# wired in enqueue_global per ACCEPTED record and enqueue_local/
+    # push_remote; the SIGNAL (wake_one) is #112-OWNED.
     var _acct: BytePtr
     def __init__(out self):
         self._ready = FifoQueue[TaskRecord]()
@@ -234,7 +234,7 @@ struct Runtime:
         # #112-OWNED: wake_one call — the wake signal for this announced
         # remote unit (the E6 lane bounds the budget, acct_parked > 0).
 
-    # --- E6/M2 idle-acct seam (PR #107 fold; issue #112) ------------------
+    # --- E6/M2 idle-acct seam (PR #106/#107 folds; issue #112) ------------
 
     def arm_acct(mut self, acct: BytePtr):
         """Pool-owned (the E6 lane calls this per worker cell once the
@@ -332,6 +332,14 @@ struct Runtime:
             # is counted inside the queue's own lock (accepted()); the local
             # `_enqueued` counter stays untouched here.
             self._inject.push(TaskRecord(tcb_addr, task_id))
+            # E6/M2 producer-side wake budget (PR #106 fold): announce PER
+            # ACCEPTED RECORD — a push that raised at capacity announces
+            # NOTHING, so the bounded wake budget is never over-spent (a
+            # rejected unit produces no wake entitlement).  wake_one is
+            # #112-OWNED: this fold only wires the announce.
+            self._announce_work()
+            # #112-OWNED: wake_one call — bounded wake budget: at most ONE
+            # signal per accepted record, fired only when acct_parked > 0.
         else:
             # enqueue_local(W): E2/#68's per-worker deque lane — the record
             # lands on THIS worker's LOCAL deque (owner push_back, LIFO
@@ -341,6 +349,13 @@ struct Runtime:
             # consumed: #68's LocalDeque replaced the A1 `_ready` FIFO]
             self._local.push_back(TaskRecord(tcb_addr, task_id))
             self._enqueued += 1
+            # E6/M2 producer-side wake budget: announce the accepted LOCAL
+            # unit (optional pointer field; address-1 sentinel; guarded
+            # like the acct readers).
+            self._announce_work()
+            # #112-OWNED: wake_one call — the wake signal for this
+            # announced local unit (the E6 lane bounds the budget,
+            # acct_parked > 0).
 
     def inject_queue(mut self) -> UnsafePointer[InjectQueue, MutAnyOrigin]:
         """The shared injection queue (drain seam for scheduler_loop)."""
