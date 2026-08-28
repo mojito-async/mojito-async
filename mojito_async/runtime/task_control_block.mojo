@@ -155,6 +155,18 @@ struct TaskControlBlock[T: ResultValue](ImplicitlyCopyable, ImplicitlyDeletable)
     # the parker's commit are atomic with respect to each other.
     var _owner_runtime: Int
     var _early: Bool
+    # H2 (PR #109) — CLAIMED-EPOCH marker: the generation of the last
+    # successful wake claim (0 = no claim consumed yet).  The WAKE leg
+    # stamps it exactly when wake_claim() consumes a WAITING epoch; a
+    # later wake carrying the SAME required_gen is by definition a
+    # DUPLICATE of that claim — quiet no-op in every task state (RUNNING,
+    # PARKING, RUNNABLE, COMPLETED, CANCELLED), even though the generation
+    # counter itself may still equal required_gen (it only bumps at the
+    # NEXT WAITING commit).  GUARD: read/written under the OWNER worker's
+    # remote-ready queue spinlock, alongside `_early` and the claim
+    # decision (issue #68 memory-ordering banner).
+    var _claim_epoch: Int
+
     def __init__(out self):
         self._state = TaskControlBlock.NEW
         self._generation = 1
@@ -167,6 +179,8 @@ struct TaskControlBlock[T: ResultValue](ImplicitlyCopyable, ImplicitlyDeletable)
         self._owner_worker = 0
         self._owner_runtime = 0
         self._early = False
+        self._claim_epoch = 0
+
     # --- construction ------------------------------------------------------
 
     @staticmethod
@@ -249,12 +263,20 @@ struct TaskControlBlock[T: ResultValue](ImplicitlyCopyable, ImplicitlyDeletable)
         state — when the state is not WAITING, or when a stale `required_gen`
         from a previous epoch does not match the current generation (a cross-
         worker producer, EPIC#2, must not let a stale wake re-transition a
-        task that already woke).  Never raises."""
+        task that already woke).  Never raises.
+
+        H2 (PR #109): a SUCCESSFUL claim stamps `_claim_epoch` = the claimed
+        generation (the current one at claim time) — the DUPLICATE detector
+        for unpark_current: any later wake carrying that same required_gen
+        is a duplicate of this claim and must no-op quietly in every state
+        (the generation counter alone cannot tell, since it only bumps at
+        the NEXT WAITING commit)."""
         if self._state != TaskControlBlock.WAITING:
             return False
         if required_gen != 0 and self._generation != required_gen:
             return False
         self._apply(TaskControlBlock.RUNNABLE)
+        self._claim_epoch = self._generation
         return True
 
     # --- queries -----------------------------------------------------------
@@ -315,6 +337,15 @@ struct TaskControlBlock[T: ResultValue](ImplicitlyCopyable, ImplicitlyDeletable)
 
     def clear_early_readiness(mut self):
         self._early = False
+
+    def claimed_epoch(self) -> Int:
+        """H2 (PR #109): the generation of the last consumed wake claim
+        (0 = none).  unpark_current's duplicate detector: a wake whose
+        required_gen equals this value arrives AFTER its epoch was already
+        claimed and must no-op quietly in every task state.  Guarded by the
+        OWNER's remote-ready queue spinlock (with `_early` and the claim
+        decision)."""
+        return self._claim_epoch
 
     def is_completed(self) -> Bool:
         """Query the A0.5 machine: COMPLETED (the run/join paths)."""
