@@ -93,7 +93,6 @@ def scheduler_loop[F: def(mut Runtime, Int, Int, BytePtr) raises -> Int, R: Resu
     ud: BytePtr,
     worker_id: Int = 0,
 ) raises -> Int:
-<<<<<<< HEAD
     """Drive ONE worker until its run queues are quiet (A2.2, issue #68).
 
     Per-worker queues (spec §21): the worker's LOCAL deque is drained
@@ -119,7 +118,6 @@ def scheduler_loop[F: def(mut Runtime, Int, Int, BytePtr) raises -> Int, R: Resu
     # E3-OWNED: injection intake (issue #69) — #69's bounded injection poll
     # (optional `inject`/`inject_budget` params, default None) drops in at
     # the seam below, BEFORE pop_local, keeping the A1 call form.
-=======
     """Drive the ONE worker until its runnable queue is quiet (A1 single
     worker, local FIFO only).  For each popped record, SKIP it (counted)
     when its TCB is not RUNNABLE (stale duplicate — never dispatched), else
@@ -133,9 +131,7 @@ def scheduler_loop[F: def(mut Runtime, Int, Int, BytePtr) raises -> Int, R: Resu
     statically known (b2: cross-module generic instantiation of the
     multi-param loop is miscompiled, verified by probe).  This plain loop
     keeps the A1 signature EXACTLY — so every existing callsite is
-    untouched and injection-free.
->>>>>>> origin/a2/69-inject
-    """
+    untouched and injection-free.    """
     var slices = 0
     while True:
         var have = False
@@ -236,3 +232,35 @@ def wake_target_worker(owner_worker: Int, local_worker: Int) -> Int:
     if owner_worker == 0 or owner_worker == local_worker:
         return local_worker
     return owner_worker
+    return owner_worker
+
+# ===========================================================================
+# E4-OWNED (issue #70): A2.4 unstarted-task stealing — §21 loop seam
+# ===========================================================================
+#
+# The steal probe in the M:N worker loop (spec §21), IN ORDER:
+#
+#     if var task = worker.pop_local():          # local deque
+#         worker.run_task(task^); continue
+#     if var task = worker.pop_remote_ready():   # E5 started-fiber wakes
+#         worker.run_task(task^); continue
+#     if var task = worker.runtime.inject_queue.pop():   # E3 injection
+#         worker.run_task(task^); continue
+#     if var task = worker.try_steal_unstarted():    # <-- E4 probe (issue #70)
+#         worker.run_task(task^); continue
+#     worker.process_timers()
+#     worker.poll_reactor_nonblocking()
+#     if worker.has_no_immediate_work():
+#         worker.park_os_thread_until_event()      # <-- E6 idle sleep handoff
+#
+# The loop restructure is #68's; E4's part is the probe call + counters:
+#   - the probe is `Worker.try_steal_unstarted()` (runtime/worker.mojo):
+#     round-robin peers from own_index+1, STARTED guard (spec §19.1/§19.2),
+#     ONE capped round, then hands off — the empty-round outcome feeds the
+#     E6 sleep decision directly below (an idle worker does NOT spin on
+#     empty deques; issue #70 step 3/4);
+#   - each successful steal bumps the worker runtime's task_steals_total
+#     exactly once (spec §71; issue #70 step 5 — failed probes bump nothing).
+#
+# ADR-006/ADR-007 are upheld structurally: only never-run records are ever
+# removed from a deque, so a started fiber's live stack is never migrated.

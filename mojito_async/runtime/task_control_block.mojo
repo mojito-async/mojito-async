@@ -129,7 +129,13 @@ struct TaskControlBlock[T: ResultValue](ImplicitlyCopyable, ImplicitlyDeletable)
     # unpinned sentinel).  E5 reads this to route remote-ready wakes to
     # the OWNER worker (spec §19.2).
     var _owner_worker: Int
-
+    # E4 (issue #70) — STARTED latch: True once the task has EVER entered
+    # user code (the first RUNNABLE -> RUNNING transition).  A started task
+    # is worker-affine (spec §19.2 / ADR-006): even when a later yield
+    # returns it to RUNNABLE and re-enqueues it, the latch stays True so the
+    # steal guard can tell "never ran" from "ran, then re-queued".  The
+    # stealability test is therefore "latched False", not "state==RUNNABLE".
+    var _started: Bool
     def __init__(out self):
         self._state = TaskControlBlock.NEW
         self._generation = 1
@@ -139,7 +145,7 @@ struct TaskControlBlock[T: ResultValue](ImplicitlyCopyable, ImplicitlyDeletable)
         self._parent = 0
         self._scope = 0
         self._owner_worker = 0
-
+        self._started = False
     # --- construction ------------------------------------------------------
 
     @staticmethod
@@ -176,6 +182,10 @@ struct TaskControlBlock[T: ResultValue](ImplicitlyCopyable, ImplicitlyDeletable)
 
     def _apply(mut self, to: Int):
         self._state = to
+        if to == TaskControlBlock.RUNNING:
+            # E4 (issue #70): the first body entry latches STARTED (never
+            # unlatches — a re-queued started task stays observable).
+            self._started = True
         if to == TaskControlBlock.WAITING:
             self._generation += 1
             self._wait._generation = self._generation
@@ -261,13 +271,30 @@ struct TaskControlBlock[T: ResultValue](ImplicitlyCopyable, ImplicitlyDeletable)
         self._owner_worker = worker_id
 
     def is_completed(self) -> Bool:
+        """Query the A0.5 machine: COMPLETED (the run/join paths)."""
         return self._state == TaskControlBlock.COMPLETED
 
     def is_cancelled(self) -> Bool:
+        """Query the A0.5 machine: CANCELLED (the cancellation paths)."""
         return self._state == TaskControlBlock.CANCELLED
 
     def is_waiting(self) -> Bool:
+        """Query the A0.5 machine: WAITING (the park paths)."""
         return self._state == TaskControlBlock.WAITING
+
+    # --- E4 (issue #70): STARTED consumption ---------------------------------
+
+    def is_started(self) -> Bool:
+        """Spec §14.1 `started`, TCB form: True exactly once this task has
+        entered user code (latched at the first RUNNABLE -> RUNNING).
+        A started task is worker-affine and NEVER stealable (spec §19.2 /
+        ADR-006), even while its yield re-enqueue leaves it RUNNABLE."""
+        return self._started
+
+    def is_pre_start(self) -> Bool:
+        """Spec §19.1: True while the task has NEVER entered user code —
+        the exact stealability predicate (NEW/RUNNABLE + never ran)."""
+        return not self._started
 
     # --- result slot -------------------------------------------------------
 
