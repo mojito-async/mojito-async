@@ -214,13 +214,13 @@ def mjs_pool_entry_main(ud: BytePtr) abi("C"):
     cell[].exited = True
 
 # ---------------------------------------------------------------------------
-# spawn_all_workers — the pool's thread-spawn loop, LIVING HERE (b2 crash
-# workaround, see worker_pool.mojo's top note: the identical loop crashed the
-# 1.0.0b2 compiler inside worker_pool.mojo in every shape — as a struct
-# method, as a module fn there, and with hoisted locals; in this module it
-# compiles and runs).  Pure pointer math + the key VALUE; no method calls per
-# iteration.  Threads run entry(cell_addr); the caller (pool) must have fully
-# written every entry cell BEFORE calling (happens-before via pthread_create).
+# B2-CONSTRAINT (probed on 1.0.0b2, PR #104): the trampoline address crosses
+# this boundary as an `Int`, NOT as a BytePtr.  Passing the entry BytePtr as
+# a function parameter into this loop is MISCOMPILED by 1.0.0b2 — every
+# spawned thread starts at a garbage address (udf trap; probed across
+# signatures: BytePtr param -> crash, Int param -> runs).  The pool side
+# therefore converts once (Int(entry)) and this loop re-derives the BytePtr
+# at the extern call site.
 # ---------------------------------------------------------------------------
 
 def spawn_all_workers(
@@ -228,7 +228,7 @@ def spawn_all_workers(
     entries_base: BytePtr,
     key: NativeTlsKey,
     n: Int,
-    entry: BytePtr,
+    entry_int: Int,
 ) raises:
     for i in range(n):
         var w = UnsafePointer[Worker, MutAnyOrigin](
@@ -237,5 +237,7 @@ def spawn_all_workers(
         var e = UnsafePointer[WorkerEntryCell, MutAnyOrigin](
             unsafe_from_address=Int(entries_base) + i * CELL_ENTRY
         )
-        var t = spawn_native_thread(entry, e.bitcast[Byte]())
+        var t = spawn_native_thread(
+            BytePtr(unsafe_from_address=entry_int), e.bitcast[Byte]()
+        )
         w[].mark_started(t, key)

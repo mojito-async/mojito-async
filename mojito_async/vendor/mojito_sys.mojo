@@ -241,6 +241,11 @@ def pthread_key_create(
     ...
 
 
+@extern("pthread_key_delete")
+def pthread_key_delete(key: UInt) abi("C") -> Int32:
+    ...
+
+
 @extern("pthread_getspecific")
 def pthread_getspecific(key: UInt) abi("C") -> BytePtr:
     ...
@@ -334,6 +339,17 @@ def make_tls_key() raises -> NativeTlsKey:
     if rc != 0:
         raise Error(String(rc))
     return k
+
+
+
+def delete_tls_key(key: NativeTlsKey) raises:
+    """Release one pthread TLS key (the pool's finalize path, PR #104 M5
+    fold).  After this returns the OS slot is gone: no thread may read or
+    write the key (the pool only calls this after every worker joined, or
+    at re-arm before new keys are created)."""
+    var rc = pthread_key_delete(key._key)
+    if rc != 0:
+        raise Error(String(rc))
 
 
 def tls_get(key: NativeTlsKey) -> BytePtr:

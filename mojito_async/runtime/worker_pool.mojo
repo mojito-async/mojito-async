@@ -28,13 +28,17 @@
 # no placement new, so Worker/WorkerEntryCell values are moved into their
 # cells via deref-assignment — the t28-style opaque-cell contract,
 # CELL_WORKER/CELL_ENTRY >= real sizes).  join_all() joins every thread;
-# finalize() returns the heap.  pthread_join gives the happens-before edge:
-# entry-cell observation fields are read without atomics after the joins.
+# finalize() returns the heap and the TLS keys.  pthread_join gives the
+# happens-before edge: entry-cell observation fields are read without
+# atomics after the joins.
 #
 # TLS: three NativeTlsKey slots reserved per spec §22/§69 — current_worker
 # (written at thread entry, coarse granularity; the C registry mutex makes
 # per-task gets a scalability mistake per the S2.4 note — no hot-path get()s
 # this lane), current_task + current_scope (RESERVED, E-lanes claim them).
+# The keys are created by the first start() and released by finalize()
+# (pthread_key_delete; M5 fold, PR #104); a restarted pool re-arms by
+# deleting the previous cycle's keys first, so no cycle leaks a slot.
 #
 # SHUTDOWN DISCIPLINE (issue #67): never join from inside a worker loop —
 # the main thread owns all joins; request_shutdown() latches; parked idles
@@ -43,10 +47,14 @@
 # NOTE (b2 1.0.0b2 compiler crashes, worked around here): (1) raising joins of
 # a dynamic String with a literal inside extern-bearing modules crash the
 # compiler, so raise messages in vendor/mojito_sys.mojo are single
-# conversions; (2) this lane's spawn+mark_started loop crashed the compiler
-# as a WorkerPool method reading `self._tls.current_worker` in the loop — the
-# loop body lives at MODULE level in _spawn_one (probed: the same code as a
-# module function compiles and runs).
+# conversions; (2) a spawn+mark_started LOOP inside THIS module crashed the
+# compiler in every shape researched — as a WorkerPool method reading
+# `self._tls.current_worker` in the loop, as a module fn here, and with
+# hoisted locals (probed).  The loop body therefore lives at MODULE level in
+# thread_entry.spawn_all_workers (the same code compiles and runs there);
+# WorkerPool.spawn_all_workers() — the pool's ONLY spawn surface (H3 fold,
+# PR #104) — hoists the TLS-key read OUT of any loop and delegates the loop
+# to that module fn.
 from std.atomic import Atomic, Ordering
 from mojito_async.integration.sys import BytePtr
 from mojito_async.runtime.config import RuntimeConfig, make_pool_config
@@ -54,16 +62,17 @@ from mojito_async.runtime.thread_entry import (
     CELL_ENTRY,
     CELL_WORKER,
     WorkerEntryCell,
+    spawn_all_workers as spawn_all_worker_threads,
 )
 from mojito_async.runtime.worker import Worker
 from mojito_async.vendor.mojito_sys import (
     NativeTlsKey,
     c_free,
     c_malloc,
+    delete_tls_key,
     join_native_thread,
     make_native_thread,
     make_tls_key,
-    spawn_native_thread,
 )
 
 
@@ -95,15 +104,19 @@ def make_worker_tls() raises -> WorkerTls:
 
 
 # ---------------------------------------------------------------------------
-# WorkerPool (the pool's spawn loop body lives at module level in _spawn_one;
-# see the NOTE at the top of this file).
+# WorkerPool (the spawn loop body lives at module level in
+# thread_entry.spawn_all_workers; see the NOTE at the top of this file).
 # ---------------------------------------------------------------------------
 
 struct WorkerPool:
     """The M:N worker pool: N NativeThread workers, each owning a Worker
     (id + Runtime + thread handle + TLS key) and an entry cell, one shutdown
-    latch, and the pool lifecycle.  Threads are spawned by start(), observed
-    while running, stopped by request_shutdown() and reaped by join_all().
+    latch, and the pool lifecycle.  start() arms the pool (validate + TLS
+    keys + cells + latch), spawn_all_workers() spawns every thread — the
+    pool's ONLY spawn surface (H3 fold, PR #104); stopped by
+    request_shutdown() and reaped by join_all(); finalize() releases the TLS
+    keys and the heap and FINALIZES the pool (a later start() raises loudly —
+    M5 fold, PR #104 — instead of re-arming through the address-1 sentinel).
 
     NOT copyable (owns heap); constructed via make_pool() / make_pool(config).
     """
@@ -115,16 +128,22 @@ struct WorkerPool:
     var _latch: UnsafePointer[Scalar[DType.uint8], MutAnyOrigin]
     var _seeded: Bool
     var _started: Bool
+    var _spawned: Bool                # spawn_all_workers ran this cycle
+    var _tls_armed: Bool              # start() created live TLS keys
     var _joined: Int
     var _freed: Bool
+    var _finalized: Bool              # finalize() ran: no further start()
 
     def __init__(out self):
         self._config = make_pool_config()
         self._tls = WorkerTls()
         self._started = False
         self._seeded = False
+        self._spawned = False
+        self._tls_armed = False
         self._joined = 0
         self._freed = False
+        self._finalized = False
         var n = self._config.worker_count
         self._workers_base = c_malloc(n * CELL_WORKER)
         self._entries_base = c_malloc(n * CELL_ENTRY)
@@ -136,8 +155,11 @@ struct WorkerPool:
         self._tls = WorkerTls()
         self._started = False
         self._seeded = False
+        self._spawned = False
+        self._tls_armed = False
         self._joined = 0
         self._freed = False
+        self._finalized = False
         var n = self._config.worker_count
         self._workers_base = c_malloc(n * CELL_WORKER)
         self._entries_base = c_malloc(n * CELL_ENTRY)
@@ -161,44 +183,72 @@ struct WorkerPool:
     # --- lifecycle ----------------------------------------------------------
 
     def start(mut self, entry: BytePtr) raises:
-        """Prepare the pool for spawning (latch arm, worker/entry cell writes,
-        TLS slots).  `entry` is the embedding binary's trampoline address
-        (@export("mjs_pool_entry"); thread_entry.mojo EMBEDDING RULE).  The
-        EMBEDDER then spawns the workers with one spawn_worker call per index
-        (b2 1.0.0b2 compiler-bug workaround — a spawn LOOP inside this module
-        crashes the compiler in every shape; see the NOTE at the top of this
-        file).  Refuses a second start before join_all().  Any seam units
-        seeded before start() are drained by the workers on entry, then they
-        idle on the latch."""
+        """Prepare the pool for spawning: validate the config (M6 fold, PR
+        #104 — RuntimeConfig.validate() runs FIRST, every start), arm the
+        latch, write the worker/entry cells, create the three TLS slots.
+        `entry` is the embedding binary's trampoline address
+        (@export("mjs_pool_entry"); thread_entry.mojo EMBEDDING RULE).
+        The EMBEDDER then spawns every thread with ONE
+        spawn_all_workers(entry) call — the pool's only spawn surface (H3
+        fold).  Refuses a second start before join_all(), and refuses ANY
+        start after finalize() (M5 fold: the freed heap must never be
+        re-armed through the address-1 sentinel latch).  Any seam units
+        seeded before start() are drained by the workers on entry, then
+        they idle on the latch."""
+        self._config.validate()
+        if self._finalized:
+            raise Error("worker_pool.start: pool finalized (no restart)")
         if self._started:
             raise Error("worker_pool.start: pool already started")
+        if self._tls_armed:
+            # A previous start() cycle armed keys that were never released
+            # (nothing deletes them on the join path): delete them before
+            # re-arming so a restarted pool does not leak TLS slots (M5).
+            delete_tls_key(self._tls.current_worker)
+            delete_tls_key(self._tls.current_task)
+            delete_tls_key(self._tls.current_scope)
+            self._tls_armed = False
         self._tls = make_worker_tls()
+        self._tls_armed = True
         Atomic[DType.uint8].store[ordering=Ordering.RELEASE](self._latch, 0)
         self._build_cells()
         self._started = True
         self._joined = 0
 
-    def current_worker_key(mut self) -> NativeTlsKey:
-        """The pool's current_worker TLS slot (spec §69), read BEFORE the
-        spawn loop and passed by value into spawn_worker (compiler-bug
-        workaround shape)."""
-        return self._tls.current_worker
+    def spawn_all_workers(mut self, entry: BytePtr) raises:
+        """Spawn EVERY worker thread in one call — the pool's ONLY spawn
+        surface (H3 fold, PR #104).  Requires start() first (cells + TLS
+        armed); refuses a second call before join_all() (a missed join
+        would orphan the first batch's threads).  mark_started + the
+        current_worker TLS-key wiring happen INSIDE the pool, so an
+        embedder calling this cannot forget them — the old footgun (a
+        driver-side spawn_native_thread loop + manual mark_started) is
+        gone.
 
-    def spawn_worker(
-        mut self,
-        entry: BytePtr,
-        wptr: UnsafePointer[Worker, MutAnyOrigin],
-        cell_addr: BytePtr,
-        key: NativeTlsKey,
-    ) raises:
-        """Spawn ONE worker thread: trampoline `entry`, entry-cell at
-        `cell_addr`, bound to worker cell `wptr` with TLS key `key`.  The
-        embedder computes the per-worker pointers via pool.worker_at(i) /
-        pool.entry_at(i) and loops range(worker_count) — the b2 compiler
-        crash workaround (see NOTE at top): this method touches NO `self`
-        state, which 1.0.0b2 compiles."""
-        var t = spawn_native_thread(entry, cell_addr)
-        wptr[].mark_started(t, key)
+        The b2 compiler-crash workaround (NOTE at top) keeps the spawn LOOP
+        out of this module: the TLS key is hoisted here (one read, outside
+        any loop) and thread_entry.spawn_all_workers — the module-level
+        loop with the exact driver-side body (spawn_native_thread +
+        mark_started per index) — does the spawn.  For every worker,
+        mark_started completes BEFORE pthread_create returns, so no worker
+        thread can ever run user code before its Worker/TLS wiring is
+        visible (happens-before via pthread_create)."""
+        if not self._started:
+            raise Error("worker_pool.spawn_all_workers: call start() first")
+        if self._spawned:
+            raise Error("worker_pool.spawn_all_workers: already spawned")
+        var key = self._tls.current_worker  # hoisted; NOT read inside a loop
+        spawn_all_worker_threads(
+            self._workers_base,
+            self._entries_base,
+            key,
+            self._config.worker_count,
+            Int(entry),  # B2 constraint (probed on 1.0.0b2): a BytePtr param
+            # into the spawn loop is miscompiled — threads start at a garbage
+            # address; the trampoline address crosses as an Int and is
+            # re-derived at the extern call site (see thread_entry.mojo).
+        )
+        self._spawned = True
 
     def _build_cells(mut self):
         """Write the worker cells (id = i) + entry cells (fresh when no seed
@@ -240,6 +290,8 @@ struct WorkerPool:
     ) raises:
         if self._started:
             raise Error("worker_pool.seed_seam_units: before start() only")
+        if self._finalized:
+            raise Error("worker_pool.seed_seam_units: pool finalized")
         if per_worker < 1:
             raise Error("worker_pool.seed_seam_units: per_worker must be >= 1")
         var n = self._config.worker_count
@@ -286,12 +338,24 @@ struct WorkerPool:
                 self._joined += 1
         self._started = False
         self._seeded = False
+        self._spawned = False
 
-    def finalize(mut self):
-        """Return the pool's heap (idempotent).  Call after join_all() and
-        after reading the entry-cell results."""
+    def finalize(mut self) raises:
+        """Release the pool's resources (idempotent): the three TLS keys
+        (M5 fold, PR #104 — pthread_key_delete per slot) and the pool heap.
+        Call after join_all() and after reading the entry-cell results;
+        refuses a LIVE pool (its threads would touch deleted keys).  After
+        this returns the pool is FINALIZED: a later start() raises loudly
+        instead of re-arming through the address-1 sentinel latch."""
         if self._freed:
             return
+        if self._started:
+            raise Error("worker_pool.finalize: join_all() first")
+        if self._tls_armed:
+            delete_tls_key(self._tls.current_worker)
+            delete_tls_key(self._tls.current_task)
+            delete_tls_key(self._tls.current_scope)
+            self._tls_armed = False
         if Int(self._workers_base) > 1:
             c_free(self._workers_base)
             self._workers_base = BytePtr(unsafe_from_address=1)
@@ -304,6 +368,7 @@ struct WorkerPool:
                 unsafe_from_address=1
             )
         self._freed = True
+        self._finalized = True
 
     # --- observability ------------------------------------------------------
 

@@ -27,12 +27,22 @@
 #
 # EMBEDDING RULE (AOT): this driver declares the @export("mjs_pool_entry")
 # trampoline (thread_entry.mjs_pool_entry_main is the shared body) and feeds
-# entry_pointer["mjs_pool_entry"]() into pool.start().  THE DRIVER SPAWNS:
-# pool.start(entry) arms the pool (TLS keys, entry cells, latch) and the
-# embedder then spawns every worker with one spawn_native_thread call per
-# index bound to pool.worker_at(i) (compiler-bug workaround; see
-# worker_pool.mojo's NOTE — a spawn loop inside the pool module crashes the
-# 1.0.0b2 compiler, the driver-side loop compiles and runs).
+# entry_pointer["mjs_pool_entry"]() into pool.start().  THE POOL SPAWNS:
+# pool.start(entry) arms the pool (validate + TLS keys + entry cells +
+# latch) and pool.spawn_all_workers(entry) spawns every worker AND performs
+# the mark_started + TLS-key wiring inside the pool (H3 fold, PR #104) — the
+# old footgun path (a driver-side spawn_native_thread loop calling
+# wptr[].mark_started by hand) is GONE, and this driver asserts the wiring
+# happened: immediately after spawn_all_workers returns, every worker is
+# already started() — mark_started completed BEFORE pthread_create returned,
+# so no thread can run user code before its Worker/TLS wiring is visible
+# (happens-before via pthread_create).
+#
+# FOLD GUARDS (M5/M6, PR #104), proven here on the real pool:
+#   - RuntimeConfig.validate() runs FIRST in start(): degenerate
+#     worker_count (0 and above the 1024 sane bound) raises loudly, as does
+#     stack_initial_commit_bytes > stack_reserve_bytes;
+#   - start() after finalize() raises loudly (no address-1 sentinel reuse).
 #
 # AOT only (modular/modular#6971: the JIT cannot materialize @export symbols
 # from imported modules; the run.sh _aot glob drives this).
@@ -48,7 +58,6 @@ from mojito_async.vendor.mojito_sys import (
     entry_pointer,
     c_free,
     c_malloc,
-    spawn_native_thread,
 )
 
 
@@ -76,6 +85,20 @@ def wait_drained(mut pool: WorkerPool, what: String) raises:
         spins += 1
         if spins > 30000:
             red(what + ": pool did not drain in 30s (spins=" + String(spins) + ")")
+
+
+def expect_start_raise(mut pool: WorkerPool, entry: BytePtr, what: String) raises:
+    """M5/M6 fold guard: pool.start(entry) MUST raise (validate / finalize);
+    anything else is a RED.  Always finalize()s the pool afterwards so the
+    negative pools release their heap."""
+    var threw = False
+    try:
+        pool.start(entry)
+    except:
+        threw = True
+    if not threw:
+        red(what)
+    pool.finalize()
 
 
 def assert_pool_audit(mut pool: WorkerPool, n: Int, per: Int) raises:
@@ -135,12 +158,20 @@ def main() raises:
     var pool = make_pool(make_pool_config(POOL_N))
     pool.seed_seam_units(PER, obs, K)
     pool.start(entry)
-    var key = pool.current_worker_key()
+    pool.spawn_all_workers(entry)
+
+    # H3 fold guard: spawn_all_workers completed mark_started for EVERY
+    # worker BEFORE any thread could run user code (happens-before via
+    # pthread_create).  The old footgun — a driver-side spawn_native_thread
+    # loop calling wptr[].mark_started(t, key) by hand — no longer exists:
+    # this driver never references spawn_native_thread or mark_started, and
+    # the getters below prove the POOL did the wiring.
     for i in range(POOL_N):
-        var wptr = pool.worker_at(i)
-        var cell_addr = pool.entry_at(i).bitcast[Byte]()
-        var t = spawn_native_thread(entry, cell_addr)
-        wptr[].mark_started(t, key)
+        if not pool.worker_at(i)[].started():
+            red(
+                "worker " + String(i)
+                + " not marked started by spawn_all_workers (wiring footgun)"
+            )
     wait_drained(pool, "4-worker pool")
 
     # per-worker slices: task j must record worker j/PER exactly (one stable
@@ -160,6 +191,24 @@ def main() raises:
     pool.finalize()
     c_free(obs.bitcast[Byte]())
 
+    # ---- 2.5 fold guards (M5/M6, PR #104) ---------------------------------
+    # A finalized pool must refuse start() LOUDLY — never re-arm through the
+    # address-1 sentinel latch into freed heap.
+    expect_start_raise(pool, entry, "start() after finalize() must raise")
+    # Degenerate configs must raise in start() via RuntimeConfig.validate():
+    # worker_count below 1, worker_count above the sane bound, and
+    # stack_initial_commit_bytes above stack_reserve_bytes.
+    var bad0 = make_pool(make_pool_config(0))
+    expect_start_raise(bad0, entry, "worker_count=0 must raise in start()")
+    var badbig = make_pool(make_pool_config(1025))
+    expect_start_raise(
+        badbig, entry, "worker_count above the sane bound must raise in start()"
+    )
+    var badcommit = make_pool(make_pool_config(1, 1048576, 2097152))
+    expect_start_raise(
+        badcommit, entry, "commit > reserve must raise in start()"
+    )
+
     # ---- 3. N=1 pool (A1 single-worker parity at count 1) ------------------
     comptime ONE_PER = Int(5)
     var obs1 = UnsafePointer[Int, MutAnyOrigin](
@@ -168,11 +217,9 @@ def main() raises:
     var pool1 = make_pool(make_pool_config(1))
     pool1.seed_seam_units(ONE_PER, obs1, ONE_PER)
     pool1.start(entry)
-    var key1 = pool1.current_worker_key()
-    var wptr1 = pool1.worker_at(0)
-    var cell_addr1 = pool1.entry_at(0).bitcast[Byte]()
-    var t1 = spawn_native_thread(entry, cell_addr1)
-    wptr1[].mark_started(t1, key1)
+    pool1.spawn_all_workers(entry)
+    if not pool1.worker_at(0)[].started():
+        red("N=1 worker not marked started by spawn_all_workers (wiring footgun)")
     wait_drained(pool1, "1-worker pool")
     for j in range(ONE_PER):
         if obs1[j] != 0:

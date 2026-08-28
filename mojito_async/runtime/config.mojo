@@ -33,6 +33,12 @@ from mojito_async.vendor.mojito_sys import cpu_logical_count
 
 comptime DEFAULT_STACK_RESERVE = Int(1048576)  # 1 MiB, pthread's default
 comptime DEFAULT_STACK_COMMIT = Int(0)
+# Sane ceiling for pool threads (degenerate-config guard, M6 fold PR #104):
+# a pool allocates worker_count * CELL_WORKER bytes of pool heap, so an
+# accidental 10^8 worker_count would request gigabytes; 1024 native threads
+# is far above any real run (defaults size to cpu_logical_count()) while
+# keeping the degenerate case a clean, loud raise instead of a malloc bomb.
+comptime MAX_WORKER_COUNT = Int(1024)
 
 
 struct RuntimeConfig(ImplicitlyCopyable, ImplicitlyDeletable, Movable):
@@ -64,11 +70,16 @@ struct RuntimeConfig(ImplicitlyCopyable, ImplicitlyDeletable, Movable):
         self.enable_tracing = enable_tracing
 
     def validate(self) raises:
-        """Refuse nonsensical configurations at construction-like boundaries
-        (start() validates again after the driver may have mutated)."""
+        """Refuse nonsensical configurations at construction-like boundaries.
+        WorkerPool.start() calls this FIRST (M6 fold, PR #104), so a
+        driver-mutated config is re-checked before any thread is armed."""
         if self.worker_count < 1:
             raise Error(
                 "RuntimeConfig.validate: worker_count must be >= 1"
+            )
+        if self.worker_count > MAX_WORKER_COUNT:
+            raise Error(
+                "RuntimeConfig.validate: worker_count exceeds the sane bound"
             )
         if self.stack_reserve_bytes < 1:
             raise Error(
@@ -77,6 +88,11 @@ struct RuntimeConfig(ImplicitlyCopyable, ImplicitlyDeletable, Movable):
         if self.stack_initial_commit_bytes < 0:
             raise Error(
                 "RuntimeConfig.validate: stack_initial_commit_bytes must be >= 0"
+            )
+        if self.stack_initial_commit_bytes > self.stack_reserve_bytes:
+            raise Error(
+                "RuntimeConfig.validate: stack_initial_commit_bytes must be "
+                + "<= stack_reserve_bytes"
             )
 
 
