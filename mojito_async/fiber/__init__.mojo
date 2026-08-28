@@ -18,3 +18,15 @@ from mojito_async.fiber.fiber import (
     bind,
     make_fiber,
 )
+
+from mojito_async.fiber.continuation import (
+    FiberContinuation,
+    FiberMotion,
+    is_continuation_error,
+    make_continuation,
+)
+
+from mojito_async.fiber.stack_pool import (
+    StackCache,
+    make_stack_cache,
+)

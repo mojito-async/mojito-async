@@ -1,15 +1,22 @@
 #!/bin/sh
 # mojito-async A1 acceptance suite (runtime #33, sync #34, channel #35,
-# timer #36, stress #37).
+# timer #36, stress #37; stack cache #52).
 #
 # Runs:
 #   - the A1 unit drivers in test/unit/ (t[0-9][0-9]_*.mojo — runtime
 #     t11..t18, sync t21_mutex/t22_semaphore, channel t20..t22, timer
 #     t19..t22; later A-lanes add tNN_* drivers that this glob picks up);
 #   - the A1.5 stress suites in test/stress/ (t*_stress.mojo, issue #37);
-#   - the AOT stress drivers test/stress/t*_aot.mojo (`mojo build` + execute:
-#     the 100k-lifecycle suite needs local libc externs — getrusage/malloc —
-#     kept in the *_aot driver per modular/modular#6971).
+#   - the AOT drivers (unit + stress, `mojo build` + execute): drivers that
+#     import the fiber/stack seams (NativeStack, ms_* externs) or local
+#     libc externs (getrusage/malloc) run ONLY AOT — the b2 JIT cannot
+#     resolve dylib symbols through an imported module (modular/modular#6971).
+#
+# Linking: the mojito-sys dylib (libmojito_spike.dylib) is produced by the
+# root Makefile from the vendored C/asm substrate.  When it exists we pass
+# `-Xlinker <dylib>` to both `mojo run` and `mojo build` so seam drivers
+# link; when it is absent the flags are omitted so the suite stays runnable
+# pre-dylib.
 #
 # Verdicts per driver: PASS = exit 0 + "PASS"; RED = exit 1 + "RED"
 # (intentional TDD-red; allow-listed at gate level via precommit/known-red.tsv
@@ -22,20 +29,19 @@ BUILD_DIR="$REPO_ROOT/build"
 MOJO=${MOJO:-mojo}
 command -v "$MOJO" >/dev/null 2>&1 || { echo "ERROR: mojo not found"; exit 2; }
 
-# Drivers that import the vendored mojito-sys seams (fiber #49, stack pool
-# #52, continuation #50) need the production dylib at link time; the JIT
-# cannot resolve its symbols through an imported module, so those drivers
-# are AOT-built.  Pass -Xlinker only when the dylib exists so the suite
-# stays runnable before the substrate dylib is built.
 DYLIB="$REPO_ROOT/libmojito_spike.dylib"
 LINK_FLAGS=""
-[ -f "$DYLIB" ] && LINK_FLAGS="-Xlinker $DYLIB"
+if [ -f "$DYLIB" ]; then
+    LINK_FLAGS="-Xlinker $DYLIB"
+fi
 
-UNIT_TESTS=$(ls "$SCRIPT_DIR"/unit/t[0-9][0-9]_*.mojo 2>/dev/null | grep -v "_aot\.mojo$" | sort || true)
-# _aot.mojo drivers are excluded here; they are built+run in the AOT loop.
+# *_aot.mojo drivers are excluded from the JIT loops; they are built+run in
+# the AOT loop below.
+UNIT_TESTS=$(ls "$SCRIPT_DIR"/unit/t[0-9][0-9]_*.mojo 2>/dev/null | grep -v "_aot\.mojo$" || true)
 STRESS_TESTS=$(ls "$SCRIPT_DIR"/stress/t*_*.mojo 2>/dev/null | grep -v "_aot\.mojo$" | sort || true)
-AOT_TESTS=$(ls "$SCRIPT_DIR"/stress/t*_aot.mojo "$SCRIPT_DIR"/unit/t*_aot.mojo 2>/dev/null || true)
-if [ -z "$UNIT_TESTS" ] && [ -z "$STRESS_TESTS" ]; then
+# AOT drivers (unit + stress): `mojo build` + execute.
+AOT_TESTS=$(ls "$SCRIPT_DIR"/unit/t*_aot.mojo "$SCRIPT_DIR"/stress/t*_aot.mojo 2>/dev/null | sort || true)
+if [ -z "$UNIT_TESTS" ] && [ -z "$STRESS_TESTS" ] && [ -z "$AOT_TESTS" ]; then
     echo "ERROR: no tests under $SCRIPT_DIR/unit or $SCRIPT_DIR/stress"
     exit 2
 fi
@@ -71,7 +77,9 @@ for t in $STRESS_TESTS; do
     run_one "$name" "$out" "$st"
 done
 
-# --- A1.5 stress AOT driver (getrusage/malloc externs stay in-driver) -----------
+# --- AOT drivers (unit + stress): fiber/stack-seam + libc externs ---------------
+# `mojo build` + execute; link the dylib for the seam externs (modular/
+# modular#6971: JIT cannot resolve dylib symbols through an imported module).
 mkdir -p "$BUILD_DIR" || true
 for t in $AOT_TESTS; do
     name=$(basename "$t" .mojo)
@@ -89,7 +97,7 @@ for t in $AOT_TESTS; do
 done
 
 echo ""
-echo "mojito-async A1 acceptance matrix (runtime #33, sync #34, channel #35, timer #36, stress #37)"
+echo "mojito-async A1 acceptance matrix (runtime #33, sync #34, channel #35, timer #36, stress #37, stack cache #52)"
 printf '%b' "$matrix" | sed 's/^/  /'
 echo ""
 [ "$failures" -ne 0 ] && { echo "RESULT: $failures FAILURE(S)"; exit 1; }
