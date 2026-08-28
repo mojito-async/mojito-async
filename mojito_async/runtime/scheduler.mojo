@@ -91,3 +91,37 @@ def scheduler_loop[F: def(mut Runtime, Int, Int, BytePtr) raises -> Int, R: Resu
         slices += 1
         _ = dispatcher(rt, rec.tcb_addr, rec.task_id, ud)
     return slices
+
+# ---------------------------------------------------------------------------
+# A1.3 affinity seam (issue #51) — worker-affine started fibers (ADR-006/007)
+# ---------------------------------------------------------------------------
+#
+# spec §19.2: STARTED tasks are NOT stealable; a started fiber's wake is
+# routed to its OWNER worker's run queue ("remote-ready routing"), NEVER the
+# general stealable set.  On the single worker the owner IS the sole worker,
+# so this always resolves to the local FIFO (spec §88 — today's behavior,
+# preserved unchanged).  The decision surface below is what EPIC #2's M:N
+# worker pool snaps to (E5 started-fiber remote-ready): the pool calls
+# wake_target_worker(f.owner_worker(), this_worker_id) at wake time and
+# enqueues onto that worker's (remote-ready) queue when the returned target
+# differs from the waker; on one worker the target is always the sole queue.
+def wake_target_worker(owner_worker: Int, local_worker: Int) -> Int:
+    """Resolve the enqueue target for a woken (started) task/fiber.
+
+    owner_worker — the woken fiber's pinned owner (from Fiber.owner_worker();
+                   0 = not started / not pinned: no affinity yet).
+    local_worker — the worker performing the wake (explicit identity; b2 has
+                   no TLS, so worker identity is threaded by value).
+
+    Returns the worker whose run queue must receive the wake:
+      - owner == local_worker (intra-worker wake, spec §88) -> local_worker,
+        the wake stays on this worker's FIFO (today's behavior);
+      - owner == 0 (unstarted/unpinned) -> local_worker, the general
+        runnable-set fallback (nothing to be affine to yet);
+      - otherwise (foreign wake) -> owner_worker: the wake lands on the
+        OWNER worker's remote-ready queue (spec §19.2), never the stealable
+        set.  EPIC #2 enqueues there in the E5 seam.
+    """
+    if owner_worker == 0 or owner_worker == local_worker:
+        return local_worker
+    return owner_worker

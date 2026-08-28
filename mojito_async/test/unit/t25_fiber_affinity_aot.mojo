@@ -179,29 +179,27 @@ def _native_marker() -> Int:
     return Int(UnsafePointer[Int, MutAnyOrigin](to=slot))
 
 
-def _resume_a1(
-    mut f: Fiber, pre: UnsafePointer[Int, MutUntrackedOrigin]
+def _resume_marked(
+    mut f: Fiber,
+    depth: Int,
+    cell: UnsafePointer[Int, MutUntrackedOrigin],
 ) raises:
-    """Resume A (#1, first body entry) from a helper frame; record the
-    native marker at this (shallow) depth just before the switch."""
-    pre[0] = _native_marker()
-    f.resume()
+    """Build `depth` live nested native frames, record the native marker at
+    the innermost point, then resume `f`.  Recursion keeps every level's
+    frame genuinely live on the native stack (recursion cannot be inlined
+    away), so a marker captured at depth 0 and one at depth 4 sit at
+    GUARANTEED distinct native addresses.  (The driver asserts the two
+    markers differ; if a future compiler tail-call-eliminated the recursion
+    the proof would visibly break instead of silently passing.)"""
+    if depth == 0:
+        cell[0] = _native_marker()
+        f.resume()
+        return
+    _resume_marked(f, depth - 1, cell)
 
 
-def _resume_a2(
-    mut f: Fiber, deep: UnsafePointer[Int, MutUntrackedOrigin]
-) raises:
-    """Resume A (#2) from a DEEPER helper frame (one extra nesting level):
-    the native marker captured here sits at a different stack depth than the
-    one taken for the first switch."""
-    _resume_a2_inner(f, deep)
-
-
-def _resume_a2_inner(
-    mut f: Fiber, deep: UnsafePointer[Int, MutUntrackedOrigin]
-) raises:
-    deep[0] = _native_marker()
-    f.resume()
+comptime NATIVE_DEPTH_SHALLOW = Int(0)
+comptime NATIVE_DEPTH_DEEP = Int(4)
 
 
 def main() raises:
@@ -288,7 +286,7 @@ def main() raises:
         failures.append("unpinned wake must stay on the local queue")
 
     # --- resume #1: FIRST BODY ENTRY — STARTED + owner pinned here ----------
-    _resume_a1(f_a, npre)
+    _resume_marked(f_a, NATIVE_DEPTH_SHALLOW, npre)
 
     if not f_a.is_started():
         failures.append("fiber not started after first body entry")
@@ -334,7 +332,7 @@ def main() raises:
         failures.append("B did not execute on its allocated synthetic stack")
 
     # --- resume #2: exact resume point on the SAME live stack ---------------
-    _resume_a2(f_a, ndeep)
+    _resume_marked(f_a, NATIVE_DEPTH_DEEP, ndeep)
 
     if pa[].phase != 4:
         failures.append("entry A did not complete after resume (phase "
