@@ -5,3 +5,7 @@
 # commit of the same PR) and does NOT block the commit; the failure is still
 # logged. Remove the row as soon as the implementation turns the test green —
 # an unlisted failure blocks the commit.
+
+# A2.4 (issue #70) TDD-red: t33_steal_aot compiles only once the E4
+# steal surface lands (implementation commit of the same PR).
+suite	https://github.com/mojito-async/mojito-async/issues/70
