@@ -54,6 +54,7 @@ from mojito_async.runtime.thread_entry import (
     CELL_ENTRY,
     CELL_WORKER,
     WorkerEntryCell,
+    cell_size_gate,
 )
 from mojito_async.runtime.worker import Worker
 from mojito_async.vendor.mojito_sys import (
@@ -172,6 +173,10 @@ struct WorkerPool:
         idle on the latch."""
         if self._started:
             raise Error("worker_pool.start: pool already started")
+        # M4 (PR #107 fold, issue #112): the heap cell strides must cover
+        # the REAL struct sizes — comptime assert + runtime backstop (the
+        # 512-byte blind CELL_WORKER once overflowed the pool heap).
+        cell_size_gate()
         self._tls = make_worker_tls()
         Atomic[DType.uint8].store[ordering=Ordering.RELEASE](self._latch, 0)
         self._build_cells()
