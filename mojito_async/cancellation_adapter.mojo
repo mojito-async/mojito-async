@@ -13,12 +13,11 @@
 # statics):
 #
 #   CancelFlagRegistry — a caller-allocation-free mapping, in mirror-parallel
-#   Lists, of scope handle -> scope CancelFlag pointer and (scope, child) ->
-#   per-child CancelFlag pointer.  Registering a CHILD also links that child
-#   flag under the scope flag via make_child_flag (read-through: cancelling
-#   the scope flag is observed by the child checkpoint).  The registry never
-#   allocates CancelFlag cells — callers own the flags and pass their
-#   pointers in.
+#   Lists, of handle -> scope flag and (scope, child) -> per-child flag.
+#   Registering a CHILD also links that child flag under the scope flag via
+#   make_child_flag (read-through: cancelling the scope is observed by the
+#   child checkpoint).  The registry never allocates CancelFlag cells —
+#   callers own the flags and pass their pointers in.
 #
 #   CancelFlagHook — a CancelHook implementation (scope.mojo's injected
 #   failure-policy callback) whose request_cancel(scope_handle,
@@ -26,6 +25,12 @@
 #   request() on it (tree propagation through the child flag's parent link).
 #   Unknown scope / unknown child REFUSE deterministically with documented
 #   message prefixes.
+#
+#   Registration is SYMMETRIC: register_child mutates the caller's child flag
+#   (links it under the scope flag); unregister_child / unregister_scope
+#   reverse that mutation by calling flag.clear_parent() on each unregistered
+#   child, so an unregistered flag stops reading through to a retired scope.
+#   The registry does not otherwise own the flag cells.
 #
 # Error messages use the stable prefixes:
 #   "CancelAdapter: unknown scope <n>"
@@ -104,10 +109,12 @@ struct CancelFlagRegistry(Movable, ImplicitlyDeletable):
             raise Error(
                 "CancelAdapter: unknown scope " + String(scope_handle)
             )
-        # drop children mapped under this scope
+        # drop every child mapped under this scope (severing its parent link
+        # so the child flag stops reading through to the scope — symmetry)
         var j = 0
         while j < len(self._child_scope_ids):
             if self._child_scope_ids[j] == scope_handle:
+                self._child_flags[j][].clear_parent()
                 var last = len(self._child_scope_ids) - 1
                 self._child_scope_ids[j] = self._child_scope_ids[last]
                 self._child_ids[j] = self._child_ids[last]
@@ -165,12 +172,19 @@ struct CancelFlagRegistry(Movable, ImplicitlyDeletable):
         self._child_flags.append(flag)
 
     def unregister_child(mut self, scope_handle: Int, child_handle: Int) raises:
-        """Drop a child mapping.  Refuses an unknown child."""
+        """Drop a child mapping (symmetry with register_child).
+
+        register_child mutates the caller-supplied child flag by linking it
+        under the scope flag; unregister_child reverses that mutation, calling
+        flag.clear_parent() so the child flag stops reading through to the
+        scope.  Refuses an unknown child.  Never frees the flag cell
+        (caller-owned)."""
         for i in range(len(self._child_scope_ids)):
             if (
                 self._child_scope_ids[i] == scope_handle
                 and self._child_ids[i] == child_handle
             ):
+                self._child_flags[i][].clear_parent()
                 var last = len(self._child_scope_ids) - 1
                 self._child_scope_ids[i] = self._child_scope_ids[last]
                 self._child_ids[i] = self._child_ids[last]
