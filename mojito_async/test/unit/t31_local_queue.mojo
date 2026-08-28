@@ -31,7 +31,9 @@ from mojito_async.runtime.runtime import Runtime
 from mojito_async.runtime.scheduler import scheduler_loop
 from mojito_async.runtime.task_control_block import TaskControlBlock
 from mojito_async.runtime.worker import make_worker
+from mojito_async.runtime.idle import ACCT_BYTES, acct_pending, complete_work
 from mojito_async.task import JoinHandle, execute, spawn
+from mojito_async.vendor.mojito_sys import c_free, c_malloc
 
 
 def red(what: String) raises -> None:
@@ -209,5 +211,42 @@ def main() raises:
         red("B's second pop_remote must raise (exactly-once)")
     if rtap[].pending() != 0:
         red("worker A must not observe B's remote queue")
+
+    # ---- 7. E6/M2 acct seam (PR #107 fold, issue #112): the producer-side
+    # wake budget.  The pool event does not exist in this lane (E1/E6-owned),
+    # so a fresh worker runtime starts with the address-1 SENTINEL and the
+    # announce is a guarded no-op; arming a caller-owned acct block must
+    # make enqueue_local + push_remote announce exactly one unit each (the
+    # E6 pre-park re-check reads pending; the wake_one signal is
+    # #112-OWNED). ---------------------------------------------------------
+    if Int(wa.runtime()[].pool_acct()) != 1:
+        red("worker runtime must start with the address-1 sentinel")
+    var acct_block = c_malloc(ACCT_BYTES)
+    var az = UnsafePointer[Int64, MutAnyOrigin](
+        unsafe_from_address=Int(acct_block)
+    )
+    for zk in range(ACCT_BYTES // 8):
+        (az + zk)[0] = 0
+    # (a) unarmed: enqueue_local must NOT announce (sentinel guard).
+    var tb0 = TB.create()
+    _ = spawn(rtap[], _ptr(tb0), 0)
+    if acct_pending(acct_block) != 0:
+        red("unarmed runtime must announce nothing (sentinel guard)")
+    # (b) armed: enqueue_local + push_remote announce exactly once each.
+    rtap[].arm_acct(acct_block)
+    var tb1 = TB.create()
+    _ = spawn(rtap[], _ptr(tb1), 0)
+    rtap[].push_remote(Int(_ptr(tb1)), 1111)
+    if acct_pending(acct_block) != 2:
+        red("armed runtime must announce one unit per accepted enqueue")
+    # (c) complete drains the announced units (submit/complete pair).
+    complete_work(acct_block, 2)
+    if acct_pending(acct_block) != 0:
+        red("complete_work must drain the announced units")
+    # (d) arm_acct refuses the sentinel; pool_acct still reads the block.
+    rtap[].arm_acct(BytePtr(unsafe_from_address=1))
+    if Int(rtap[].pool_acct()) != Int(acct_block):
+        red("arm_acct must refuse the address-1 sentinel")
+    c_free(acct_block)
 
     print("T31 local queue: PASS")
