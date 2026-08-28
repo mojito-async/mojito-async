@@ -50,23 +50,38 @@ def _acct_cell(acct: BytePtr, off: Int) -> UnsafePointer[Int64, MutAnyOrigin]:
 
 # --- readers (pool + embedder side) ----------------------------------------
 
+def _acct_guarded(acct: BytePtr, off: Int) -> Int:
+    """Read one acct counter; an unarmed pool (the address-1 sentinel — the
+    accounting block is allocated at construction now) reports a quiescent 0
+    instead of dereferencing the sentinel."""
+    if Int(acct) <= 1:
+        return 0
+    return Int(Atomic[DType.int64].load[ordering=Ordering.SEQUENTIAL](
+        _acct_cell(acct, off)
+    ))
+
+
 def acct_parked(acct: BytePtr) -> Int:
     """Number of workers currently parked as sleepers (sequentially the
     pool's idle-worker count; a spinning worker never holds one of these)."""
-    return Int(Atomic[DType.int64].load[ordering=Ordering.SEQUENTIAL](_acct_cell(acct, ACCT_IDLE_OFF)))
+    return _acct_guarded(acct, ACCT_IDLE_OFF)
+
 
 def acct_pending(acct: BytePtr) -> Int:
     """Announced (injected but not yet drained) work units."""
-    return Int(Atomic[DType.int64].load[ordering=Ordering.SEQUENTIAL](_acct_cell(acct, ACCT_PENDING_OFF)))
+    return _acct_guarded(acct, ACCT_PENDING_OFF)
+
 
 def acct_park_total(acct: BytePtr) -> Int:
-    return Int(Atomic[DType.int64].load[ordering=Ordering.SEQUENTIAL](_acct_cell(acct, ACCT_PARK_OFF)))
+    return _acct_guarded(acct, ACCT_PARK_OFF)
+
 
 def acct_wake_total(acct: BytePtr) -> Int:
-    return Int(Atomic[DType.int64].load[ordering=Ordering.SEQUENTIAL](_acct_cell(acct, ACCT_WAKE_OFF)))
+    return _acct_guarded(acct, ACCT_WAKE_OFF)
+
 
 def acct_spurious_total(acct: BytePtr) -> Int:
-    return Int(Atomic[DType.int64].load[ordering=Ordering.SEQUENTIAL](_acct_cell(acct, ACCT_SPUR_OFF)))
+    return _acct_guarded(acct, ACCT_SPUR_OFF)
 
 
 # --- producers / embedder side ---------------------------------------------

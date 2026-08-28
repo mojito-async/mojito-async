@@ -146,7 +146,10 @@ struct WorkerPool:
         self._latch = c_malloc(8).bitcast[Scalar[DType.uint8]]()
         Atomic[DType.uint8].store[ordering=Ordering.RELEASE](self._latch, 0)
         self._event = NativeEvent()
-        self._acct = BytePtr(unsafe_from_address=1)
+        # Accounting block allocated AT CONSTRUCTION (crash fix, A2.6): no
+        # copy/read may ever dereference the address-1 sentinel; _ensure_idle_
+        # state() keeps re-arming it across restarts without reallocating.
+        self._acct = c_malloc(ACCT_BYTES)
 
     def __init__(out self, config: RuntimeConfig):
         self._config = config
@@ -161,7 +164,10 @@ struct WorkerPool:
         self._latch = c_malloc(8).bitcast[Scalar[DType.uint8]]()
         Atomic[DType.uint8].store[ordering=Ordering.RELEASE](self._latch, 0)
         self._event = NativeEvent()
-        self._acct = BytePtr(unsafe_from_address=1)
+        # Accounting block allocated AT CONSTRUCTION (crash fix, A2.6): no
+        # copy/read may ever dereference the address-1 sentinel; _ensure_idle_
+        # state() keeps re-arming it across restarts without reallocating.
+        self._acct = c_malloc(ACCT_BYTES)
 
     # --- addressing ---------------------------------------------------------
 
