@@ -250,22 +250,21 @@ def _native_marker() -> Int:
     return Int(UnsafePointer[Int, MutAnyOrigin](to=slot))
 
 
-# The fiber-backed dispatcher (generic scheduler_loop bound): the fiber
-# handle is threaded through the driver value (design decision, issue #53:
-# NEVER dynamic dispatch).  Each slice: claim RUNNING, drive the task's
-# fiber (entry or exact re-entry), then settle:
-#   - body unwound (slot.finished)  -> RUNNING -> COMPLETED + result;
-#   - body parked mid-frame         -> fiber_suspend_current (A: WAITING
-#     + generation bump) or fiber_yield_now (Y: PARKING -> RUNNABLE + FIFO
-#     re-enqueue, no wait epoch).
+# fiber (entry or exact re-entry), then settle by the FRAME-REPORTED
+# VERDICT (T3):
+#   - verdict Parked   -> fiber_suspend_current (A: WAITING + generation
+#     bump) or fiber_yield_now (Y: PARKING -> RUNNABLE + FIFO re-enqueue,
+#     no wait epoch);
+#   - verdict Completed -> the body unwound -> seam_mark_completed ->
+#     RUNNING -> COMPLETED + result.
 def dispatch(mut rt: Runtime, tcb_addr: Int, tid: Int, ud: BytePtr) raises -> Int:
     var sc = ud.bitcast[T26Scene]()
     if tid == sc[].a_tid[]:
         var ha = _handle(tcb_addr, tid)
         sc[].a_n[] = sc[].a_n[] + 1
         claim_running(ha)
-        seam_drive(rt, sc[].slot_a)
-        if sc[].a_n[] >= 2:
+        var va = seam_drive(rt, sc[].slot_a)
+        if not va.is_parked():
             seam_mark_completed(sc[].slot_a)
             ha.tcb()[].transition(TaskControlBlock.COMPLETED)
             ha.tcb()[].mark_result(IntResult(211))
@@ -276,17 +275,20 @@ def dispatch(mut rt: Runtime, tcb_addr: Int, tid: Int, ud: BytePtr) raises -> In
         var hb = _handle(tcb_addr, tid)
         sc[].b_n[] = sc[].b_n[] + 1
         claim_running(hb)
-        seam_drive(rt, sc[].slot_b)
-        seam_mark_completed(sc[].slot_b)
-        hb.tcb()[].transition(TaskControlBlock.COMPLETED)
-        hb.tcb()[].mark_result(IntResult(111))
+        var vb = seam_drive(rt, sc[].slot_b)
+        if not vb.is_parked():
+            seam_mark_completed(sc[].slot_b)
+            hb.tcb()[].transition(TaskControlBlock.COMPLETED)
+            hb.tcb()[].mark_result(IntResult(111))
+        else:
+            fiber_suspend_current(rt, hb, Int(3))
         return 1
     if tid == sc[].y_tid[]:
         var hy = _handle(tcb_addr, tid)
         sc[].y_n[] = sc[].y_n[] + 1
         claim_running(hy)
-        seam_drive(rt, sc[].slot_y)
-        if sc[].y_n[] >= 2:
+        var vy = seam_drive(rt, sc[].slot_y)
+        if not vy.is_parked():
             seam_mark_completed(sc[].slot_y)
             hy.tcb()[].transition(TaskControlBlock.COMPLETED)
             hy.tcb()[].mark_result(IntResult(311))
