@@ -80,6 +80,7 @@ from mojito_async.runtime.scheduler import scheduler_loop
 from mojito_async.runtime.task_control_block import TaskControlBlock
 from mojito_async.runtime.join_handle import JoinHandle
 from mojito_async.runtime.park import park_current
+from mojito_async.runtime.idle import ACCT_BYTES, acct_pending, complete_work
 from mojito_async.integration.sys import IntResult
 from mojito_async.task import claim_running, execute, spawn
 
@@ -568,6 +569,17 @@ def main() raises:
 
     # ---- Driver B: deterministic backpressure (fresh runtime) --------------
     var rt_b = create()
+    # E6/M2 fold (PR #106, issue #112): arm a caller-owned idle acct block
+    # and verify enqueue_global announces PER ACCEPTED RECORD — a rejected
+    # push announces nothing, so the bounded wake budget is never
+    # over-spent (wake_one itself is #112-OWNED).
+    var acct_b = c_malloc(ACCT_BYTES)
+    var azb = UnsafePointer[Int64, MutAnyOrigin](unsafe_from_address=Int(acct_b))
+    for zk in range(ACCT_BYTES // 8):
+        (azb + zk)[0] = 0
+    rt_b.arm_acct(acct_b)
+    if Int(rt_b.pool_acct()) != Int(acct_b):
+        failures.append("driver B: arm_acct did not arm the acct block")
     # Driver-B TCB cells live on the HEAP (c_malloc): NB=1168 TCBs is too
     # large for stack_allocation and the compiler elides the in-place
     # transitions on the oversized stack array (verified: states read back
@@ -602,6 +614,11 @@ def main() raises:
     if rt_b.inject_pending() != CAP_FULL:
         failures.append("driver B: pending " + String(rt_b.inject_pending())
                         + " != capacity " + String(CAP_FULL))
+    if acct_pending(acct_b) != pushed_ok_b:
+        failures.append("driver B: announced " + String(acct_pending(acct_b))
+                        + " != accepted " + String(pushed_ok_b)
+                        + " (per-accepted-record budget violated: rejected "
+                        + "pushes must announce nothing)")
 
 
 
@@ -663,6 +680,27 @@ def main() raises:
     if overruns != over_ok:
         failures.append("driver B: accepted-overrun TCBs completed " + String(overruns)
                         + " != over_ok " + String(over_ok))
+    if acct_pending(acct_b) != pushed_ok_b + over_ok:
+        failures.append("driver B: announced-after-drain "
+                        + String(acct_pending(acct_b)) + " != accepted "
+                        + String(pushed_ok_b + over_ok))
+    # submit()/complete() pair (M7): the drain side completes the announced
+    # budget; the signed pending counter returns to 0.
+    complete_work(acct_b, pushed_ok_b + over_ok)
+    if acct_pending(acct_b) != 0:
+        failures.append("driver B: complete_work did not drain the announced "
+                        + "budget (pending " + String(acct_pending(acct_b)) + ")")
+    # M7 debug pair-mismatch detection: an over-complete past the announced
+    # balance must ASSERT (pending would go negative).
+    var pair_broken = False
+    try:
+        complete_work(acct_b, 1)
+    except Error:
+        pair_broken = True
+    if not pair_broken:
+        failures.append("driver B: over-complete must assert (M7 pair "
+                        + "mismatch not detected)")
+    c_free(acct_b)
 
     # ---- Driver C: cross-worker wake injection -----------------------------
     var owner_tcb = TB.create()
@@ -744,6 +782,14 @@ def main() raises:
     var d_up = UnsafePointer[T32Worker, MutAnyOrigin](to=d_worker)
     var d_ud = d_up.bitcast[Byte]()
     var inj_ptr = rt.inject_queue()
+    # E6/M2 fold: verify the LOCAL route of enqueue_global announces too
+    # (driver B proved the injection route).  Drives A-C are done — arming
+    # rt now cannot disturb them.
+    var acct_d = c_malloc(ACCT_BYTES)
+    var azd = UnsafePointer[Int64, MutAnyOrigin](unsafe_from_address=Int(acct_d))
+    for zk in range(ACCT_BYTES // 8):
+        (azd + zk)[0] = 0
+    rt.arm_acct(acct_d)
 
     # injected policy task: current_worker=0 -> injection queue
     var p_tcb = TB.create()
@@ -760,6 +806,10 @@ def main() raises:
     if enq_inj and rt.inject_pending() != pend_before + 1:
         failures.append("driver D: injected policy task did not land in the "
                         + "injection queue")
+    if enq_inj and acct_pending(acct_d) != 1:
+        failures.append("driver D: injected accepted record must announce "
+                        + "exactly once (got "
+                        + String(acct_pending(acct_d)) + ")")
     try:
         _ = worker_slice(UnsafePointer[Runtime, MutAnyOrigin](to=rt), inj_ptr, d_ud)
     except Error:
@@ -782,6 +832,9 @@ def main() raises:
     if enq_loc and rt.inject_pending() != pend_l:
         failures.append("driver D: LOCAL enqueue touched the injection queue "
                         + "(no-global-lock-on-local-path violated)")
+    if enq_loc and acct_pending(acct_d) != 2:
+        failures.append("driver D: local-route announce lost (pending "
+                        + String(acct_pending(acct_d)) + ")")
     try:
         _ = worker_slice(UnsafePointer[Runtime, MutAnyOrigin](to=rt), inj_ptr, d_ud)
     except Error:
@@ -790,6 +843,10 @@ def main() raises:
         failures.append("driver D: local policy task did not complete")
     if rt.inject_pending() != 0:
         failures.append("driver D: injection queue not quiet after policy")
+    complete_work(acct_d, 2)
+    if acct_pending(acct_d) != 0:
+        failures.append("driver D: announced budget not drained after policy")
+    c_free(acct_d)
 
     # ---- verdict ------------------------------------------------------------
     if len(failures) == 0:
