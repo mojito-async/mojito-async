@@ -2,10 +2,11 @@
 #
 # A2.1 (issue #67) — the worker-thread entry: the C-ABI trampoline body
 # (mjs_pool_entry_main), the per-worker entry-cell the trampoline reads, and
-# the FUTURE worker-loop seam (E2-OWNED; the queue lane, issue #68, fills the
-# loop body).  This is the A2 production home of the S2.2 thread-entry recipe
-# (an @export'd abi("C") entry + the adrp/add code address, proven under
-# mojito_sys and in the *_aot drivers).
+# the worker-loop seam (E2-OWNED; the queue lane, issue #68, fills the loop
+# body; A2.6/E6, issue #72, fills the IDLE sleep/wake path).  This is the A2
+# production home of the S2.2 thread-entry recipe (an @export'd abi("C")
+# entry + the adrp/add code address, proven under mojito-sys and in the
+# *_aot drivers).
 #
 # EMBEDDING RULE (b2 AOT linkage — probe-proven, and the same pattern the A1
 # fiber lanes use where drivers export their own t28_entry/t24_entry bodies):
@@ -24,39 +25,55 @@
 # recipe needs the symbol present in the same binary).  The BODY is shared
 # here so every embedder only writes the two-line forwarding export.
 #
-# ENTRY CHOREOGRAPHY (A2.1 discipline):
-#   1. current_worker TLS (spec §69) is written AT THREAD ENTRY, once, at
-#      COARSE granularity — the slot receives the Worker cell address (the
-#      value is then worker-stable for the thread's whole life).  Per the
-#      S2.4 scalability note the C TLS layer holds one global registry mutex
-#      on reads, so NO per-task get() hot paths exist this lane; the single
-#      entry write + the acceptance read-back are the whole TLS surface.
-#      current_task / current_scope keys (spec §22/§69) are RESERVED slots
-#      carried in the cell and NOT written yet (the E-lanes claim them).
+# ENTRY CHOREOGRAPHY:
+#   1. TLS (spec §22/§69) is established AT THREAD ENTRY, once, at COARSE
+#      granularity — current_worker receives the Worker cell address
+#      (worker-stable for the thread's whole life); current_task /
+#      current_scope are bound to the "cleared" sentinel (no task/scope is
+#      current when a worker enters).  Per the S2.4 note the C TLS layer
+#      holds one global registry mutex on reads, so NO per-task get() hot
+#      paths exist; the single entry write + the acceptance read-back are the
+#      whole TLS surface.  A2.6 formalizes the bind/clear via runtime/tls.mojo.
 #   2. the worker runs the E2-OWNED seam (pool_worker_loop): this lane
-#      drains the seeded seam units (direct current_worker observations — the
-#      A2.1 acceptance "K tasks each observing current_worker"), then parks
-#      idle on the shutdown latch.  Issue #68 replaces the unit source with
-#      the worker's LOCAL runnable queue + scheduler drive; the latch check
-#      stays.  The NativeEvent idle/wake path is E6.
+#      drains the seeded seam units (direct current_worker observations), then
+#      SLEEPS on the pool NativeEvent (A2.6/E6) instead of busy-spinning.
 #   3. exit: the loop returns when it observes the latch; the trampoline
-#      flags exited so join_all() can assert every worker saw the shutdown.
+#      CLEARS all three TLS slots (spec §22/§69) and flags exited so
+#      join_all() can assert every worker saw the shutdown.
 #
 # The entry cell lives in pool-owned heap (worker_pool.mojo) with a STABLE
 # address for the worker's whole life; the worker's Runtime/TCB cells are
 # never touched cross-thread by this lane (per-worker Runtime only).
 #
-# Externs: none HERE — pthread spawn/join/TLS live in vendor/mojito_sys.mojo
-# at concrete module scope; this module only composes them.
+# Externs: none HERE — pthread spawn/join/TLS + NativeEvent live in
+# vendor/mojito_sys.mojo at concrete module scope; this module composes them.
+#
+# E6 b2 workaround (documented at worker_idle_park): the worker-side idle park
+# body lives at MODULE scope HERE (the abi("C") trampoline's own module) and
+# calls the vendor NativeEvent wrappers directly.  Deeper struct-method /
+# cross-module extern chains from an abi("C") def mis-lower on 1.0.0b2
+# ("Call parameter type does not match function signature!" — a UInt arg
+# degrades to pass-by-ref through the layers); keeping the extern calls at
+# concrete module scope in the trampoline module sidesteps it.  The shared
+# accounting (idle.mojo) uses identical ACCT_* offsets, so producer and worker
+# agree on the same block.
 from std.atomic import Atomic, Ordering
 from std.memory import stack_allocation
 from std.time import sleep
 from mojito_async.integration.sys import BytePtr
+from mojito_async.runtime.idle import IDLE_PAIR_ASSERT
+from mojito_async.runtime.tls import (
+    bind_current_scope,
+    bind_current_task,
+    bind_current_worker,
+    clear_worker_tls,
+)
 from mojito_async.runtime.worker import Worker
 from mojito_async.vendor.mojito_sys import (
     NativeTlsKey,
+    monotonic_now_ns,
+    native_event_wait_until,
     pthread_getspecific,
-    pthread_setspecific,
     spawn_native_thread,
     tls_get,
 )
@@ -108,6 +125,19 @@ def cell_size_gate() raises:
         raise Error("thread_entry: CELL_WORKER too small for the Worker struct")
     if CELL_ENTRY < _entry_cell_stride():
         raise Error("thread_entry: CELL_ENTRY too small for the WorkerEntryCell")
+# Generous (2 s) so idle workers genuinely SLEEP for long stretches; the
+# wake budget + shutdown both signal the event explicitly, so latency stays
+# sub-millisecond regardless.
+comptime IDLE_PARK_SLICE_NS = Int(2_000_000_000)  # 2 s backstop
+
+
+# The pool-owned idle accounting block layout (SHARED with runtime/idle.mojo —
+# must match idle.mojo's ACCT_* comptime offsets exactly).
+comptime IDLE_ACCT_IDLE = Int(0)
+comptime IDLE_ACCT_PENDING = Int(8)
+comptime IDLE_ACCT_PARK = Int(64)
+comptime IDLE_ACCT_WAKE = Int(72)
+comptime IDLE_ACCT_SPUR = Int(80)
 
 
 struct WorkerEntryCell(ImplicitlyCopyable, ImplicitlyDeletable, Movable):
@@ -123,13 +153,18 @@ struct WorkerEntryCell(ImplicitlyCopyable, ImplicitlyDeletable, Movable):
                   TLS VALUE; spec §69).
     cw/ct/cs    — the pool's three NativeTlsKey slots (spec §22/§69):
                   current_worker (written at entry) + current_task +
-                  current_scope (RESERVED; the E-lanes write them).
+                  current_scope (bound to the cleared sentinel at entry).
     latch       — the pool's shutdown latch (Atomic[uint8]: 0 running, 1
                   shutdown requested); polled by the idle loop.
     units_left  — seam units still to run for this worker (issue #68 swaps
                   this for the local runnable queue).
     obs/obs_done/obs_cap — the seam unit's observation slice (driver-owned
                   heap): each unit records its worker id at obs[obs_done].
+    event       — the pool's NativeEvent handle (A2.6/E6 idle park target).
+    acct        — the pool's idle-accounting block (A2.6/E6 lock-free
+                  atomics: idle sleepers, announced work, spec §71 counters).
+    idle_parks  — how many times THIS worker parked as a sleeper (A2.6/E6;
+                  the bench's parked-not-spinning observability, post-join).
     entry_ok    — TLS read-back at ENTRY matched the Worker cell address.
     unit_ok     — every seam unit saw the stable current_worker value.
     loop_ok/exited — the seam ran cleanly / the worker observed the latch.
@@ -150,6 +185,9 @@ struct WorkerEntryCell(ImplicitlyCopyable, ImplicitlyDeletable, Movable):
     var unit_ok: Bool
     var loop_ok: Bool
     var exited: Bool
+    var event: Int             # pool NativeEvent handle (E6 park target)
+    var acct: BytePtr          # pool idle-accounting block (E6 atomics)
+    var idle_parks: Int        # times this worker parked as a sleeper
 
     def __init__(out self):
         self.worker_id = 0
@@ -169,6 +207,9 @@ struct WorkerEntryCell(ImplicitlyCopyable, ImplicitlyDeletable, Movable):
         self.unit_ok = True
         self.loop_ok = False
         self.exited = False
+        self.event = 0
+        self.acct = BytePtr(unsafe_from_address=1)
+        self.idle_parks = 0
 
 
 # ---------------------------------------------------------------------------
@@ -179,19 +220,83 @@ struct WorkerEntryCell(ImplicitlyCopyable, ImplicitlyDeletable, Movable):
 #     dispatcher>, ud) — the seam function signature stays exactly
 #     `pool_worker_loop(cell: BytePtr) raises`; stealing (#70) reaches the
 #     stealable set from the same loop; the NativeEvent idle path is E6.
-# A2.1 leaves the shutdown-latch poll as the ONLY loop motion after units,
-# which is what makes "request_shutdown() observed by every worker loop;
-# join_all() returns; no thread leaks" provable BEFORE the queue lands.
+# A2.6 (issue #72) fills the E6 idle path: after the units a worker SLEEPS on
+# the pool's NativeEvent (worker_idle_park) instead of busy-spinning on the
+# latch; the bounded deadline slice is the shutdown backstop.
 # ---------------------------------------------------------------------------
 
+def _idle_cell(acct: BytePtr, off: Int) -> UnsafePointer[Int64, MutAnyOrigin]:
+    """Address of one int64 atomic in the pool's idle-accounting block."""
+    return UnsafePointer[Int64, MutAnyOrigin](unsafe_from_address=Int(acct) + off)
+
+
+def _idle_pending(acct: BytePtr) -> Int:
+    return Int(Atomic[DType.int64].load[ordering=Ordering.SEQUENTIAL](_idle_cell(acct, IDLE_ACCT_PENDING)))
+
+
+def worker_idle_park(acct: BytePtr, event: Int, deadline_ns: UInt) -> Bool:
+    """The OS-level idle park of one worker (issue #72 step 2/step 5), at
+    module scope in the abi("C") trampoline's module (see the E6 b2 workaround
+    note at the top) so the vendor NativeEvent wrappers are called at concrete
+    scope.  Identical semantics to idle.mojo's idle_park_worker, and it reads/
+    writes the SAME acct block via the same offsets.
+
+      1. commit this OS worker as a sleeper (+1 _idle_workers);
+      2. RE-CHECK the announced-work count immediately before sleeping — the
+         lost-wakeup guard (work landed between the last pop and here); if
+         present, withdraw and return True (the caller does not sleep);
+      3. park on the pool NativeEvent with an absolute CLOCK_MONOTONIC
+         deadline slice (native_event_wait_until consumes a token; the C
+         predicate loop means ok ONLY on a real token — no fake spurious
+         ready, spec §17), then leave the sleeper set;
+      4. on a consumed token classify it: productive when announced work
+         remains, spurious otherwise (bump spurious_wake_total, spec §71).
+
+    Returns True when the caller should NOT sleep (work found at the pre-park
+    re-check); False after a real park (woken by token or the slice elapsed —
+    the caller re-checks the latch and re-parks)."""
+    _ = Atomic[DType.int64].fetch_add[ordering=Ordering.SEQUENTIAL](
+        _idle_cell(acct, IDLE_ACCT_IDLE), 1
+    )
+    if _idle_pending(acct) > 0:
+        _ = Atomic[DType.int64].fetch_add[ordering=Ordering.SEQUENTIAL](
+            _idle_cell(acct, IDLE_ACCT_IDLE), -1
+        )
+        return True
+    _ = Atomic[DType.int64].fetch_add[ordering=Ordering.SEQUENTIAL](
+        _idle_cell(acct, IDLE_ACCT_PARK), 1
+    )
+    var consumed = native_event_wait_until(event, deadline_ns)
+    _ = Atomic[DType.int64].fetch_add[ordering=Ordering.SEQUENTIAL](
+        _idle_cell(acct, IDLE_ACCT_IDLE), -1
+    )
+    if consumed:
+        _ = Atomic[DType.int64].fetch_add[ordering=Ordering.SEQUENTIAL](
+            _idle_cell(acct, IDLE_ACCT_WAKE), 1
+        )
+        if _idle_pending(acct) == 0:
+            _ = Atomic[DType.int64].fetch_add[ordering=Ordering.SEQUENTIAL](
+                _idle_cell(acct, IDLE_ACCT_SPUR), 1
+            )
+    return False
+
+
 def pool_worker_loop(cell: BytePtr):
-    """E2-OWNED SEAM (issue #68 fills this): the worker's main loop.
+    """E2-OWNED SEAM (issue #68 fills the queue-drive): the worker's main loop.
 
     A2.1: first drain this worker's seeded seam units — each unit runs
     seam_run_unit (one current_worker TLS observation, the lane's acceptance
-    "task").  Then idle on the shutdown latch (checked every iteration; the
-    A2.1 exit requirement is "parked idles see the latch and exit" — the
-    latch poll IS the park; the NativeEvent idle path is E6).
+    "task").
+
+    E6 (issue #72) IDLE SLEEP/WAKE: after the seam units the worker does NOT
+    busy-spin on the shutdown latch — it SLEEPS on the pool's NativeEvent via
+    worker_idle_park (spec §21, issue #72 step 2/step 5): it commits as an
+    idle sleeper, re-checks announced work (the lost-wakeup guard), and parks
+    on wait_until(absolute CLOCK_MONOTONIC slice).  A producer's wake budget
+    (pool.wake_one) signals the event; a parked worker wakes, re-checks the
+    latch / re-parks.  The bounded deadline slice is the shutdown backstop:
+    even if a signal races a just-parked worker, it wakes within one slice,
+    sees the latch, and exits (never join-from-worker).
 
     NON-RAISING on purpose (b2 1.0.0b2 drops/compiles-out function calls
     inside try/except inside abi("C") defs — probed in this lane; the entry
@@ -206,7 +311,46 @@ def pool_worker_loop(cell: BytePtr):
         )
         if Int(latched) != 0:
             return
-        sleep(0.001)
+        # E6 idle park — body INLINED here (NOT via worker_idle_park): the
+        # 1.0.0b2 compiler mis-lowers native_event_wait_until's UInt arg when
+        # the extern is reached through THREE call layers from the abi("C")
+        # trampoline (abiC -> pool_worker_loop -> worker_idle_park -> extern;
+        # "Call parameter type does not match function signature" -> SEGV).
+        # Two layers (abiC -> pool_worker_loop -> extern) lower correctly.
+        # worker_idle_park stays for direct (non-abiC) callers.
+        var deadline = monotonic_now_ns() + IDLE_PARK_SLICE_NS
+        var acctp = c[].acct
+        _ = Atomic[DType.int64].fetch_add[ordering=Ordering.SEQUENTIAL](
+            _idle_cell(acctp, IDLE_ACCT_IDLE), 1
+        )
+        var have_work = _idle_pending(acctp) > 0
+        if have_work:
+            _ = Atomic[DType.int64].fetch_add[ordering=Ordering.SEQUENTIAL](
+                _idle_cell(acctp, IDLE_ACCT_IDLE), -1
+            )
+            # Announced work present at the pre-park re-check: the embedder
+            # drains the real task queues (a2.2 discipline; A2Bench contract).
+            # Yield briefly — bounded, NOT a busy-spin — then re-check latch.
+            sleep(0.0002)
+        else:
+            _ = Atomic[DType.int64].fetch_add[ordering=Ordering.SEQUENTIAL](
+                _idle_cell(acctp, IDLE_ACCT_PARK), 1
+            )
+            var consumed = native_event_wait_until(c[].event, deadline)
+            _ = Atomic[DType.int64].fetch_add[ordering=Ordering.SEQUENTIAL](
+                _idle_cell(acctp, IDLE_ACCT_IDLE), -1
+            )
+            if consumed:
+                _ = Atomic[DType.int64].fetch_add[ordering=Ordering.SEQUENTIAL](
+                    _idle_cell(acctp, IDLE_ACCT_WAKE), 1
+                )
+                if _idle_pending(acctp) == 0:
+                    _ = Atomic[DType.int64].fetch_add[ordering=Ordering.SEQUENTIAL](
+                        _idle_cell(acctp, IDLE_ACCT_SPUR), 1
+                    )
+            # This worker genuinely parked on the NativeEvent and returned
+            # (consumed a token or the slice elapsed); re-check the latch.
+            c[].idle_parks += 1
 
 
 def seam_run_unit(cell: BytePtr):
@@ -216,7 +360,7 @@ def seam_run_unit(cell: BytePtr):
     observation slice.  NON-RAISING (b2 try-in-abiC drop workaround; a full
     observation slice just trips unit_ok).  Issue #68 replaces this whole
     unit source with queue-driven scheduler slices; the current_worker read
-    is the only part that stays."""
+    and the announced-unit completion (below) are the parts that stay."""
     var c = cell.bitcast[WorkerEntryCell]()
     var me = tls_get(c[].cw)
     if Int(me) != Int(c[].worker):
@@ -227,27 +371,58 @@ def seam_run_unit(cell: BytePtr):
     c[].obs[c[].obs_done] = c[].worker_id
     c[].obs_done += 1
     c[].units_left -= 1
+    # A2.6/M7 (issue #72): the drained seam unit COMPLETES one announced
+    # unit — seed_seam_units announced per_worker units per worker and every
+    # drain must pair (producer wake protocol, idle.mojo header).  NON-
+    # RAISING (abi("C") path; b2 drops try/except calls here): a debug-build
+    # underflow (drain below the announced floor — old pending < 1 before
+    # the -1) flags unit_ok instead of raising, mirroring idle.mojo's
+    # complete_work pair-mismatch detection on the worker side.
+    var pending_before = Atomic[DType.int64].fetch_add[ordering=Ordering.SEQUENTIAL](
+        _idle_cell(c[].acct, IDLE_ACCT_PENDING), -1
+    )
+    if IDLE_PAIR_ASSERT and pending_before - 1 < 0:
+        c[].unit_ok = False
 
 
 def mjs_pool_entry_main(ud: BytePtr) abi("C"):
     """THE worker-thread trampoline body (@export'ed by the embedding binary;
     see EMBEDDING RULE above).  Runs on the NEW OS thread:
-      1. current_worker TLS := this worker's cell via the RAW externs
-         (coarse, entry-only).
+      1. TLS (spec §22/§69) established AT ENTRY — current_worker := this
+         worker's cell, current_task / current_scope := the cleared sentinel
+         — through runtime/tls.mojo's bind_* accessors (coarse, entry-only;
+         non-raising Bool returns, so a failure flags the entry cell instead
+         of raising through the C boundary).
       2. the E2-OWNED seam loop (pool_worker_loop, NON-raising — b2
          1.0.0b2 compiles-out calls inside try/except inside abi("C") defs,
          probed in this lane, so the entry has NO try/except at all).
-      3. flag exited + loop_ok so join_all() can audit the shutdown."""
+      3. TLS slots CLEARED at exit through runtime/tls.mojo's clear_worker_tls
+         + flags exited + loop_ok so join_all() can audit the shutdown."""
     var cell = ud.bitcast[WorkerEntryCell]()
-    var rc = pthread_setspecific(cell[].cw.raw(), cell[].worker)
-    if rc != 0:
+    # b2 cannot construct a NULL BytePtr (non-nullable), so the "cleared / no
+    # runtime bound" TLS value is the address-1 sentinel the codebase uses as
+    # a null-equivalent; the accessors treat Int(p) <= 1 as "absent".
+    var cleared = BytePtr(unsafe_from_address=1)
+    if not bind_current_worker(cell[].cw, cell[].worker):
+        cell[].entry_ok = False
+        cell[].exited = True
+        return
+    if not bind_current_task(cell[].ct, cleared):
+        cell[].entry_ok = False
+        cell[].exited = True
+        return
+    if not bind_current_scope(cell[].cs, cleared):
         cell[].entry_ok = False
         cell[].exited = True
         return
     var back = pthread_getspecific(cell[].cw.raw())
     cell[].entry_ok = Int(back) == Int(cell[].worker)
     pool_worker_loop(ud)
-    cell[].loop_ok = True
+    # A2.6 (issue #72): clear ALL three TLS slots at exit (spec §22/§69) so
+    # the OS-worker-local pointers never dangle past the trampoline.  The
+    # exit clear result feeds loop_ok (a failed clear = unclean exit).
+    var clear_ok = clear_worker_tls(cell[].cw, cell[].ct, cell[].cs)
+    cell[].loop_ok = clear_ok
     cell[].exited = True
 
 # ---------------------------------------------------------------------------
