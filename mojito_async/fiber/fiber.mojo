@@ -116,6 +116,17 @@ struct Fiber(ImplicitlyCopyable, ImplicitlyDeletable):
     # True while the fiber has yielded back to the driver and is waiting for
     # the next resume (set by suspend(), cleared by a resume() that re-enters).
     var _suspended: Bool
+    # A1.3 (issue #51): the WORKER identity this fiber is affine to once
+    # started (spec §19.2 / ADR-006).  0 = not pinned.  b2 has no TLS, so
+    # worker identity is threaded explicitly: the creating worker (EPIC #2's
+    # pool) calls set_owner() before the first resume; the owner becomes
+    # OBSERVABLE only at first body entry (STARTED) and is immutable after.
+    var _owner: Int
+
+    # A1.3 (issue #51) — ADR-007: live stacks never relocate.  In fault-
+    # enabled builds the switch helpers assert stack-locality before every
+    # switch; the assertion is a single compare (no allocation).
+    comptime FAULT_CHECKS = True
 
     # Zero-arg ctor: inert Fiber (nothing allocated).  The driver may hold
     # `var f = Fiber()` and hand `to=f` to bind()/init.
@@ -126,6 +137,7 @@ struct Fiber(ImplicitlyCopyable, ImplicitlyDeletable):
         self._prepared = False
         self._started = False
         self._suspended = False
+        self._owner = 0
 
     # All-scalar ctor binding an existing reservation: `stack` (base/top from
     # ms_stack_alloc).  The block is not yet allocated (deferred to the
@@ -137,6 +149,7 @@ struct Fiber(ImplicitlyCopyable, ImplicitlyDeletable):
         self._prepared = False
         self._started = False
         self._suspended = False
+        self._owner = 0
 
     # -- queries -----------------------------------------------------------
 
@@ -144,7 +157,36 @@ struct Fiber(ImplicitlyCopyable, ImplicitlyDeletable):
         return self._stack != 0
 
     def has_resumed(self) -> Bool:
+        """True once the fiber's first resume() has prepared+entered the
+        fresh context (the frozen batch seam spelling; alias of the spec
+        §14.1 `started` flag that is_started() also reports)."""
         return self._started
+
+    def is_started(self) -> Bool:
+        """Spec §14.1 `started`: True exactly once the fiber has entered body
+        entry (set on the FIRST resume — not at construction)."""
+        return self._started
+
+    def owner_worker(self) -> Int:
+        """The worker identity this started fiber is affine to (spec §19.2 /
+        ADR-006).  An unstarted fiber has NO owner pinned until first entry:
+        0 means not started / no owner.  Once STARTED this never changes —
+        set_owner() rejects a conflicting re-pin."""
+        if not self._started:
+            return 0
+        return self._owner
+
+    def assert_never_relocated(self) raises:
+        """ADR-007 (issue #51): the live stack address is fixed at the first
+        ms_stack_alloc and never reassigned; this Fiber only ever releases
+        that SAME reservation (in destroy()).  Called from the switch helpers
+        in fault-enabled builds (FAULT_CHECKS) and by drivers/EPIC #2 as a
+        direct policy assertion.  Raises only on a fiber with no live stack
+        (unbound/destroyed)."""
+        if self._stack == 0:
+            raise Error(
+                "fiber.assert_never_relocated: no live stack (unbound/destroyed)"
+            )
 
     def is_suspended(self) -> Bool:
         return self._suspended
@@ -202,15 +244,30 @@ struct Fiber(ImplicitlyCopyable, ImplicitlyDeletable):
         )
         up[] = ud
 
+    # -- A1.3 affinity (issue #51) ------------------------------------------
+
+    # Pin the owner WORKER this fiber is affine to (ADR-006).  Called by the
+    # worker that will START the fiber (the sole worker today; EPIC #2's pool
+    # pins at spawn, before the first resume).  Once the fiber has STARTED
+    # (entered body entry) the owner is immutable: a re-pin to a DIFFERENT
+    # worker raises; a re-pin to the SAME worker is an idempotent no-op.
+    def set_owner(mut self, worker_id: Int) raises:
+        if self._started:
+            if self._owner != worker_id:
+                raise Error(
+                    "fiber.set_owner: owner is immutable once started "
+                    "(pinned to " + String(self._owner) + ")"
+                )
+            return
+        self._owner = worker_id
+
     # -- switching ---------------------------------------------------------
 
-    # Driver side: save the current (driver) registers into the caller slot
-    # and resume this fiber.  On the FIRST call this also prepares the fresh
-    # context (ms_ctx_make) bound to the entry callback; afterwards it resumes
-    # the fiber at its exact suspension point.
     def resume(mut self) raises:
         if self._stack == 0:
             raise Error("fiber.resume: no bound stack")
+        comptime if Self.FAULT_CHECKS:
+            self.assert_never_relocated()  # ADR-007 before every switch
         if not self._prepared:
             self._prepared = True
             var fp = self.frame_ptr()
@@ -221,7 +278,7 @@ struct Fiber(ImplicitlyCopyable, ImplicitlyDeletable):
             ms_ctx_make(
                 self.fiber_ctx(), self.stack_top(), self.entry_ptr(), fp
             )
-            self._started = True
+            self._started = True  # spec §14.1: STARTED at first body entry
         self._suspended = False
         ms_ctx_switch(self.caller_ctx(), self.fiber_ctx())
 
@@ -232,6 +289,8 @@ struct Fiber(ImplicitlyCopyable, ImplicitlyDeletable):
     def suspend(mut self) raises:
         if self._stack == 0:
             raise Error("fiber.suspend: no bound stack")
+        comptime if Self.FAULT_CHECKS:
+            self.assert_never_relocated()  # ADR-007 before every switch
         self._suspended = True
         ms_ctx_switch(self.fiber_ctx(), self.caller_ctx())
 
@@ -249,6 +308,7 @@ struct Fiber(ImplicitlyCopyable, ImplicitlyDeletable):
             self._prepared = False
             self._started = False
             self._suspended = False
+            self._owner = 0
         if self._block != 0:
             c_free(UnsafePointer[Byte, MutAnyOrigin](unsafe_from_address=self._block))
             self._block = 0
