@@ -23,7 +23,10 @@
 #       §24/§25, generation-bumped epoch).  Raises IllegalTransitionError if
 #       the task is not RUNNING.
 #   unpark_current — deliver readiness ONCE per epoch: WAITING -> RUNNABLE +
-#       FIFO re-enqueue.  An already-RUNNABLE task is a no-op (enqueue-once);
+#       re-enqueue onto the worker's REMOTE-ready queue.  A wake may come
+#       from ANY worker (spec §19.2), so the post-wake enqueue target is the
+#       per-worker remote queue (issue #68; E5 routes it to the OWNER worker
+#       before pushing).  An already-RUNNABLE task is a no-op (enqueue-once);
 #       any other state (e.g. COMPLETED) raises — a stale wake never silently
 #       double-enqueues (t15 asserts this).
 #
@@ -67,7 +70,10 @@ def unpark_current[R: ResultValue](
     h: JoinHandle[R],
     required_gen: Int = 0,
 ) raises:
-    """Deliver readiness ONCE: WAITING -> RUNNABLE and re-enqueue (FIFO).
+    """Deliver readiness ONCE: WAITING -> RUNNABLE and re-enqueue onto the
+    worker's REMOTE-ready queue (issue #68 — a wake may come from ANY
+    worker, so it lands on the per-worker remote queue; E5 routes it to the
+    OWNER worker, spec §19.2, before pushing).
     Keeps the task's original scheduler id.  Enqueue-once: an already-RUNNABLE
     task is not re-enqueued; any other state (COMPLETED etc.) is an illegal
     transition and raises (never silently enqueued twice).
@@ -83,7 +89,7 @@ def unpark_current[R: ResultValue](
     if h.state() == TaskControlBlock.RUNNABLE:
         return
     if h.tcb()[].wake_claim(required_gen):
-        rt.enqueue(Int(h.tcb()), h.id())
+        rt.push_remote(Int(h.tcb()), h.id())
         return
     if h.state() == TaskControlBlock.WAITING:
         # blocked WAITING but required_gen was stale -> reject silently; never

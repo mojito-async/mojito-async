@@ -123,6 +123,12 @@ struct TaskControlBlock[T: ResultValue](ImplicitlyCopyable, ImplicitlyDeletable)
     # Structured-concurrency links.  Cell handles (0 = none).
     var _parent: Int
     var _scope: Int
+    # Owner-affinity (A2.2, issue #68 — E2 reserves the field for E5):
+    # worker id stamped at FIRST RUN by the scheduler loop.  0 = not
+    # started / not pinned (matches scheduler.wake_target_worker's
+    # unpinned sentinel).  E5 reads this to route remote-ready wakes to
+    # the OWNER worker (spec §19.2).
+    var _owner_worker: Int
 
     def __init__(out self):
         self._state = TaskControlBlock.NEW
@@ -132,6 +138,7 @@ struct TaskControlBlock[T: ResultValue](ImplicitlyCopyable, ImplicitlyDeletable)
         self._has_result = False
         self._parent = 0
         self._scope = 0
+        self._owner_worker = 0
 
     # --- construction ------------------------------------------------------
 
@@ -243,6 +250,15 @@ struct TaskControlBlock[T: ResultValue](ImplicitlyCopyable, ImplicitlyDeletable)
 
     def set_scope_handle(mut self, h: Int):
         self._scope = h
+    def owner_worker(self) -> Int:
+        """The worker that first ran this task (0 = not started / not
+        pinned; A2.2 issue #68, E5 surface)."""
+        return self._owner_worker
+
+    def set_owner_worker(mut self, worker_id: Int):
+        """Stamp the first-run worker (called by the scheduler loop at
+        dispatch; A2.2 issue #68)."""
+        self._owner_worker = worker_id
 
     def is_completed(self) -> Bool:
         return self._state == TaskControlBlock.COMPLETED
