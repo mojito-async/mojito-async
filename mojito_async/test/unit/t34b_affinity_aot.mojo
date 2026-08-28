@@ -37,6 +37,13 @@
 # modular/modular#6971).
 #
 # Verdict: exit 0 + "PASS"; any failure prints FAIL + _iso_exit(1).
+#
+# BUILD REQUIREMENT (H4-partial/M10, PR #109): this driver MUST be built at
+# `mojo build -O 0`.  Its cross-thread handshake cells (phase, parked_*,
+# body_entries, running_worker) are PLAIN Ints published with release/
+# acquire fences; a higher optimization level can hoist the plain handshake
+# reads and deadlock or desynchronize the driver.  mojito_async/test/run.sh
+# carries the -O 0 build flag for this driver.
 from std.atomic import Atomic, fence, Ordering
 from std.time import sleep
 from mojito_async.integration.sys import BytePtr, IntResult
