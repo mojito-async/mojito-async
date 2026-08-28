@@ -144,3 +144,34 @@ def wake_target_worker(owner_worker: Int, local_worker: Int) -> Int:
     if owner_worker == 0 or owner_worker == local_worker:
         return local_worker
     return owner_worker
+
+# ===========================================================================
+# E4-OWNED (issue #70): A2.4 unstarted-task stealing — §21 loop seam
+# ===========================================================================
+#
+# The steal probe in the M:N worker loop (spec §21), IN ORDER:
+#
+#     if var task = worker.pop_local():          # local deque
+#         worker.run_task(task^); continue
+#     if var task = worker.pop_remote_ready():   # E5 started-fiber wakes
+#         worker.run_task(task^); continue
+#     if var task = worker.runtime.inject_queue.pop():   # E3 injection
+#         worker.run_task(task^); continue
+#     if var task = worker.try_steal_unstarted():    # <-- E4 probe (issue #70)
+#         worker.run_task(task^); continue
+#     worker.process_timers()
+#     worker.poll_reactor_nonblocking()
+#     if worker.has_no_immediate_work():
+#         worker.park_os_thread_until_event()      # <-- E6 idle sleep handoff
+#
+# The loop restructure is #68's; E4's part is the probe call + counters:
+#   - the probe is `Worker.try_steal_unstarted()` (runtime/worker.mojo):
+#     round-robin peers from own_index+1, STARTED guard (spec §19.1/§19.2),
+#     ONE capped round, then hands off — the empty-round outcome feeds the
+#     E6 sleep decision directly below (an idle worker does NOT spin on
+#     empty deques; issue #70 step 3/4);
+#   - each successful steal bumps the worker runtime's task_steals_total
+#     exactly once (spec §71; issue #70 step 5 — failed probes bump nothing).
+#
+# ADR-006/ADR-007 are upheld structurally: only never-run records are ever
+# removed from a deque, so a started fiber's live stack is never migrated.
