@@ -9,7 +9,7 @@
 #     (def-only, no module globals, no TLS) a bare free function CANNOT
 #     reach the current task's TCB or the runtime without an explicit
 #     context argument — exactly why every runtime primitive threads
-#     `(mut rt, h)` explicitly (yield_now, _suspend_current, resume_current,
+#     `(mut rt, h)` explicitly (yield_now, park_current, unpark_current,
 #     wake).  Called bare (no driven frame) it raises a precise, documented
 #     error rather than pretending to time out or silently parking nowhere.
 #   - `sleep_current(rt, h, heap, clock, duration)` — the REAL park: arms a
@@ -27,12 +27,12 @@
 # is no concurrent service pass inside a task body, so the arm-before-park
 # order removes any park/expiry race for the unit surface.
 from mojito_async.runtime.runtime import Runtime
-from mojito_async.runtime.scheduler import _suspend_current
 from mojito_async.runtime.task_control_block import ResultValue
 from mojito_async.task import JoinHandle, SuspendReason
 from mojito_async.time.clock import MonotonicClock
 from mojito_async.time.deadline import Deadline, Duration
 from mojito_async.time.timer_heap import TimerHeap
+from mojito_async.runtime.park import park_current
 
 
 def sleep(duration: Duration) raises:
@@ -77,7 +77,7 @@ def sleep_current[R: ResultValue](
     owned storage."""
     var deadline = clock.now() + duration.ticks()
     _ = heap.arm(h.id(), Int(h.tcb()), deadline)
-    _suspend_current(rt, h, SuspendReason.TIMER)
+    park_current(rt, h, SuspendReason.TIMER)
 
 
 def sleep_until_current[R: ResultValue](
@@ -97,4 +97,4 @@ def sleep_until_current[R: ResultValue](
         # hook still wakes this task through the canonical path (no spin).
         ticks = now
     _ = heap.arm(h.id(), Int(h.tcb()), ticks)
-    _suspend_current(rt, h, SuspendReason.TIMER)
+    park_current(rt, h, SuspendReason.TIMER)
