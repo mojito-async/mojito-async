@@ -2,15 +2,27 @@
 #
 # A1.1 runtime (issue #33) — the colorless one-worker scheduler core.
 #
+# A2.2 (issue #68) — per-worker run queues: this Runtime is ONE worker's
+# scheduler state.  The A1 shared FIFO (_ready) is REPLACED on the runnable
+# hot path by the per-worker _local LocalDeque (owner push/pop, LIFO spawn
+# locality) + _remote RemoteReadyQueue (any worker pushes a wake, the owner
+# pops it — spec §19.2/§21).  _ready itself is RETAINED as the E3-OWNED
+# injection intake (#69 replaces it with inject_queue.mojo; see the banner
+# under enqueue()).  The companion enqueue split:
+#
+#   enqueue_local / pop_local  — this worker's own deque (spawn, yield);
+#   push_remote    / pop_remote — remote-ready wakes (unpark_current; E5
+#                                 routes owner-affine wakes here);
+#   enqueue()                  — E3-OWNED injection intake (unchanged path).
+#
 # Productionized from spike/colorless_runtime/runtime.mojo (A0.2 + A0.6,
-# issues #11, #15); semantics carried forward VERBATIM.  `Runtime` owns the
-# FIFO runnable queue (TaskRecord payloads), the shutdown flag, the task-id
-# allocator, and the observable scheduling counters.  `run[T: def() -> None]`
-# executes the ROOT task on the CALLING thread (work-first, spec §88): it
-# creates the root TCB, walks NEW -> RUNNABLE -> RUNNING, invokes the task,
-# and marks COMPLETED on both the normal and the raising path (root tasks
-# have no joiners, so run() is their joiner — the error message is preserved
-# and re-raised).
+# issues #11, #15); semantics carried forward.  `Runtime` owns this worker's
+# run queues, the shutdown flag, the task-id allocator, and the observable
+# scheduling counters.  `run[T: def() -> None]` executes the ROOT task on
+# the CALLING thread (work-first, spec §88): it creates the root TCB, walks
+# NEW -> RUNNABLE -> RUNNING, invokes the task, and marks COMPLETED on both
+# the normal and the raising path (root tasks have no joiners, so run() is
+# their joiner — the error message is preserved and re-raised).
 #
 # INV kept (spec §13/A0-T1): run() creates NO OS thread and performs NO
 # hidden blocking — everything executes synchronously on the caller's stack.
@@ -21,7 +33,7 @@
 #   to the `def()` callable trait; no static methods (module `create()` is
 #   the constructor surface); EXTERN-FREE (modular/modular#6971: extern calls
 #   stay in the embedding *_aot drivers).
-from mojito_async.runtime.queue import FifoQueue, TaskRecord
+from mojito_async.runtime.queue import FifoQueue, LocalDeque, RemoteReadyQueue, TaskRecord
 from mojito_async.runtime.task_control_block import ResultValue, TaskControlBlock
 
 
@@ -45,18 +57,22 @@ struct Nil(ResultValue):
 # ---------------------------------------------------------------------------
 
 struct Runtime:
-    """One-main concept single-worker scheduler core.
+    """One worker's scheduler core.
 
     State:
-      _ready     — FIFO of RUNNABLE TaskRecords (mutex-free: single worker,
-                     no cross-thread handoff exists).
+      _ready     — E3-OWNED injection intake: the A1 global FIFO, retained
+                     for global/injection submits until #69's inject queue
+                     replaces it (NOT on the local hot path).
+      _local     — this worker's LOCAL work-stealing deque (unstarted
+                     tasks; owner push_back/pop_back — LIFO spawn locality).
+      _remote    — this worker's REMOTE-ready queue (wakes of STARTED
+                     fibers; any worker pushes, the owner pops — FIFO).
       _shutdown  — latched by shutdown(); run()/spawn refuse afterwards.
       _scope     — root scope handle (Int cell handle; refined upward).
       _next_id   — monotonic task-id allocator (ids start at 1; 0 = none).
       counters   — observable scheduling effects: _tasks_started/_completed
                      count ROLE-task executions by run(); _enqueued counts
-                     runnable registrations (spawn/wake).  Tests observe
-                     these instead of trusting silent success.
+                     runnable registrations (spawn/wake/local/remote).
       _fiber_drives / _fiber_switches — A1.5 (issue #53) fiber-path toggle:
                      drives count scheduler slices that drove a task's FIBER;
                      switches count the actual ms_ctx_switch calls (2 per
@@ -69,6 +85,8 @@ struct Runtime:
     comptime NO_SCOPE = Int(0)
 
     var _ready: FifoQueue[TaskRecord]
+    var _local: LocalDeque
+    var _remote: RemoteReadyQueue
     var _shutdown: Bool
     var _scope: Int
     var _next_id: Int
@@ -81,6 +99,8 @@ struct Runtime:
 
     def __init__(out self):
         self._ready = FifoQueue[TaskRecord]()
+        self._local = LocalDeque()
+        self._remote = RemoteReadyQueue()
         self._shutdown = False
         self._scope = Self.NO_SCOPE
         self._next_id = 1
@@ -127,23 +147,76 @@ struct Runtime:
         self._next_id += 1
         return id
 
+    # E3-OWNED: injection intake (issue #68/69) — global/injection submits
+    # keep riding the A1 FIFO path until #69's inject_queue.mojo replaces
+    # it; #69 fills this seam (and scheduler_loop's `# E3-OWNED: injection
+    # intake` poll slot).  NOT on the local hot path.
     def enqueue(mut self, tcb_addr: Int, task_id: Int) raises:
-        """Register a RUNNABLE task record (FIFO order)."""
+        """Register a RUNNABLE task record on the E3 injection intake FIFO
+        (A1 semantics, unchanged; #69 owns this path's replacement)."""
         if self._shutdown:
             raise Error("runtime.enqueue: runtime is shut down")
         self._ready.push(TaskRecord(tcb_addr, task_id))
         self._enqueued += 1
 
+    def enqueue_local(mut self, tcb_addr: Int, task_id: Int) raises:
+        """Register a RUNNABLE record on THIS worker's local deque (unstarted
+        tasks: spawn, yield).  Owner push_back — LIFO spawn locality (issue
+        #68).  No global lock on this path: only this worker's deque guard."""
+        if self._shutdown:
+            raise Error("runtime.enqueue_local: runtime is shut down")
+        self._local.push_back(TaskRecord(tcb_addr, task_id))
+        self._enqueued += 1
+
+    def push_remote(mut self, tcb_addr: Int, task_id: Int) raises:
+        """Deliver a wake to THIS worker's remote-ready queue (STARTED-fiber
+        wakes, spec §19.2/§21).  ANY worker may push; the OWNER pops.  E5
+        routes owner-affine wakes here; unpark_current already uses this as
+        the post-wake enqueue target (issue #68, #39)."""
+        if self._shutdown:
+            raise Error("runtime.push_remote: runtime is shut down")
+        self._remote.push(TaskRecord(tcb_addr, task_id))
+        self._enqueued += 1
+
+    def pop_local(mut self) raises -> TaskRecord:
+        """Dequeue the next LOCAL record (owner LIFO end); raises on an
+        empty deque."""
+        return self._local.pop_back()
+
+    def pop_remote(mut self) raises -> TaskRecord:
+        """Dequeue the next REMOTE-ready record (owner FIFO pop); raises on
+        an empty queue."""
+        return self._remote.pop()
+
     def pop_ready(mut self) raises -> TaskRecord:
-        """Dequeue the next RUNNABLE record; raises on an empty queue."""
-        return self._ready.pop()
+        """A1-compat pop of the runnable record the scheduler would serve
+        next (the LOCAL deque — t14/t18 manual pops)."""
+        return self._local.pop_back()
 
-    def has_ready(self) -> Bool:
-        return not self._ready.is_empty()
+    def has_local(mut self) -> Bool:
+        return not self._local.is_empty()
 
-    def pending(self) -> Int:
-        """Number of currently RUNNABLE records."""
-        return len(self._ready)
+    def has_remote(mut self) -> Bool:
+        return not self._remote.is_empty()
+
+    def has_ready(mut self) -> Bool:
+        """A1-compat probe: is there LOCAL work?  (The scheduler now uses
+        has_local/has_remote; kept for the A1 callers.)"""
+        return self.has_local()
+
+    def local_queue(mut self) -> UnsafePointer[LocalDeque, MutAnyOrigin]:
+        """This worker's local deque (E2 accessor; b2 pointer-return idiom —
+        deref at the call site, e.g. E4 steal probes)."""
+        return UnsafePointer[LocalDeque, MutAnyOrigin](to=self._local)
+
+    def remote_queue(mut self) -> UnsafePointer[RemoteReadyQueue, MutAnyOrigin]:
+        """This worker's remote-ready queue (E2 accessor; pointer-return)."""
+        return UnsafePointer[RemoteReadyQueue, MutAnyOrigin](to=self._remote)
+
+    def pending(mut self) -> Int:
+        """Number of currently RUNNABLE records across all run paths (E3
+        intake + local deque + remote queue)."""
+        return len(self._ready) + self._local.count() + self._remote.count()
 
     # --- observability -------------------------------------------------------
 

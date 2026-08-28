@@ -11,9 +11,17 @@
 # own task bodies (b2 cannot store them); callers pass dispatchers where
 # bodies are known, exactly like the spike's drivers.
 #
-# Extern-free, allocation-discipline kept: the Worker holds no task storage;
-# every TaskControlBlock cell is caller-allocated.
+#
+# A2.2 (issue #68) — per-worker run-queue accessors (E2-owned).  The queue
+# STATE lives on this worker's Runtime (_local LocalDeque + _remote
+# RemoteReadyQueue); Worker exposes thin refs so callers can probe/drive
+# them without reaching into Runtime internals.
+#
+# # E1-OWNED: the WORKER POOL, thread_entry, NativeThread and TlsKey
+# bindings are the sibling lane's (issue #67).  The entry points below
+# (run_root/drive/shutdown) stay untouched by this lane.
 from mojito_async.integration.sys import BytePtr
+from mojito_async.runtime.queue import LocalDeque, RemoteReadyQueue
 from mojito_async.runtime.runtime import Runtime, create
 from mojito_async.runtime.scheduler import scheduler_loop
 
@@ -28,11 +36,25 @@ struct Worker:
 
     # --- access ----------------------------------------------------------
 
-    def runtime(mut self) -> ref Runtime:
-        return self._runtime
+    def runtime(mut self) -> UnsafePointer[Runtime, MutAnyOrigin]:
+        """This worker's Runtime (b2 pointer-return idiom; deref at the call
+        site — `w.runtime()[].enqueue_local(...)`)."""
+        return UnsafePointer[Runtime, MutAnyOrigin](to=self._runtime)
 
     def handle(mut self) -> UnsafePointer[Runtime, MutAnyOrigin]:
         return UnsafePointer[Runtime, MutAnyOrigin](to=self._runtime)
+
+    # --- A2.2 per-worker run queues (issue #68) — E2-owned accessors ------
+
+    def local_queue(mut self) -> UnsafePointer[LocalDeque, MutAnyOrigin]:
+        """This worker's LOCAL runnable deque (owner push/pop; the scheduler
+        drains it before the remote queue, spec §21)."""
+        return self._runtime.local_queue()
+
+    def remote_queue(mut self) -> UnsafePointer[RemoteReadyQueue, MutAnyOrigin]:
+        """This worker's REMOTE-ready queue (any worker pushes a wake, the
+        owner pops — spec §19.2)."""
+        return self._runtime.remote_queue()
 
     # --- entry points -------------------------------------------------------
 

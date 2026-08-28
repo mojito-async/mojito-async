@@ -145,7 +145,7 @@ def main() raises:
 
     # ---- 4. Worker N=1 parity + local-before-remote drive order ----------
     var wa = make_worker()
-    var rta = wa.runtime()
+    var rtap = wa.runtime()
     var buf = stack_allocation[16, Int]()
     for zi in range(16):
         buf[zi] = 0
@@ -160,16 +160,16 @@ def main() raises:
     # A spawns X locally (A's local deque); a simulated remote wake pushes Y
     # (RUNNABLE, E5 would route it here) onto A's RemoteReadyQueue.
     var tcb_x = TB.create()
-    var h_x = spawn(rta, _ptr(tcb_x), 0)
+    var h_x = spawn(rtap[], _ptr(tcb_x), 0)
     var tcb_y = TB.create()
     tcb_y.transition(TaskControlBlock.RUNNABLE)
     var ptr_y = _ptr(tcb_y)
-    rta.push_remote(Int(ptr_y), 777)
-    if rta.pending() != 2:
+    rtap[].push_remote(Int(ptr_y), 777)
+    if rtap[].pending() != 2:
         red("worker A must hold 2 runnable records (1 local + 1 remote)")
 
     # Drive with the explicit worker identity 1 (b2 has no TLS).
-    var served = scheduler_loop(rta, dispatch_log, ud, worker_id=1)
+    var served = scheduler_loop(rtap[], dispatch_log, ud, worker_id=1)
     if served != 2:
         red("drive served " + String(served) + " != 2")
     if not h_x.is_completed():
@@ -187,27 +187,27 @@ def main() raises:
 
     # ---- 6. Two-worker isolation (manual enqueues; E1 pool not this lane)
     var wb = make_worker()
-    var rtb = wb.runtime()
+    var rtbp = wb.runtime()
     # worker A's side pushes a wake record into worker B's RemoteReadyQueue
     # (the E5 cross-worker wake route; manual here — no pool in this lane).
-    rtb.push_remote(Int(ptr_y), 777)
-    if rtb.pending() != 1:
+    rtbp[].push_remote(Int(ptr_y), 777)
+    if rtbp[].pending() != 1:
         red("worker B must see exactly one remotely pushed record")
-    var rec_b = rtb.pop_remote()
+    var rec_b = rtbp[].pop_remote()
     if rec_b.tcb_addr != Int(ptr_y):
         red("B's owner pop did not observe the remote record")
     if rec_b.task_id != 777:
         red("B's popped record lost its task id")
-    if rtb.pending() != 0:
+    if rtbp[].pending() != 0:
         red("B must pop the remote record exactly once")
     var raised4 = False
     try:
-        _ = rtb.pop_remote()
+        _ = rtbp[].pop_remote()
     except Error:
         raised4 = True
     if not raised4:
         red("B's second pop_remote must raise (exactly-once)")
-    if rta.pending() != 0:
+    if rtap[].pending() != 0:
         red("worker A must not observe B's remote queue")
 
     print("T31 local queue: PASS")
