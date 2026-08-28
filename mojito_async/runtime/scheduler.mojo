@@ -53,6 +53,7 @@ from mojito_async.runtime.queue import TaskRecord
 from mojito_async.runtime.runtime import Nil, Runtime
 from mojito_async.runtime.task_control_block import ResultValue, TaskControlBlock
 from mojito_async.runtime.inject_queue import InjectQueue
+from mojito_async.runtime.join_handle import JoinHandle
 
 
 # ---------------------------------------------------------------------------
@@ -115,23 +116,15 @@ def scheduler_loop[F: def(mut Runtime, Int, Int, BytePtr) raises -> Int, R: Resu
     the E1 worker pool passes its worker index.  Existing single-runtime
     callers keep the 3-argument form (default 0 = no pin stamp).
 
-    # E3-OWNED: injection intake (issue #69) — #69's bounded injection poll
-    # (optional `inject`/`inject_budget` params, default None) drops in at
-    # the seam below, BEFORE pop_local, keeping the A1 call form.
-    """Drive the ONE worker until its runnable queue is quiet (A1 single
-    worker, local FIFO only).  For each popped record, SKIP it (counted)
-    when its TCB is not RUNNABLE (stale duplicate — never dispatched), else
-    hand (rt, tcb_addr, task_id, ud) to `dispatcher`, which executes that
-    task to its next state.  Returns the number of records SERVED; skipped
-    records are observable via `rt.skipped()`.
-
     A2.3 (issue #69): the GLOBAL-INJECTION poll is driver-drained through
-    the concrete InjectQueue seam (try_pop/pending) with the loop shape
-    documented below — the poll must live where the dispatcher is
-    statically known (b2: cross-module generic instantiation of the
-    multi-param loop is miscompiled, verified by probe).  This plain loop
-    keeps the A1 signature EXACTLY — so every existing callsite is
-    untouched and injection-free.    """
+    the concrete InjectQueue seam (try_pop/pending) at the driver call
+    site — the `# E3-OWNED: injection intake` seam below marks where the
+    bounded injection poll drops in.  The poll must live where the
+    dispatcher is statically known (b2: cross-module generic instantiation
+    of the multi-param loop is miscompiled, verified by probe); this plain
+    loop keeps the A1 signature EXACTLY — so every existing callsite is
+    untouched and injection-free.
+    """
     var slices = 0
     while True:
         var have = False
@@ -231,7 +224,6 @@ def wake_target_worker(owner_worker: Int, local_worker: Int) -> Int:
     """
     if owner_worker == 0 or owner_worker == local_worker:
         return local_worker
-    return owner_worker
     return owner_worker
 
 # ===========================================================================
