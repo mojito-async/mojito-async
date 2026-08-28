@@ -124,11 +124,15 @@ void ms_stack_free(void *base) {
     }
 }
 
-size_t ms_stack_total_size(void) {
-    /* Sum of all live reservations, guard pages included. */
-    size_t total = 0;
+/* Live reservation count (A1.1 oversubscription guard, issue #49 / #101).
+ * The Mojo-side Fiber factories raise before a 33rd live fiber is created so
+ * A1 fails loudly rather than trapping on the substrate resume table's 64-row
+ * saturation (32 fibers x 2 rows/fiber = 64).  EPIC #2 (#101) removes the cap
+ * entirely; the guard is the catchable fail-loud surface until then. */
+int ms_live_stack_count(void) {
+    size_t n = 0;
     for (size_t i = 0; i < g_resv_len; ++i)
         if (g_resv[i].base != NULL)
-            total += g_resv[i].total;
-    return total;
+            ++n;
+    return (int)n;
 }
