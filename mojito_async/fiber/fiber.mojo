@@ -72,6 +72,7 @@ from mojito_async.vendor.mojito_sys import (
     ms_ctx_switch,
     stack_free,
 )
+from std.atomic import Ordering, fence
 
 
 # Sidecar handed to the entry thunk (as the ms_ctx_make userdata, unmodified).
@@ -171,9 +172,16 @@ struct Fiber(ImplicitlyCopyable, ImplicitlyDeletable):
         """The worker identity this started fiber is affine to (spec §19.2 /
         ADR-006).  An unstarted fiber has NO owner pinned until first entry:
         0 means not started / no owner.  Once STARTED this never changes —
-        set_owner() rejects a conflicting re-pin."""
+        set_owner() rejects a conflicting re-pin.
+
+        T5 (issue #51): this owner read is an ACQUIRE fence paired with the
+        RELEASE in set_owner(), so a cross-worker producer (EPIC #2's pool)
+        reading the pinned worker id from ANOTHER worker thread sees the
+        fiber's synchronized state together with the store.  A no-op pass-
+        through on today's single cooperative worker."""
         if not self._started:
             return 0
+        fence[Ordering.ACQUIRE]
         return self._owner
 
     def assert_never_relocated(self) raises:
@@ -251,6 +259,11 @@ struct Fiber(ImplicitlyCopyable, ImplicitlyDeletable):
     # pins at spawn, before the first resume).  Once the fiber has STARTED
     # (entered body entry) the owner is immutable: a re-pin to a DIFFERENT
     # worker raises; a re-pin to the SAME worker is an idempotent no-op.
+    #
+    # T5 (issue #51): the pin store is RELEASED (fence) so the pinned owner
+    # value is visible together with the fiber's synchronized state to any
+    # acquiring reader (owner_worker) on another worker thread.  A no-op
+    # pass-through on the single cooperative worker.
     def set_owner(mut self, worker_id: Int) raises:
         if self._started:
             if self._owner != worker_id:
@@ -260,6 +273,7 @@ struct Fiber(ImplicitlyCopyable, ImplicitlyDeletable):
                 )
             return
         self._owner = worker_id
+        fence[Ordering.RELEASE]
 
     # -- switching ---------------------------------------------------------
 

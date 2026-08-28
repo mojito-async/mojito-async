@@ -65,15 +65,33 @@ def park_current[R: ResultValue](
 def unpark_current[R: ResultValue](
     mut rt: Runtime,
     h: JoinHandle[R],
+    required_gen: Int = 0,
 ) raises:
     """Deliver readiness ONCE: WAITING -> RUNNABLE and re-enqueue (FIFO).
     Keeps the task's original scheduler id.  Enqueue-once: an already-RUNNABLE
     task is not re-enqueued; any other state (COMPLETED etc.) is an illegal
-    transition and raises (never silently enqueued twice)."""
+    transition and raises (never silently enqueued twice).
+
+    Generation consumption (T5, issue #51): the wake path consumes the
+    waiter's epoch via TaskControlBlock.wake_claim.  Pass `required_gen` = the
+    generation a producer captured at WAITING commit to REJECT a stale wake
+    from a previous epoch (a no-op when the current generation no longer
+    matches — required for EPIC #2's cross-worker producer so a stale wake can
+    never re-transition a task that already woke).  Pass 0 (default) for
+    today's single worker, where the epoch is trivially current; the state
+    edge and enqueue-once still hold."""
     if h.state() == TaskControlBlock.RUNNABLE:
         return
+    if h.tcb()[].wake_claim(required_gen):
+        rt.enqueue(Int(h.tcb()), h.id())
+        return
+    if h.state() == TaskControlBlock.WAITING:
+        # blocked WAITING but required_gen was stale -> reject silently; never
+        # double-enqueue, never transition.
+        return
+    # not RUNNABLE and not successfully claimed -> transition (raises for an
+    # illegal pair, preserving the A1 loud surface on COMPLETED etc.).
     h.tcb()[].transition(TaskControlBlock.RUNNABLE)
-    rt.enqueue(Int(h.tcb()), h.id())
 
 
 # ---------------------------------------------------------------------------
