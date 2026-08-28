@@ -100,6 +100,12 @@ struct InjectQueue:
     var _data: Deque[TaskRecord]
     var _attempts: Int
     var _rejected: Int
+    # Accepted (enqueued) records — counted UNDER the queue's own lock, so
+    # external producer threads can race safely without touching any Runtime
+    # field (b2: atomic RMW on a Runtime field inside the fiber-crossing
+    # enqueue path miscompiles the A1 fiber drive, verified vs t26; the
+    # queue's lock is already held by push, so the count is free here).
+    var _accepted: Int
 
     def __init__(out self, capacity: Int):
         self._lock = 0
@@ -107,6 +113,7 @@ struct InjectQueue:
         self._data = Deque[TaskRecord]()
         self._attempts = 0
         self._rejected = 0
+        self._accepted = 0
 
     # --- locking ------------------------------------------------------------
 
@@ -136,6 +143,12 @@ struct InjectQueue:
         """Capacity rejections seen so far (backpressure evidence)."""
         return self._rejected
 
+    def accepted(self) -> Int:
+        """Records ACCEPTED since construction (counted under this queue's
+        own lock — the cross-thread-safe enqueue accounting; Runtime.enqueued
+        folds it in)."""
+        return self._accepted
+
     def attempts(self) -> Int:
         return self._attempts
 
@@ -145,21 +158,72 @@ struct InjectQueue:
         """Enqueue one runnable record.  RAISES a clear full error at
         capacity instead of blocking any worker (ADR-009): the caller (the
         scheduler's external-spawn intake) retries on its next loop
-        iteration."""
-        raise Error("InjectQueue.push: not implemented yet (issue #69)")
+        iteration.  Push is a short critical section over the ring (P0: MPSC
+        under one lock — correct first, §20 queue progression); during the
+        hold no worker can be wedged: the critical section is bounded, and a
+        full queue fails the push instead of waiting."""
+        self._lock_acquire()
+        self._attempts += 1
+        if len(self._data) >= self._cap:
+            self._rejected += 1
+            self._lock_release()
+            raise Error(
+                "InjectQueue.push: queue full (capacity " + String(self._cap)
+                + ") — apply backpressure and retry on the next sweep"
+            )
+        self._data.append(rec)
+        self._accepted += 1
+        self._lock_release()
 
     def try_push(mut self, rec: TaskRecord) -> Bool:
-        """Backpressure probe: True when the record was accepted; False at
-        capacity (nothing enqueued, nothing raised — the producer applies
-        backpressure and retries on the next sweep)."""
-        raise Error("InjectQueue.try_push: not implemented yet (issue #69)")
+        """Backpressure probe (spec §86): True when the record was accepted;
+        False at capacity — nothing enqueued, nothing raised, the producer
+        applies backpressure and retries on the next sweep."""
+        self._lock_acquire()
+        self._attempts += 1
+        if len(self._data) >= self._cap:
+            self._rejected += 1
+            self._lock_release()
+            return False
+        self._data.append(rec)
+        self._accepted += 1
+        self._lock_release()
+        return True
 
     # --- consumer side (any worker) -----------------------------------------
 
+    def try_pop(mut self, mut out: TaskRecord) -> Bool:
+        """Non-blocking dequeue (FIFO): True when `out` was filled with the
+        head record; False when the queue is empty (`out` untouched).  This
+        by-ref form is the b2-safe spelling used by the scheduler's bounded
+        poll (no Optional through generic loops — the b2 compiler
+        miscompiles Optional[TaskRecord] truthiness in generics, verified by
+        probe).  Non-blocking: a FULL injection queue never wedges a worker
+        (ADR-009) — pop keeps draining and the worker services its local/
+        remote deques, retrying injection next loop iteration (issue 3)."""
+        self._lock_acquire()
+        if len(self._data) == 0:
+            self._lock_release()
+            return False
+        # Non-empty under the lock => popleft cannot fail; b2 requires the
+        # raising call be guarded.
+        var rec = TaskRecord(0, 0)
+        try:
+            rec = self._data.popleft()
+        except Error:
+            rec = TaskRecord(0, 0)
+        self._lock_release()
+        out = rec
+        return True
+
     def pop(mut self) -> Optional[TaskRecord]:
-        """Dequeue one record (FIFO); None when empty.  Non-blocking —
-        a full injection queue never wedges a worker: pop keeps draining."""
-        raise Error("InjectQueue.pop: not implemented yet (issue #69)")
+        """Dequeue one record (FIFO); None when empty.  Convenience wrapper
+        over `try_pop` for non-generic callers (the issue's public spelling);
+        the scheduler poll uses the by-ref `try_pop` (b2-safe)."""
+        var rec = TaskRecord(0, 0)
+        if self.try_pop(rec):
+            return Optional[TaskRecord](rec)
+        return Optional[TaskRecord]()
 
 
 # ---------------------------------------------------------------------------
@@ -191,5 +255,27 @@ def push_wake[R: ResultValue](
     affinity retargets the enqueue for owner-affinity wakes of STARTED
     tasks to the owner worker's REMOTE-READY queue (NOT theft-eligible);
     the claim-once guard above is the invariant both targets share.
+
+    VALIDATE + COMMIT are atomic under the injection lock: the capacity
+    check, the `wake_claim` (park.mojo's claim-once guard), and the enqueue
+    happen in ONE critical section, so a concurrent worker pop can never
+    observe a claimed-but-not-yet-enqueued wake, and a full queue never
+    consumes the claim (the waiter stays WAITING; the producer retries on
+    its next sweep — backpressure, ADR-009).
     """
-    raise Error("push_wake: not implemented yet (issue #69)")
+    q._lock_acquire()
+    if len(q._data) >= q._cap:
+        # No room for the wake record: do NOT claim — the waiter stays
+        # WAITING and the wake is simply not delivered yet (the producer
+        # retries next sweep).  Never blocks, never corrupts state.
+        q._lock_release()
+        return False
+    var checker = UnsafePointer[TaskControlBlock[R], MutAnyOrigin](
+        unsafe_from_address=tcb_addr
+    )
+    var claimed = checker[].wake_claim(required_gen)
+    if claimed:
+        q._data.append(TaskRecord(tcb_addr, task_id))
+        q._accepted += 1
+    q._lock_release()
+    return claimed
