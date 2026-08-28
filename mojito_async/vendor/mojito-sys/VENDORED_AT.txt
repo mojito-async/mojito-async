@@ -1,0 +1,29 @@
+Vendored mojito-sys S0 substrate — mojito_async/vendor/mojito-sys/
+
+Source repository: github.com/mojito-async/mojito-sys
+Source tree:       spike/context_switch/ (frozen S0 substrate, A0.1 lane)
+Source commit:     0ad48315bebc1fcb02834074afbff6e59173cdb1
+Frozen contract:   8454212 (S0 SPIKE_REPORT: GO — feasibility proven, all 14 tests green)
+Vendored on:       2026-08-28T00:00:00Z (A1.1 productionization, issue #49)
+
+Files (copied verbatim, byte-identical to the source commit above — the Mojo
+binding surface lives in the sibling mojito_async/vendor/mojito_sys.mojo, NOT
+in this directory):
+  include/mojito_spike.h   # frozen v2 ms_ctx_t layout (168 B: x19-x30, d8-d15, sp)
+  native_stack.c           # ms_stack_alloc/free with PROT_NONE guard page
+  aarch64_switch.S         # ms_ctx_make/ms_ctx_switch (Apple arm64; #if !__APPLE__ guard)
+  ms_ctx.c                 # compile-time layout asserts + sentinel probe (guarded off)
+
+Verified identical to the spike's frozen copy
+(spike/colorless_runtime/vendor/mojito-sys/): the A0.4 bisect (PR #25,
+tests t4/t4b, 3/3) showed this exact geometry survives real switch cycles, so
+the production copy is byte-identical — `diff -r` against the spike vendor
+dir is empty.
+
+The substrate is UNCHANGED since the frozen contract commit 8454212: the only
+delta is the Mojo bindings, which were re-home'd into mojito_async/vendor/
+mojito_sys.mojo (the batch-wide single home of the mojito-sys type surface
+for A1.1/#49, A1.2/#50, A1.4/#52).  This vendor snapshot is consumed by the
+A1 production lanes; it is NOT modified here — boundary rule
+(docs/A0_PLAN.md): mojito-async uses only this vendored surface
+(ms_stack_alloc/free, ms_ctx_make/switch), never raw mmap/pthread/asm.
