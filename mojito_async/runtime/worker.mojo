@@ -275,12 +275,10 @@ struct Worker:
         self._event = event
         self._acct = acct
 
-    def pool_event(mut self) -> Int:
-        """The pool's NativeEvent handle this worker parks on."""
-        return self._event
-
     def pool_acct(mut self) -> BytePtr:
-        """The pool's idle-accounting block this worker reports into."""
+        """The pool's idle-accounting block this worker reports into.  (The
+        pool-side event handle reader is WorkerPool.pool_event() — THE
+        public name; the Worker does not duplicate it, M8.)"""
         return self._acct
 
     def tls_worker_ptr(mut self) -> BytePtr:

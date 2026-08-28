@@ -55,6 +55,7 @@ from mojito_async.runtime.idle import (
     acct_parked,
     acct_pending,
     acct_park_total,
+    acct_reset,
     acct_spurious_total,
     acct_wake_total,
     announce_work as acct_announce,
@@ -198,6 +199,16 @@ struct WorkerPool:
         self._tls = make_worker_tls()
         self._ensure_idle_state()
         self._zero_acct()
+        if self._seeded:
+            # M7: re-announce the seeded units — seed_seam_units announced
+            # them at seed time, but _zero_acct (above) resets the whole
+            # block each start(); the seeded units are real announced work
+            # the workers complete on drain (the producer wake protocol,
+            # idle.mojo header).
+            var total = 0
+            for i in range(self._config.worker_count):
+                total += self.entry_at(i)[].units_seeded
+            acct_announce(self._acct, total)
         self._build_cells()
         self._started = True
         self._joined = 0
@@ -219,12 +230,11 @@ struct WorkerPool:
             self._acct = c_malloc(ACCT_BYTES)
 
     def _zero_acct(mut self):
-        """Reset the accounting block's five counters (each start() re-arms)."""
-        for off in range(5):
-            var p = UnsafePointer[Int64, MutAnyOrigin](
-                unsafe_from_address=Int(self._acct) + off * 8
-            )
-            Atomic[DType.int64].store[ordering=Ordering.SEQUENTIAL](p, 0)
+        """Reset the accounting block's five counters (each start() re-arms).
+        Delegates to idle.acct_reset — idle.mojo OWNS the block layout (the
+        two hot counters + the three observability counters live on separate
+        cache lines, M9)."""
+        acct_reset(self._acct)
 
     def _build_cells(mut self):
         """Write the worker cells (id = i) + entry cells (fresh when no seed
@@ -286,6 +296,11 @@ struct WorkerPool:
             e[].units_left = per_worker
             e[].units_seeded = per_worker
             e[].unit_ok = True
+        # M7 (issue #72): ANNOUNCE the seeded units — per_worker units per
+        # worker (the producer wake protocol, idle.mojo header; each drained
+        # seam unit completes one).  start() re-arms this after its acct
+        # reset, so the count survives the lifecycle.
+        acct_announce(self._acct, n * per_worker)
         self._seeded = True
 
     def request_shutdown(mut self) raises:
@@ -305,14 +320,16 @@ struct WorkerPool:
         for i in range(sleepers):
             native_event_signal(self._event)
 
-    # --- E6 producer-side wake budget (issue #72 step 3) --------------------
-
     def wake_one(mut self) raises:
         """Producer side: signal the pool NativeEvent ONLY IF at least one
         worker is parked as an idle sleeper (never burn a signal into
         nobody).  Breadth-one (the C event wakes at most one waiter); a
         producer that injects K work units calls wake_one() up to K times —
-        K units wake at most K sleepers."""
+        K units wake at most K sleepers.  The wake path performs NO
+        allocation (atomics + the event only); the producer must have
+        preallocated the target queues BEFORE announce_work/wake_one (the
+        producer wake protocol, idle.mojo header — a deque growth would
+        allocate mid-handoff, M9)."""
         if not self._started:
             raise Error("worker_pool.wake_one: pool not started")
         if acct_parked(self._acct) > 0:
@@ -327,13 +344,17 @@ struct WorkerPool:
 
     def announce_work(mut self, n: Int) raises:
         """A producer injected `n` work units: bump the announced-work count
-        the workers' wake re-check classifies against."""
+        the workers' wake re-check classifies against (MUST pair with
+        complete_work + at most n wake_one() calls; the producer wake
+        protocol, idle.mojo header)."""
         if not self._started:
             raise Error("worker_pool.announce_work: pool not started")
         acct_announce(self._acct, n)
 
     def complete_work(mut self, n: Int) raises:
-        """The embedder drained `n` units (real tasks completed)."""
+        """The embedder drained `n` units (real tasks completed).  MUST pair
+        with a prior announce_work; completing below the announced floor
+        RAISES in debug builds (idle.mojo's pair-mismatch detection)."""
         if not self._started:
             raise Error("worker_pool.complete_work: pool not started")
         acct_complete(self._acct, n)
@@ -423,6 +444,11 @@ struct WorkerPool:
         return self.entry_at(i)[].obs_done
 
     # --- A2.6/E6 idle observability (issue #72) ----------------------------
+    # CANONICAL counter names (M8): these accessors ARE the one public name
+    # per counter — idle_parked / pending_work / park_total / wake_total /
+    # spurious_total (+ per-worker idle_parks(i)); idle.mojo's acct_* readers
+    # are the raw block aliases that single-source them (see idle.mojo's
+    # canonical-name table).  No other names exist for these counters.
 
     def idle_parked(mut self) -> Int:
         """Number of workers currently parked as idle sleepers (a SPINNING

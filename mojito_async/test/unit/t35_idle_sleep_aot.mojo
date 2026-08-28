@@ -13,13 +13,20 @@
 #   2. WAKE (K-wake-K-sleepers budget): the producer signals the event
 #      (pool.wake_one) up to K times; a parked worker consumes a token and
 #      wakes, parked drops, and wake_total reflects the token consumption.
-#      Breadth-one: wake_total stays <= K + slack (never over-signals).  A
-#      consumer of every token is observed across repeated bursts.
+#      The driver fires a REAL BOUNDED BURST — K = 8 wake_one() signals
+#      across the sleepers (M7/t35 fold) — and asserts wake_total ADVANCES
+#      (the burst provably woke workers) while staying <= the K + slack
+#      budget (breadth-one: never over-signals).  The burst driver builds
+#      with -O 0 (run.sh): the same loop at -O 3 trips a 1.0.0b2 codegen
+#      SEGV, so the unoptimized build is the acceptance harness for it.
 #   3. SHUTDOWN WAKES-AND-JOINS EVERY PARKED WORKER: request_shutdown() sets
 #      the latch AND signals the event; join_all() returns with
 #      threads_joined == 2, every worker exited (no leaked native threads)
 #      even though every worker was asleep on the event when shutdown began.
-#   4. COUNTERS (spec §71): park_total / wake_total / spurious_wake_total are
+#   4. RUNTIME-ABSENT ACCESSOR (issue #72/H5): current_worker_addr() on the
+#      embedder's (never-bound) thread raises the real NoConcurrencyRuntime
+#      error — the absent-path accessor is live, not dead surface.
+#   5. COUNTERS (spec §71): park_total / wake_total / spurious_wake_total are
 #      non-decreasing and sensible (park_total > 0 after the idle beat).
 #
 # The pool threads idle via the E6 seam (thread_entry.pool_worker_loop inlines
@@ -36,6 +43,7 @@ from std.time import sleep
 from mojito_async.integration.sys import BytePtr
 from mojito_async.runtime.config import make_pool_config
 from mojito_async.runtime.thread_entry import mjs_pool_entry_main
+from mojito_async.runtime.tls import current_worker_addr
 from mojito_async.runtime.worker_pool import WorkerPool, make_pool
 from mojito_async.vendor.mojito_sys import (
     entry_pointer,
@@ -98,18 +106,25 @@ def main() raises:
             + "(parked=" + String(pool.idle_parked()) + "); busiest worker "
             + "parked_count register would still climb — workers must sleep")
 
-    # ---- 2. WAKE (one provable hand-off, breadth-one) ----------------------
-    # The wake mechanism is separately validated by the C NativeEvent
-    # semantics (a signal leaves a sticky token a waiter consumes; breadth-one:
-    # one signal wakes at most one sleeper) and by wake_total here.  We issue
-    # ONE wake_one while the workers are provably parked and require at most
-    # K + slack total wakes across the run — never over-signaling.  (A rapid
-    # wake-burst loop trips a 1.0.0b2 codegen SEGV in this AOT driver, so the
-    # driver keeps a single probe; the burst is covered by the counter bound.)
+    # ---- 2. WAKE (real bounded burst: K=8 wake_one signals) ---------------
+    # The driver fires a BOUNDED BURST of K wake_one() signals while the
+    # workers are provably parked and requires TWO things: wake_total
+    # ADVANCES (the burst provably woke at least one sleeper — the single-
+    # probe version could never show consumption) and stays within the
+    # K + slack budget (breadth-one: K signals wake at most K sleepers,
+    # never over-signaling).  Slack covers the one extra consumed token a
+    # worker may burn racing the shutdown.  (The burst loop trips a 1.0.0b2
+    # codegen SEGV at -O 3, so the driver is built with -O 0 — run.sh.)
     var wake_before = pool.wake_total()
-    if pool.idle_parked() > 0:
-        pool.wake_one()
+    for i in range(K):
+        if pool.idle_parked() > 0:
+            pool.wake_one()
     sleep(0.02)
+    if pool.wake_total() <= wake_before:
+        red("wake_total did not advance across the K=" + String(K)
+            + " wake burst (before=" + String(wake_before)
+            + ", after=" + String(pool.wake_total())
+            + ") — no sleeper consumed a token (the wake hand-off is broken)")
     if pool.wake_total() > wake_before + K + 2:
         red("wake_total grew beyond the wake budget K=" + String(K)
             + " + slack over the run — over-signaling (breadth-one violated)")
@@ -129,14 +144,33 @@ def main() raises:
         if not pool.entry_ok(i):
             red("worker " + String(i) + ": current_worker TLS did not round-trip")
 
-    # ---- 4. COUNTERS (spec §71) ------------------------------------------
+    # ---- 4. RUNTIME-ABSENT ACCESSOR (issue #72/H5) ------------------------
+    # current_worker_addr() on THIS thread (the embedder's main thread —
+    # never bound by any trampoline) must raise the REAL NoConcurrencyRuntime
+    # error: the accessor surface is live and the absent-path error model is
+    # a raised type, not dead code.
+    var key_after = pool.current_worker_key()
+    var raised_absent = False
+    try:
+        var p = current_worker_addr(key_after)
+        _ = p
+    except Error:
+        raised_absent = True
+    if not raised_absent:
+        red("current_worker_addr() on an unbound thread did not raise "
+            + "NoConcurrencyRuntime (the runtime-absent path is dead)")
+
+    # ---- 5. COUNTERS (spec §71) ------------------------------------------
     if pool.park_total() < 1:
         red("park_total must be >= 1")
 
-    pool.finalize()
-
+    # Print the evidence BEFORE finalize(): the PASS line reports the REAL
+    # pre-teardown counters (finalize frees the acct block, so post-finalize
+    # reads are the quiescent 0).
     print("T35 idle sleep: PASS (idle_parked=" + String(POOL_N)
           + ", park_total=" + String(pool.park_total())
           + ", wake_total=" + String(pool.wake_total())
           + ", spurious=" + String(pool.spurious_total())
           + ", joined=" + String(pool.threads_joined()) + ")")
+
+    pool.finalize()
