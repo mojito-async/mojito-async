@@ -42,6 +42,7 @@
 #
 # Verdict: exit 0 + "PASS"; any RED prints + raises (exit 1).
 from std.memory import stack_allocation
+from mojito_async.runtime.config import RuntimeConfig
 from mojito_async.integration.sys import BytePtr, IntResult
 from mojito_async.runtime.runtime import Runtime, create
 from mojito_async.runtime.scheduler import (
@@ -403,7 +404,10 @@ def test_interleaving() raises:
     buf[S_R2] = 777
     buf[S_R2ADDR] = Int(_ptr(tcb_r2))
     rt.push_remote(Int(_ptr(tcb_r1)), 700)
-    rt.enqueue(Int(_ptr(tcb_inj)), 800)
+    # The E3 injection intake: #69's InjectQueue (the A1 `_ready` FIFO is
+    # only the legacy enqueue() path — the fair loop's has_inject/pop_inject
+    # drain the real shared bounded intake in the full tree).
+    rt.enqueue_global(Int(_ptr(tcb_inj)), 800, 0)
 
     # The continuous LOCAL CPU hog (bounded; K=3).
     var tcb_hog = TB.create()
@@ -535,8 +539,30 @@ def test_starvation_watch() raises:
         + ", yielding hog events=" + String(rt_y.starvation_events()) + ")")
 
 
+def test_config_fair_budget_validation() raises:
+    """M6 (review fold, issue #73): fair_budget_k is validated in
+    RuntimeConfig.validate() — a negative K must raise (a K that would make
+    the budget gate fire immediately is a config error); K=0 (budget
+    disabled, plain scheduler_loop semantics) and K>=1 must validate."""
+    var bad = RuntimeConfig(1, fair_budget_k=-1)
+    try:
+        bad.validate()
+        red("negative fair_budget_k must be rejected by validate()")
+    except e:
+        if not String(e).startswith("RuntimeConfig.validate: fair_budget_k"):
+            red("negative fair_budget_k raised the wrong error: " + String(e))
+    var zero = RuntimeConfig(1, fair_budget_k=0)
+    zero.validate()  # 0 = disabled, documented — must be accepted
+    var ok = RuntimeConfig(1, fair_budget_k=4)
+    ok.validate()
+    print("T36 fairness: 4. config fair_budget_k validation OK "
+        + "(negative raises, 0 = disabled accepted, K=4 accepted)")
+
+
 def main() raises:
     test_timer_under_saturation()
     test_interleaving()
     test_starvation_watch()
+    test_config_fair_budget_validation()
     print("T36 fairness: PASS")
+
