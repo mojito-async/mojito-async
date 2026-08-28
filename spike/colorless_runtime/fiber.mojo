@@ -3,7 +3,7 @@
 # A0.4 (issue #13) — fiber wrapper over the vendored NativeStack /
 # NativeContext substrate (ms_stack_alloc/free, ms_ctx_make/switch).
 #
-# Struct Fiber wraps ONE synthetic stack plus the two 168-byte ms_ctx_t save
+# Struct Fiber wraps ONE synthetic stack plus the two 176-byte ms_ctx_t save
 # areas needed for self-contained switching:
 #
 #     _fiber  — THIS fiber's own continuation (registers saved whenever the
@@ -48,7 +48,7 @@
 # upgrade.  t4_fiber.mojo does exactly that.
 # ---------------------------------------------------------------------------
 #
-# Layout: the two 168-byte save areas, the 24-byte sidecar and the
+# Layout: the two 176-byte save areas, the 24-byte sidecar and the
 # entry/userdata scratch live in ONE heap block (2*MS_CTX_SIZE + 40 bytes,
 # C malloc'd, 16-aligned), referenced by addresses, freed in destroy().  This
 # keeps the Fiber struct all-scalar; the InlineArray-fields variant crashed
