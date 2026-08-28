@@ -46,6 +46,14 @@ if [ -z "$UNIT_TESTS" ] && [ -z "$STRESS_TESTS" ] && [ -z "$AOT_TESTS" ]; then
     exit 2
 fi
 
+# A2.5 two-phase/affinity/duplicate drivers (t34/t34b/t34c — H4-partial and
+# M10 of PR #109): their cross-thread handshake cells are PLAIN Ints
+# published with release/acquire fences, so these drivers MUST be built at
+# -O 0 — a higher optimization level can hoist the plain handshake reads and
+# deadlock or desynchronize the driver.  Every OTHER AOT driver keeps the
+# default optimization level (the suite is NOT rebuilt at -O 0).
+AOT_O0_DRIVERS="t34_two_phase_aot t34b_affinity_aot t34c_duplicate_wake_aot"
+
 failures=0; reds=0; matrix=""
 
 run_one() { # <name> <out> <exit>
@@ -84,7 +92,12 @@ mkdir -p "$BUILD_DIR" || true
 for t in $AOT_TESTS; do
     name=$(basename "$t" .mojo)
     bin="$BUILD_DIR/$name"
-    if ! "$MOJO" build "$t" -o "$bin" -I "$REPO_ROOT" $LINK_FLAGS \
+    o0=""
+    for d in $AOT_O0_DRIVERS; do
+        [ "$d" = "$name" ] && o0="-O 0"
+    done
+    # shellcheck disable=SC2086  # o0 expands to nothing or "-O 0"
+    if ! "$MOJO" build "$t" -o "$bin" -I "$REPO_ROOT" $LINK_FLAGS $o0 \
             >"$BUILD_DIR/$name.build.log" 2>&1; then
         row="$name FAIL (AOT build error)"
         failures=$((failures+1))

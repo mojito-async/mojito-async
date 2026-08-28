@@ -40,6 +40,14 @@
 # directly).  AOT only (pthread externs; modular/modular#6971).
 #
 # Verdict: exit 0 + "PASS"; any failure prints FAIL + _iso_exit(1).
+#
+# BUILD REQUIREMENT (H4-partial/M10, PR #109): this driver MUST be built at
+# `mojo build -O 0`.  Its cross-thread handshake cells (phase, wake_latched,
+# parked_*) are PLAIN Ints published with release/acquire fences; a higher
+# optimization level can hoist the plain handshake reads and deadlock or
+# desynchronize the driver.  mojito_async/test/run.sh carries the -O 0
+# build flag for this driver.  Live scenarios: BOTH S1 and S2 run in
+# main() — S2 (the lost-wakeup window) is invoked, not dead code (H4).
 from std.atomic import Atomic, fence, Ordering
 from std.time import sleep
 from mojito_async.integration.sys import BytePtr, IntResult
@@ -239,6 +247,7 @@ def dispatch_w0(mut rt: Runtime, tcb_addr: Int, tid: Int, ud: BytePtr) raises ->
                 set_phase(sc[].phase, PH_ERR)
                 return 1
             sleep(0.00001)
+        fence[Ordering.ACQUIRE]()  # M10: acquire the waker's latch publication
         var rdy = park_validate(h)
         if not rdy:
             _fail(sc[].failures, "S2: VALIDATE missed the early wake (LOST WAKEUP)")
@@ -546,9 +555,17 @@ def run_scenario(failures: UnsafePointer[Int, MutAnyOrigin], early: Int) raises:
 
 
 def main() raises:
-    var failures = Int(0)
-    var failuresp = UnsafePointer[Int, MutAnyOrigin](to=failures)
-    run_scenario(failuresp, 0)  # S1: cross-worker wake (A0-T12)
+    var failures_s2 = Int(0)
+    var failures_s1 = Int(0)
+    # S2 first (the lost-wakeup window, A0-T11) — LIVE per H4 (PR #109);
+    # then S1 (the cross-worker wake + duplicate/stale rejection).  Each
+    # scenario uses its own failure counter so both assertion blocks run
+    # independently.
+    var fp2 = UnsafePointer[Int, MutAnyOrigin](to=failures_s2)
+    run_scenario(fp2, 1)  # S2: wake inside the PREPARE window
+    var fp1 = UnsafePointer[Int, MutAnyOrigin](to=failures_s1)
+    run_scenario(fp1, 0)  # S1: cross-worker wake (A0-T12)
+    var failures = failures_s2 + failures_s1
     if failures != 0:
         print("T34 two-phase: FAIL (" + String(failures) + ")")
         _iso_exit(1)
