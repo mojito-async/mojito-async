@@ -6,3 +6,13 @@
 # logged. Remove the row as soon as the implementation turns the test green —
 # an unlisted failure blocks the commit.
 suite	https://github.com/mojito-async/mojito-async/issues/61
+
+# A3.3 (issue #62) TDD-red driver: t18_scope_storm_aot asserts the A3
+# exit-criteria storm (500 rounds x 16-depth, root-level cancel storm over
+# a wide tree, failure storm) with exact counters.  The cancellation-storm
+# scenario is RED on main because a root-level request_cancel_all reaches
+# ZERO descendant task flags (scope cancel does not descend into child
+# scopes); that recursive-descend semantic is issue #54's landing.  The
+# driver compiles against the A1.1 machinery unchanged and turns GREEN once
+# the #54 semantics land (this PR merges AFTER the sibling #54 PR).
+suite	https://github.com/mojito-async/mojito-async/issues/54
