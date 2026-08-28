@@ -37,6 +37,8 @@ from mojito_async.runtime.queue import FifoQueue, LocalDeque, RemoteReadyQueue, 
 from mojito_async.runtime.task_control_block import ResultValue, TaskControlBlock
 from std.atomic import Atomic
 from mojito_async.runtime.inject_queue import InjectQueue
+from mojito_async.integration.sys import BytePtr
+from mojito_async.runtime.idle import announce_work
 
 
 # ---------------------------------------------------------------------------
@@ -126,6 +128,17 @@ struct Runtime:
     # failed probe (empty deque or a STARTED record returned to its owner)
     # bumps nothing — no fake counters.
     var _steal_total: Int
+    # E6/M2 (PR #106 fold; issue #112) — the idle-accounting block for the
+    # producer-side wake budget (runtime/idle.mojo).  OPTIONAL pointer
+    # field: the pool allocates the block and arms each worker runtime's
+    # cell via arm_acct() once the E6 NativeEvent idle path exists; until
+    # then the field carries the address-1 SENTINEL and every read is
+    # guarded exactly like the acct readers' pattern (`_acct_guarded`,
+    # idle.mojo), so a cloned/moved Runtime (worker cells are rebuilt per
+    # start) never announces against a sentinel.  The ANNOUNCE side is
+    # wired in enqueue_global per ACCEPTED record; the SIGNAL (wake_one)
+    # is #112-OWNED.
+    var _acct: BytePtr
     def __init__(out self):
         self._ready = FifoQueue[TaskRecord]()
         self._local = LocalDeque()
@@ -141,6 +154,7 @@ struct Runtime:
         self._fiber_switches = 0
         self._inject = InjectQueue(Self.INJECT_CAPACITY)
         self._steal_total = 0
+        self._acct = BytePtr(unsafe_from_address=1)
     # --- root-task execution (A0-T1) ----------------------------------------
 
     def run[T: def() raises -> None](mut self, task: T) raises:
@@ -207,6 +221,32 @@ struct Runtime:
             raise Error("runtime.push_remote: runtime is shut down")
         self._remote.push(TaskRecord(tcb_addr, task_id))
         self._enqueued += 1
+
+    # --- E6/M2 idle-acct seam (PR #106 fold; issue #112) ------------------
+
+    def arm_acct(mut self, acct: BytePtr):
+        """Pool-owned (the E6 lane calls this per worker cell once the
+        NativeEvent idle path exists): arm this runtime's idle-accounting
+        block.  `0`/the address-1 sentinel are refused — the acct readers'
+        guard (`_acct_guarded`, runtime/idle.mojo) treats <= 1 as
+        unarmed."""
+        if Int(acct) > 1:
+            self._acct = acct
+
+    def pool_acct(mut self) -> BytePtr:
+        """This runtime's armed idle-accounting block; the address-1
+        sentinel while unarmed."""
+        return self._acct
+
+    def _announce_work(mut self):
+        """E6/M2 producer-side wake budget: announce ONE accepted runnable
+        record into the idle acct when the pool armed one.  The acct
+        pointer is an OPTIONAL pointer field (default = the address-1
+        sentinel) and every read is guarded exactly like the acct readers'
+        pattern; an unarmed runtime announces nothing.  The SIGNAL —
+        wake_one — lands in #112: this fold only wires the announce."""
+        if Int(self._acct) > 1:
+            announce_work(self._acct, 1)
 
     def pop_local(mut self) raises -> TaskRecord:
         """Dequeue the next LOCAL record (owner LIFO end); raises on an
@@ -280,6 +320,14 @@ struct Runtime:
             # is counted inside the queue's own lock (accepted()); the local
             # `_enqueued` counter stays untouched here.
             self._inject.push(TaskRecord(tcb_addr, task_id))
+            # E6/M2 producer-side wake budget (PR #106 fold): announce PER
+            # ACCEPTED RECORD — a push that raised at capacity announces
+            # NOTHING, so the bounded wake budget is never over-spent (a
+            # rejected unit produces no wake entitlement).  wake_one is
+            # #112-OWNED: this fold only wires the announce.
+            self._announce_work()
+            # #112-OWNED: wake_one call — bounded wake budget: at most ONE
+            # signal per accepted record, fired only when acct_parked > 0.
         else:
             # enqueue_local(W): E2/#68's per-worker deque lane — the record
             # lands on THIS worker's LOCAL deque (owner push_back, LIFO
@@ -289,6 +337,13 @@ struct Runtime:
             # consumed: #68's LocalDeque replaced the A1 `_ready` FIFO]
             self._local.push_back(TaskRecord(tcb_addr, task_id))
             self._enqueued += 1
+            # E6/M2 producer-side wake budget: announce the accepted LOCAL
+            # unit (optional pointer field; address-1 sentinel; guarded
+            # like the acct readers).
+            self._announce_work()
+            # #112-OWNED: wake_one call — the wake signal for this
+            # announced local unit (the E6 lane bounds the budget,
+            # acct_parked > 0).
 
     def inject_queue(mut self) -> UnsafePointer[InjectQueue, MutAnyOrigin]:
         """The shared injection queue (drain seam for scheduler_loop)."""
