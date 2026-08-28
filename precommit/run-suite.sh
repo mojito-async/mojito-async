@@ -38,3 +38,10 @@ if [ ! -x "$A11SH" ]; then
     exit 3
 fi
 "$A11SH" || exit 1
+# --- A2.8 scheduler-scale bench (issue #74) — same gate discipline --------
+BENCHSH="bench/run.sh"
+if [ ! -x "$BENCHSH" ]; then
+    echo "precommit/run-suite.sh: $BENCHSH missing; bench coverage LOST."
+    exit 3
+fi
+"$BENCHSH" || exit 1
