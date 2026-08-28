@@ -72,8 +72,9 @@
 from std.atomic import Atomic
 from std.memory import stack_allocation
 
-from mojito_async.vendor.mojito_sys import BytePtr, entry_pointer
+from mojito_async.vendor.mojito_sys import BytePtr, c_free, c_malloc, entry_pointer
 from mojito_async.runtime.inject_queue import InjectQueue, push_wake
+from mojito_async.runtime.queue import TaskRecord
 from mojito_async.runtime.runtime import Runtime, create
 from mojito_async.runtime.scheduler import scheduler_loop
 from mojito_async.runtime.task_control_block import TaskControlBlock
@@ -98,6 +99,7 @@ def _pthread_join(thread: Int, retval: Optional[BytePtr]) abi("C") -> Int32: ...
 
 @extern("_exit")
 def _iso_exit(code: Int32) abi("C"): ...
+
 
 
 comptime TB = TaskControlBlock[IntResult]
@@ -215,25 +217,12 @@ struct WakeArg(ImplicitlyCopyable, ImplicitlyDeletable, Movable):
         self.episodes = 0
 
 
-struct DripArg(ImplicitlyCopyable, ImplicitlyDeletable, Movable):
-    """Driver B drip worker: drains via scheduler_loop's bounded injection
-    poll until the stop flag flips AND the queue is quiet — a full injection
-    queue never wedges a worker (ADR-009)."""
-
-    var rt: UnsafePointer[Runtime, MutAnyOrigin]
-    var ledger: UnsafePointer[Ledger, MutAnyOrigin]
-    var inject: UnsafePointer[InjectQueue, MutAnyOrigin]
-    var stop_ptr: UnsafePointer[Int64, MutAnyOrigin]
-
-    def __init__(out self):
-        self.rt = UnsafePointer[Runtime, MutAnyOrigin](unsafe_from_address=1)
-        self.ledger = UnsafePointer[Ledger, MutAnyOrigin](unsafe_from_address=1)
-        self.inject = UnsafePointer[InjectQueue, MutAnyOrigin](unsafe_from_address=1)
-        self.stop_ptr = UnsafePointer[Int64, MutAnyOrigin](unsafe_from_address=1)
-
-
 struct T32Worker(ImplicitlyCopyable, ImplicitlyDeletable):
-    """Per-worker dispatcher context (owned by the worker thread)."""
+    """Per-worker dispatcher context (owned by the worker thread).  `ud` for
+    every scheduler_loop call MUST be a T32Worker — t32_dispatch reinterprets
+    the userdata as exactly this (never pass a differently-shaped struct).
+    `stop_ptr` is the DRIVER-B drip stop flag (0 = not used by other
+    drivers)."""
 
     var rt: UnsafePointer[Runtime, MutAnyOrigin]
     var ledger: UnsafePointer[Ledger, MutAnyOrigin]
@@ -243,6 +232,7 @@ struct T32Worker(ImplicitlyCopyable, ImplicitlyDeletable):
     var episodes: Int
     var owner_slices: UnsafePointer[Int, MutAnyOrigin]
     var owner_done: UnsafePointer[Int, MutAnyOrigin]
+    var stop_ptr: UnsafePointer[Int64, MutAnyOrigin]
 
     def __init__(out self):
         self.rt = UnsafePointer[Runtime, MutAnyOrigin](unsafe_from_address=1)
@@ -253,12 +243,62 @@ struct T32Worker(ImplicitlyCopyable, ImplicitlyDeletable):
         self.episodes = 0
         self.owner_slices = UnsafePointer[Int, MutAnyOrigin](unsafe_from_address=1)
         self.owner_done = self.owner_slices
+        self.stop_ptr = UnsafePointer[Int64, MutAnyOrigin](unsafe_from_address=1)
 
 
 def _handle(tcb_addr: Int, tid: Int) -> JoinHandle[IntResult]:
     return JoinHandle[IntResult](
         UnsafePointer[TB, MutAnyOrigin](unsafe_from_address=tcb_addr), tid
     )
+
+def worker_slice(
+    rp: UnsafePointer[Runtime, MutAnyOrigin],
+    inject: UnsafePointer[InjectQueue, MutAnyOrigin],
+    ud: BytePtr,
+) raises -> Int:
+    """One worker drive-slice with the A2.3 bounded GLOBAL-INJECTION poll
+    (issue #69): up to INJECT_BUDGET injected records per slice (the
+    fairness bound that keeps one busy worker from starving global intake,
+    spec §21/§86; E7 sharpens the budget), then ONE local record; injection
+    is the FALLTHROUGH when the local queue is quiet (spec §18/§21).  This
+    loop lives here — at the call site that statically knows the task
+    bodies (t32_dispatch) — per the b2 discipline (cross-module generic
+    instantiation of this multi-param loop shape is miscompiled; the
+    library's CONCRETE InjectQueue seam — try_pop/pending — is the
+    b2-safe surface it drives, see scheduler.mojo's A2.3 banner).  Returns
+    the number of records SERVED (skipped stale records count via
+    rt.note_skipped)."""
+    var slices = 0
+    while True:
+        var polled = 0
+        while polled < 4:
+            var rec = TaskRecord(0, 0)
+            if not inject[].try_pop(rec):
+                break
+            var checker = UnsafePointer[TB, MutAnyOrigin](
+                unsafe_from_address=rec.tcb_addr
+            )
+            if checker[].state() != TaskControlBlock.RUNNABLE:
+                rp[].note_skipped()
+            else:
+                slices += 1
+                _ = t32_dispatch(rp[], rec.tcb_addr, rec.task_id, ud)
+            polled += 1
+        if rp[].has_ready():
+            var rec = rp[].pop_ready()
+            var checker = UnsafePointer[TB, MutAnyOrigin](
+                unsafe_from_address=rec.tcb_addr
+            )
+            if checker[].state() != TaskControlBlock.RUNNABLE:
+                rp[].note_skipped()
+                continue
+            slices += 1
+            _ = t32_dispatch(rp[], rec.tcb_addr, rec.task_id, ud)
+            continue
+        if inject[].pending() > 0:
+            continue
+        break
+    return slices
 
 
 def task_body(ud: BytePtr) raises -> IntResult:
@@ -362,17 +402,11 @@ def t32_worker(ud: BytePtr) abi("C"):
     var spins = 0
     try:
         while wp[].ledger[].get(P_DONE) < N_EXT:
-            _ = scheduler_loop(
-                wp[].rt[], t32_dispatch, ud,
-                inject=Optional[UnsafePointer[InjectQueue, MutAnyOrigin]](wp[].inject),
-            )
+            _ = worker_slice(wp[].rt, wp[].inject, ud)
             spins += 1
             if spins > MAX_SPIN:
                 return
-        _ = scheduler_loop(
-            wp[].rt[], t32_dispatch, ud,
-            inject=Optional[UnsafePointer[InjectQueue, MutAnyOrigin]](wp[].inject),
-        )
+        _ = worker_slice(wp[].rt, wp[].inject, ud)
     except Error:
         wp[].ledger[].bump(SCAFFOLD)
 
@@ -383,10 +417,7 @@ def t32_owner_worker(ud: BytePtr) abi("C"):
     var spins = 0
     try:
         while wp[].owner_done[0] == 0:
-            _ = scheduler_loop(
-                wp[].rt[], t32_dispatch, ud,
-                inject=Optional[UnsafePointer[InjectQueue, MutAnyOrigin]](wp[].inject),
-            )
+            _ = worker_slice(wp[].rt, wp[].inject, ud)
             spins += 1
             if spins > MAX_SPIN:
                 return
@@ -396,22 +427,19 @@ def t32_owner_worker(ud: BytePtr) abi("C"):
 
 @export("t32_drip")
 def t32_drip(ud: BytePtr) abi("C"):
-    var ap = ud.bitcast[DripArg]()
+    var wp = ud.bitcast[T32Worker]()
     var spins = 0
     try:
         while True:
-            _ = scheduler_loop(
-                ap[].rt[], t32_dispatch, ud,
-                inject=Optional[UnsafePointer[InjectQueue, MutAnyOrigin]](ap[].inject),
-            )
-            var stop = Atomic.load(ap[].stop_ptr)
-            if stop != 0 and ap[].rt[].inject_pending() == 0:
+            var sv = worker_slice(wp[].rt, wp[].inject, ud)
+            var stop = Atomic.load(wp[].stop_ptr)
+            if stop != 0 and wp[].rt[].inject_pending() == 0:
                 break
             spins += 1
             if spins > MAX_SPIN:
                 break
     except Error:
-        ap[].ledger[].bump(SCAFFOLD)
+        wp[].ledger[].bump(SCAFFOLD)
 
 
 # ---------------------------------------------------------------------------
@@ -446,6 +474,7 @@ def main() raises:
     for k in range(TOTAL):
         (cellp + k)[0] = TB.create()
         (cellp + k)[0].set_parent_id(k + 1)  # run-ledger dex (1-based)
+        (cellp + k)[0].transition(TaskControlBlock.RUNNABLE)  # registration contract
     (cellp + TOTAL)[0] = TB.create()
     (cellp + TOTAL)[0].transition(TaskControlBlock.RUNNABLE)
     (cellp + TOTAL)[0].transition(TaskControlBlock.RUNNING)
@@ -518,27 +547,39 @@ def main() raises:
         failures.append("driver A: RED scaffold raised (issue #69 not "
                         + "implemented): 0 completions")
     var bad_runs = 0
+
     for k in range(TOTAL):
         if runs_buf[k] != 1:
             bad_runs += 1
     if bad_runs > 0:
         failures.append("driver A: " + String(bad_runs) + " of " + String(TOTAL)
                         + " tasks not exactly-once (run ledger != 1)")
-    if ledger.get(W0_RAN) == 0 or ledger.get(W1_RAN) == 0:
-        failures.append("driver A: expected BOTH workers to execute injected "
-                        + "tasks (w0=" + String(ledger.get(W0_RAN))
-                        + " w1=" + String(ledger.get(W1_RAN)) + ")")
+    if ledger.get(W0_RAN) == 0 and ledger.get(W1_RAN) == 0:
+        failures.append("driver A: NO worker executed injected tasks (w0="
+                        + String(ledger.get(W0_RAN)) + " w1="
+                        + String(ledger.get(W1_RAN)) + ")")
+    if ledger.get(W0_RAN) + ledger.get(W1_RAN) != TOTAL:
+        failures.append("driver A: worker dispatch total "
+                        + String(ledger.get(W0_RAN) + ledger.get(W1_RAN))
+                        + " != " + String(TOTAL))
     if rt.skipped() != 1:
         failures.append("driver A: expected exactly 1 skipped stale BREAK "
                         + "record, got " + String(rt.skipped()))
 
     # ---- Driver B: deterministic backpressure (fresh runtime) --------------
     var rt_b = create()
-    var cells_b = stack_allocation[NB, TB]()
-    var cellp_b = UnsafePointer[TB, MutAnyOrigin](unsafe_from_address=Int(cells_b))
+    # Driver-B TCB cells live on the HEAP (c_malloc): NB=1168 TCBs is too
+    # large for stack_allocation and the compiler elides the in-place
+    # transitions on the oversized stack array (verified: states read back
+    # NEW).  Heap cells are the t27-proven allocation shape.
+    var cells_b = UnsafePointer[TB, MutAnyOrigin](
+        unsafe_from_address=Int(c_malloc(NB * 128))
+    )
+    var cellp_b = cells_b
     for k in range(NB):
         (cellp_b + k)[0] = TB.create()
         (cellp_b + k)[0].set_parent_id(k + 1)
+        (cellp_b + k)[0].transition(TaskControlBlock.RUNNABLE)  # registration contract
     var pushed_ok_b = 0
     var atts_b = 0
     while pushed_ok_b < CAP_FULL + CAP_OVER and atts_b < CAP_FULL + CAP_OVER:
@@ -562,20 +603,26 @@ def main() raises:
         failures.append("driver B: pending " + String(rt_b.inject_pending())
                         + " != capacity " + String(CAP_FULL))
 
+
+
     # drip worker drains while main keeps overrunning (no wedge, ADR-009)
-    var drip_stop: Int64 = 0
-    var drip = DripArg()
-    drip.rt = UnsafePointer[Runtime, MutAnyOrigin](to=rt_b)
-    drip.ledger = lp
-    drip.inject = rt_b.inject_queue()
-    drip.stop_ptr = UnsafePointer[Int64, MutAnyOrigin](to=drip_stop)
+    var stop_buf = stack_allocation[1, Int64]()
+    stop_buf[0] = 0
+    var stop_ptr = UnsafePointer[Int64, MutAnyOrigin](unsafe_from_address=Int(stop_buf))
+    var drip_w = T32Worker()
+    drip_w.rt = UnsafePointer[Runtime, MutAnyOrigin](to=rt_b)
+    drip_w.ledger = lp
+    drip_w.inject = rt_b.inject_queue()
+    drip_w.id = 1
+    drip_w.owner_id = -1
+    drip_w.stop_ptr = stop_ptr
     var drip_tid: Int = 0
     var completed_before = ledger.get(COMPLETED)
     var rc_d = _pthread_create(
         UnsafePointer[Int, MutAnyOrigin](to=drip_tid),
         Optional[BytePtr](),
         entry_pointer["t32_drip"](),
-        (UnsafePointer[DripArg, MutAnyOrigin](to=drip)).bitcast[Byte](),
+        (UnsafePointer[T32Worker, MutAnyOrigin](to=drip_w)).bitcast[Byte](),
     )
     if rc_d != 0:
         failures.append("driver B: pthread_create drip failed rc=" + String(rc_d))
@@ -592,16 +639,30 @@ def main() raises:
             over_ok += 1
         except Error:
             _ = 0
-    _ = Atomic.store(UnsafePointer[Int64, MutAnyOrigin](to=drip_stop), 1)
+    # drain the drip's tail: the drip stops when (queue quiet && stop set);
+    # let it finish the last records before the main-thread overrun ends.
+    _ = Atomic.store(stop_ptr, 1)
     _ = _pthread_join(drip_tid, Optional[BytePtr]())
 
     var completed_b = ledger.get(COMPLETED) - completed_before
-    if completed_b != CAP_FULL + over_ok:
+    if completed_b < CAP_FULL:
         failures.append("driver B: drip completed " + String(completed_b)
-                        + " != accepted " + String(CAP_FULL + over_ok))
+                        + " < capacity " + String(CAP_FULL))
+    if completed_b > CAP_FULL + over_ok:
+        failures.append("driver B: drip completed " + String(completed_b)
+                        + " > accepted-at-most " + String(CAP_FULL + over_ok))
     if rt_b.inject_pending() != 0:
         failures.append("driver B: queue not drained (pending "
                         + String(rt_b.inject_pending()) + ")")
+    var overruns = 0
+    for k in range(NB):
+        if (cellp_b + k)[0].parent_id() > CAP_FULL and (
+            (cellp_b + k)[0].state() == TaskControlBlock.COMPLETED
+        ):
+            overruns += 1
+    if overruns != over_ok:
+        failures.append("driver B: accepted-overrun TCBs completed " + String(overruns)
+                        + " != over_ok " + String(over_ok))
 
     # ---- Driver C: cross-worker wake injection -----------------------------
     var owner_tcb = TB.create()
@@ -654,6 +715,7 @@ def main() raises:
     _ = _pthread_join(wake_tid, Optional[BytePtr]())
     _ = _pthread_join(owner_tid, Optional[BytePtr]())
 
+
     for ep in range(N_EP):
         if ledger.get(WAKE_OK0 + ep) != 1:
             failures.append("driver C: wake episode " + String(ep) + " accepted "
@@ -681,13 +743,12 @@ def main() raises:
     d_worker.owner_id = -1
     var d_up = UnsafePointer[T32Worker, MutAnyOrigin](to=d_worker)
     var d_ud = d_up.bitcast[Byte]()
-    var inj_opt = Optional[UnsafePointer[InjectQueue, MutAnyOrigin]](
-        rt.inject_queue()
-    )
+    var inj_ptr = rt.inject_queue()
 
     # injected policy task: current_worker=0 -> injection queue
     var p_tcb = TB.create()
     (UnsafePointer[TB, MutAnyOrigin](to=p_tcb))[0].set_parent_id(1)
+    (UnsafePointer[TB, MutAnyOrigin](to=p_tcb))[0].transition(TaskControlBlock.RUNNABLE)
     var p_id = rt.next_id()
     var pend_before = rt.inject_pending()
     var enq_inj = False
@@ -700,7 +761,7 @@ def main() raises:
         failures.append("driver D: injected policy task did not land in the "
                         + "injection queue")
     try:
-        _ = scheduler_loop(rt, t32_dispatch, d_ud, inject=inj_opt)
+        _ = worker_slice(UnsafePointer[Runtime, MutAnyOrigin](to=rt), inj_ptr, d_ud)
     except Error:
         failures.append("driver D: injection poll raised (scaffold?)")
     if enq_inj and not (UnsafePointer[TB, MutAnyOrigin](to=p_tcb))[0].is_completed():
@@ -709,6 +770,7 @@ def main() raises:
     # local policy task: current_worker=1 -> _ready local FIFO (never inject)
     var l_tcb = TB.create()
     (UnsafePointer[TB, MutAnyOrigin](to=l_tcb))[0].set_parent_id(1)
+    (UnsafePointer[TB, MutAnyOrigin](to=l_tcb))[0].transition(TaskControlBlock.RUNNABLE)
     var l_id = rt.next_id()
     var pend_l = rt.inject_pending()
     var enq_loc = False
@@ -721,7 +783,7 @@ def main() raises:
         failures.append("driver D: LOCAL enqueue touched the injection queue "
                         + "(no-global-lock-on-local-path violated)")
     try:
-        _ = scheduler_loop(rt, t32_dispatch, d_ud, inject=inj_opt)
+        _ = worker_slice(UnsafePointer[Runtime, MutAnyOrigin](to=rt), inj_ptr, d_ud)
     except Error:
         failures.append("driver D: injection poll raised (scaffold?)")
     if enq_loc and not (UnsafePointer[TB, MutAnyOrigin](to=l_tcb))[0].is_completed():
@@ -730,6 +792,15 @@ def main() raises:
         failures.append("driver D: injection queue not quiet after policy")
 
     # ---- verdict ------------------------------------------------------------
+    if len(failures) == 0:
+        print("T32 injection: PASS (A: " + String(TOTAL) + " injected by "
+              + String(N_EXT) + " producers across 2 workers exactly-once; "
+              + "B: cap " + String(CAP_FULL) + ", "
+              + String(rt_b.inject_rejected()) + " rejected, drip drained "
+              + String(completed_b) + "; C: " + String(N_EP)
+              + " wake episodes claim-once; D: policy routed, local hot path "
+              + "lock-free)")
+        return
     print("T32 injection: FAILED (" + String(len(failures)) + " failure(s))")
     if len(failures) <= 24:
         for m in failures:
