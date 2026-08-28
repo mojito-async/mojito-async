@@ -43,6 +43,7 @@ struct SuspendReason:
     comptime NONE = Int(0)
     comptime YIELD = Int(1)
     comptime JOIN = Int(2)
+    comptime TIMER = Int(5)
     comptime PARK = Int(3)
     comptime CANCEL = Int(4)
 
