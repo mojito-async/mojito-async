@@ -186,7 +186,164 @@ def ms_ctx_switch(from_: BytePtr, to: BytePtr) abi("C"):
 def c_malloc(size: Int) abi("C") -> BytePtr:
     ...
 
-
 @extern("free")
 def c_free(ptr: BytePtr) abi("C"):
     ...
+
+
+# ---------------------------------------------------------------------------
+# A2.1 (issue #67) — worker-pool substrate: logical CPU count, NativeThread,
+# NativeTlsKey.  The frozen mojito-sys S0 substrate exports NO thread-creation
+# primitive, so the documented S2.2 recipe applies: an @export'd abi("C")
+# entry (the pool trampoline, runtime/thread_entry.mojo) + the adrp/add
+# code-address recipe (entry_pointer above, AOT-proven in *_aot drivers) and
+# the pthread_* externs BELOW at concrete module scope (libc; per the A1
+# notes libc symbols resolve under both JIT and AOT, the ms_* dylib symbols
+# are AOT-only).  The producers/consumers of NativeThread must be core
+# scheduler threads (spec phase A2 "N mojito-sys.NativeThread workers").
+#
+# NULL-CAPABLE C PARAMETERS: typed UInt (zero passes through as the null
+# pointer ABI-wise) — Mojo pointers are non-nullable in 1.0.0b2
+# (std.memory.unsafe_pointer: "use Optional[UnsafePointer] to model
+# nullability"), and pthread_create/pthread_join/pthread_key_create all take
+# NULL in our usage (default attributes, no dtor, no exit value).
+# ---------------------------------------------------------------------------
+
+@extern("ms_cpu_logical_count")
+def cpu_logical_count() abi("C") -> Int:
+    ...
+
+
+@extern("pthread_create")
+def pthread_create(
+    thread: UnsafePointer[UInt, MutAnyOrigin],
+    attr: UInt,
+    start_routine: BytePtr,
+    arg: BytePtr,
+) abi("C") -> Int32:
+    ...
+
+
+@extern("pthread_join")
+def pthread_join(thread: UInt, retval: UInt) abi("C") -> Int32:
+    ...
+
+
+@extern("pthread_self")
+def pthread_self() abi("C") -> UInt:
+    ...
+
+
+@extern("pthread_key_create")
+def pthread_key_create(
+    key: UnsafePointer[UInt, MutAnyOrigin], destructor: UInt
+) abi("C") -> Int32:
+    ...
+
+
+@extern("pthread_getspecific")
+def pthread_getspecific(key: UInt) abi("C") -> BytePtr:
+    ...
+
+
+@extern("pthread_setspecific")
+def pthread_setspecific(key: UInt, value: BytePtr) abi("C") -> Int32:
+    ...
+
+
+# ---------------------------------------------------------------------------
+# NativeThread — one OS thread handle (pthread_t on LP64 Darwin; the A2.1
+# worker pool's worker carrier).  Value type: holding a handle does not own
+# the thread; join_native_thread is the only release path (like
+# ms_stack_free for NativeStack).
+# ---------------------------------------------------------------------------
+
+struct NativeThread(ImplicitlyCopyable, ImplicitlyDeletable, Movable):
+    var _tid: UInt
+
+    def __init__(out self):
+        self._tid = 0
+
+    def tid(self) -> UInt:
+        return self._tid
+
+    def alive(self) -> Bool:
+        return self._tid != 0
+
+
+def make_native_thread() -> NativeThread:
+    """Module-level factory (b2 has no static methods)."""
+    return NativeThread()
+
+
+def spawn_native_thread(entry: BytePtr, arg: BytePtr) raises -> NativeThread:
+    """Create one OS thread running entry(arg) with default pthread attrs.
+
+    `entry` is the C-ABI code address of an @export'd abi("C") def obtained
+    via entry_pointer[...] (the S2.2 adrp/add recipe).  Raises when
+    pthread_create fails (thread limit / resource exhaustion); the caller
+    stays the thread's creator and MUST eventually join it.
+    """
+    var t = NativeThread()
+    var tp = UnsafePointer[UInt, MutAnyOrigin](to=t._tid)
+    var rc = pthread_create(tp, 0, entry, arg)
+    if rc != 0:
+        # NOTE (b2 1.0.0b2 #compiler-crash, probed in this lane): mixing a
+        # const String literal + a dynamic String(rc) in one concatenation
+        # inside a raise path that also calls an extern crashed the compiler;
+        # keep the message a SINGLE dynamic conversion.
+        raise Error(String(rc))
+    return t
+
+
+def join_native_thread(t: NativeThread) raises:
+    """Join one thread; its exit value is discarded (retval = NULL)."""
+    if not t.alive():
+        return
+    var rc = pthread_join(t._tid, 0)
+    if rc != 0:
+        raise Error(String(rc))
+
+
+# ---------------------------------------------------------------------------
+# NativeTlsKey — one OS-worker-local storage slot (pthread_key_t; spec §69:
+# current_worker / current_task / current_scope).  Native TLS is
+# OS-worker-local, never task-local (spec §69 documents the migration
+# caveat).  A2.1 writes current_worker at THREAD ENTRY only (coarse
+# granularity — the C layer behind pthread reads holds one global registry
+# mutex, per the S2.4 scalability note; no per-task get() hot paths this
+# lane).  current_task / current_scope are reserved slots for the E-lanes.
+# ---------------------------------------------------------------------------
+
+struct NativeTlsKey(ImplicitlyCopyable, ImplicitlyDeletable, Movable):
+    var _key: UInt
+
+    def __init__(out self):
+        self._key = 0
+
+    def raw(self) -> UInt:
+        return self._key
+
+
+def make_tls_key() raises -> NativeTlsKey:
+    """Create one pthread TLS key (no destructor; slots hold raw pointers to
+    runtime-owned cells, freed by the pool lifecycle, never the OS)."""
+    var k = NativeTlsKey()
+    var kp = UnsafePointer[UInt, MutAnyOrigin](to=k._key)
+    var rc = pthread_key_create(kp, 0)
+    if rc != 0:
+        raise Error(String(rc))
+    return k
+
+
+def tls_get(key: NativeTlsKey) -> BytePtr:
+    """Read this OS thread's value for `key` (address 0 when unset — the
+    null pointer; never dereferenced unguarded)."""
+    return pthread_getspecific(key._key)
+
+
+def tls_set(key: NativeTlsKey, value: BytePtr) raises:
+    """Bind `value` to this OS thread's slot for `key` (address 0 clears)."""
+    var rc = pthread_setspecific(key._key, value)
+    if rc != 0:
+        raise Error(String(rc))
