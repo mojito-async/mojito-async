@@ -111,6 +111,7 @@ struct RuntimeConfig(ImplicitlyCopyable, ImplicitlyDeletable, Movable):
             raise Error(
                 "RuntimeConfig.validate: stack_initial_commit_bytes must be "
                 + "<= stack_reserve_bytes"
+            )
         if self.fair_budget_k < 0:
             raise Error(
                 "RuntimeConfig.validate: fair_budget_k must be >= 0 (0 disables)"
