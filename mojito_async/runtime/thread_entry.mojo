@@ -305,6 +305,21 @@ def pool_worker_loop(cell: BytePtr):
     var c = cell.bitcast[WorkerEntryCell]()
     while c[].units_left > 0:
         seam_run_unit(cell)
+    # A2.6/M7 (issue #72): this worker's drain COMPLETED its announced seam
+    # units — ONE BATCHED complete per worker per cycle (the producer wake
+    # protocol, idle.mojo header: every drained unit completes exactly one
+    # announce).  Batching (instead of one seq-cst RMW per unit) keeps the
+    # announce/complete balance exact while keeping the per-unit drain off
+    # the shared acct cache line — a per-unit decrement serialized the
+    # bench's 2M-unit sweep across workers (no CPU scaling).  NON-RAISING
+    # (abi("C") path): a debug-build underflow (completing past the
+    # announced floor) flags unit_ok, mirroring idle.mojo's pair check.
+    if c[].obs_done > 0:
+        var pending_before = Atomic[DType.int64].fetch_add[
+            ordering=Ordering.SEQUENTIAL
+        ](_idle_cell(c[].acct, IDLE_ACCT_PENDING), -Int64(c[].obs_done))
+        if IDLE_PAIR_ASSERT and pending_before < Int64(c[].obs_done):
+            c[].unit_ok = False
     while True:
         var latched = Atomic[DType.uint8].load[ordering=Ordering.ACQUIRE](
             c[].latch
@@ -371,18 +386,6 @@ def seam_run_unit(cell: BytePtr):
     c[].obs[c[].obs_done] = c[].worker_id
     c[].obs_done += 1
     c[].units_left -= 1
-    # A2.6/M7 (issue #72): the drained seam unit COMPLETES one announced
-    # unit — seed_seam_units announced per_worker units per worker and every
-    # drain must pair (producer wake protocol, idle.mojo header).  NON-
-    # RAISING (abi("C") path; b2 drops try/except calls here): a debug-build
-    # underflow (drain below the announced floor — old pending < 1 before
-    # the -1) flags unit_ok instead of raising, mirroring idle.mojo's
-    # complete_work pair-mismatch detection on the worker side.
-    var pending_before = Atomic[DType.int64].fetch_add[ordering=Ordering.SEQUENTIAL](
-        _idle_cell(c[].acct, IDLE_ACCT_PENDING), -1
-    )
-    if IDLE_PAIR_ASSERT and pending_before - 1 < 0:
-        c[].unit_ok = False
 
 
 def mjs_pool_entry_main(ud: BytePtr) abi("C"):
