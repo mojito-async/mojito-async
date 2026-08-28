@@ -19,17 +19,56 @@
 #     queue; E5 routes it to the OWNER worker, spec §19.2).  The A1.1
 #     `_suspend_current` / `resume_current` spellings were deleted; every
 #     consumer and lane driver imports park.mojo.
-#   - `scheduler_loop` — the per-worker cooperative drive loop.  It is
-#     GENERIC over a statically-known task-owner dispatcher (b2 cannot store
-#     function values): the caller supplies the body executor for THIS task
-#     tree, so unstarted records are executed exactly where their bodies are
-#     known (the spike's proven model; NEVER dynamic dispatch through the
-#     record).  The loop drains the worker's LOCAL deque first, then its
-#     REMOTE-ready queue (spec §21), running each record via the dispatcher
-#     to its next checkpoint, and stops when both are quiet.  A popped
-#     record whose TCB is not RUNNABLE (stale duplicate) is SKIPPED —
-#     counted via rt.skipped(), never dispatched (the A1 invariant survives
-#     the queue split, issue #68).
+#     A2.5 (issue #71) — STARTED-FIBER AFFINITY / OWNERSHIP SPLIT: the
+#     BASE scheduler_loop stamps owner_worker AND the owner Runtime
+#     address at FIRST RUN (when `worker_id` is nonzero) and asserts the
+#     no-off-owner invariant (a STARTED record is never popped by a
+#     non-owner worker — spec §19.2; the wake routing in park.mojo + E4's
+#     steal guard make it unreachable, this is the debug assertion path).
+#     H1 fold (#73/#71 coordinate): fair_scheduler_loop stamps BOTH at
+#     FIRST RUN (owner_worker + owner Runtime address) and asserts the
+#     same no-off-owner invariant on its REMOTE-ready pops (budget-drain
+#     + main pick) — sound on this base because every remote record
+#     carries either no owner yet or this worker's own id, and t36 is the
+#     only fair-loop driver.
+#
+#     # E3-OWNED: injection intake (issue #69) — #69's bounded injection poll
+#     # (optional `inject`/`inject_budget` params, default None) drops in at
+#     # the seam below, BEFORE pop_local, keeping the A1 call form.
+#
+# A2.7 (issue #73) — the FAIRNESS BUDGET (spec §21/§67/§71).  The
+# worker-loop fairness drive is `fair_scheduler_loop` below: after K
+# CONSECUTIVELY LOCALLY-SOURCED task slices it services remote-ready, the
+# injection intake, and the caller's timer/reactor sweep before resuming
+# local work (spec §21 "run at most K ready tasks then service
+# reactor/timers").  Work-class slice accounting (local vs remote vs
+# injection) and the kill-0 starvation watch live on the runtime.
+#
+# COOPERATIVE YIELD — documented limitation (spec §67/§68): scheduling is
+# COOPERATIVE.  `yield_now` (below) remains the escape hatch, and a task
+# that parks through runtime.park also hands the worker back.  But ARBITRARY
+# CPU-BOUND USER CODE THAT NEVER YIELDS MAY MONOPOLIZE ITS WORKER: the
+# scheduler has NO async stack preemption in the MVP (spec §68 forbids
+# it), so a task's own slice runs to its next checkpoint unconditionally.
+# The fairness budget bounds the DEFERRAL of timers/reactor/remote/inject
+# to K slices (they still run between the hog's slices), and the kill-0
+# watch MEASURES a never-yielding task via starvation_events — the
+# accepted, documented cooperative limitation (spec §67 says exactly this;
+# §68 lists safepoint/time-budget preemption as later options, none in the
+# MVP).  E8 (bench, issue #74) reads starvation_events.
+#
+#   REVIEW CHECKLIST (A2.7 drivers review):
+#     [ ] fair_scheduler_loop counts CONSECUTIVE LOCAL slices vs Budget.K
+#     [ ] hitting K services timers/reactor BEFORE more local work
+#     [ ] remote-ready + injection drain to quiet in the same budget pass
+#     [ ] a never-yielding task: timers still fire (t36 test 1), remote/
+#         inject run within the window (t36 test 2), starvation_events
+#         bumps once per >K streak (t36 tests 1+3)
+#     [ ] a yielding/parking task NEVER bumps starvation_events (t36 test 3)
+#     [ ] yield_now still reschedules cooperatively (A1 parity, t36 test 3)
+#     [ ] K=0 degenerates to plain scheduler_loop semantics
+#     [ ] the loop returns only after a quiet final service pass (E6
+#         idle-sleep handoff: park the OS thread only after this return)
 #
 #
 # A1.5 (issue #53) — the FIBER-BACKED drive.  This module stays EXTERN-FREE
@@ -77,6 +116,9 @@ def yield_now[R: ResultValue](mut rt: Runtime, h: JoinHandle[R]) raises:
     h.tcb()[].transition(TaskControlBlock.PARKING)
     h.tcb()[].transition(TaskControlBlock.RUNNABLE)
     rt.enqueue_local(Int(h.tcb()), h.id())
+    # A2.7 (issue #73): one cooperative handoff observed — the starve-watch
+    # (fair_scheduler_loop) resets its consecutive-slices counter on this.
+    rt.note_yield()
 
 
 # ---------------------------------------------------------------------------
@@ -144,8 +186,31 @@ def scheduler_loop[F: def(mut Runtime, Int, Int, BytePtr) raises -> Int, R: Resu
         if checker[].state() != TaskControlBlock.RUNNABLE:
             rt.note_skipped()
             continue
-        if worker_id != 0 and checker[].owner_worker() == 0:
+        var own = checker[].owner_worker()
+        # no-off-owner invariant (issue #71): a STARTED record is worker-
+        # affine — the wake routing (park.mojo's owner-remote push) and E4's
+        # steal guard keep it off every non-owner queue, so popping one here
+        # is a migration bug.  Assert it (debug builds; the A1 unpooled
+        # sentinel worker_id == 0 skips the check).
+        if own != 0 and worker_id != 0 and own != worker_id:
+            raise Error(
+                "scheduler_loop: STARTED task "
+                + String(rec.task_id)
+                + " popped off-owner (owner "
+                + String(own)
+                + ", worker "
+                + String(worker_id)
+                + ") — a started fiber must never migrate (issue #71)"
+            )
+        if worker_id != 0 and own == 0:
+            # FIRST RUN: stamp the worker affinity — the owner worker id
+            # (E5 surface, issue #68) AND the owner Runtime address (issue
+            # #71: the cross-worker wake route target, so unpark_current
+            # needs no global worker registry).
             checker[].set_owner_worker(worker_id)
+            checker[].set_owner_runtime(
+                Int(UnsafePointer[Runtime, MutAnyOrigin](to=rt))
+            )
         slices += 1
         _ = dispatcher(rt, rec.tcb_addr, rec.task_id, ud)
     return slices
@@ -182,6 +247,271 @@ def scheduler_loop[F: def(mut Runtime, Int, Int, BytePtr) raises -> Int, R: Resu
 # intake between its local/remote deques, so injected work is dequeued
 # identically on every worker — WITHOUT a global lock on the local hot path.
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# A2.7 (issue #73) — FAIRNESS BUDGET DRIVE (spec §21 "run at most K ready
+# tasks then service reactor/timers"; §67 no class starves; §71 observe).
+#
+# fair_scheduler_loop is the WORKER-LOOP fairness budget over the same
+# per-worker queues as scheduler_loop:
+#
+#   BUDGET (spec §21): the loop counts CONSECUTIVE LOCALLY-SOURCED slices
+#   against Budget.K; the instant that count reaches K it (1) notes the
+#   budget reset, (2) runs the caller's timer/reactor service callback
+#   (a time/timer_service sweep — the A1 timer lane — and/or a reactor
+#   nonblocking poll), and (3) drains the REMOTE-ready queue and the
+#   INJECTION intake to quiet BEFORE resuming local work.  Endless local
+#   CPU work therefore never defers timers/reactor/remote/inject beyond K
+#   slices: the acceptance "a timer inserted at T+small fires while a local
+#   task never yields".
+#
+#   WORK-CLASS ACCOUNTING (§71): every served slice is classified and
+#   counted on the runtime — slices_local (this worker's deque: spawn,
+#   yield), slices_remote (STARTED-task wakes, spec §19.2), slices_inject
+#   (the E3 intake seam; #69's inject_queue polls through this drains).
+#   The class counters let the budget guarantee reactor/timer progress
+#   under CPU saturation and surface exactly what deferred what to the
+#   benchmark lane (E8, issue #74).
+#
+#   KILL-0 STARVATION WATCH (§67/§71): the loop tracks the CURRENT task's
+#   consecutive locally-sourced slices since ITS OWN cooperative handoff —
+#   a yield_now (observed via the runtime yields counter) or a park/exit
+#   (observed via the post-dispatch TCB state — WAITING/COMPLETED).  When a
+#   SAME-task streak exceeds Budget.K (the K+1th slice), the runtime
+#   starvation_events counter bumps ONCE per streak.  Note carefully: the
+#   LOOP-forced service passes are what prevent actual starvation (timers
+#   fire, remote/inject drain), but a never-yielding task's OWN streak is
+#   NOT reset by them — that streak is the documented §67 cooperative
+#   limitation ("CPU-bound user code that never yields may monopolize its
+#   worker"; NO preemption in MVP, §68), measured rather than hidden and
+#   surfaced to the benchmarks.  A yielding/parking task NEVER bumps it.
+#
+#   E6 IDLE-SLEEP HANDOFF (banner for the sibling #72 lane): this function
+#   returns ONLY after a quiet final service pass — the fair drain is empty
+#   (timers serviced, reactor polled, remote/inject drained) — so an idle
+#   worker that parks its OS thread (NativeEvent park) does so strictly
+#   AFTER the fair drain, composing with the #72 idle path.  The pool's
+#   worker loop (thread_entry) parks only post-return.
+#
+#   K=0 disables the budget, the service passes and the watch entirely:
+#   the loop degenerates to plain scheduler_loop semantics (A1 parity).
+#
+#   Generic over the SAME statically-known record dispatcher as
+#   scheduler_loop (b2: no function-typed struct fields) PLUS the caller's
+#   service callback `service(rt, ud)` — the timer/reactor sweep the budget
+#   runs between drains (the A1 timer lane's service_timers wrapped by the
+#   caller, or a reactor poll).  The budget default (4) mirrors
+#   config.DEFAULT_FAIR_BUDGET_K — the literal is duplicated here because
+#   scheduler.mojo stays EXTERN-FREE (config.mojo imports cpu_logical_count
+#   from mojito-sys; modular/modular#6971 JIT drivers cannot resolve that).
+# ---------------------------------------------------------------------------
+
+# Starve-watch + budget state of one fair drive (loop-local; b2 has no
+# function-typed or global mutable state, so the loop owns it explicitly).
+struct FairLoopState(ImplicitlyCopyable, ImplicitlyDeletable):
+    """Per-drive fairness state (budget counter + kill-0 watch)."""
+
+    var consecutive_budget: Int   # consecutive locally-sourced slices served
+    var streak_task: Int          # task id owning the current watch streak (0 = none)
+    var streak_len: Int           # consecutive same-task local slices since ITS yield/park
+
+    def __init__(out self):
+        self.consecutive_budget = 0
+        self.streak_task = 0
+        self.streak_len = 0
+
+
+def fair_scheduler_loop[
+    F: def(mut Runtime, Int, Int, BytePtr) raises -> Int,
+    S: def(mut Runtime, BytePtr) raises,
+    R: ResultValue = Nil,
+](
+    mut rt: Runtime,
+    dispatcher: F,
+    ud: BytePtr,
+    service: S,
+    budget_k: Int = 4,
+    worker_id: Int = 0,
+) raises -> Int:
+    """Drive ONE worker under the A2.7 fairness budget (spec §21/§67/§71).
+
+    Same record discipline as scheduler_loop (local deque FIRST, then the
+    remote-ready queue, then the E3 injection intake; stale non-RUNNABLE
+    records are skipped via rt.skipped(); owner_worker is stamped at first
+    run when worker_id is nonzero) — PLUS, whenever K consecutively
+    locally-sourced slices have been served, a budget pass runs BEFORE more
+    local work: rt.budget_resets(), the `service` callback (the caller's
+    timer/reactor sweep), then a FULL drain of the remote-ready queue and
+    the injection intake (counted slices_remote / slices_inject).  Endless
+    local CPU work defers timers/reactor/remote/inject by at most K slices.
+
+    The kill-0 starve watch (rt.starvation_events) bumps ONCE per streak
+    when the SAME never-yielding task reaches Budget.K+1 consecutive local
+    slices with no yield_now (rt.yields delta) and no park/exit (TCB no
+    longer RUNNABLE after its slice).  A yield_now or park resets the
+    streak; a loop-forced service pass does NOT (it is the loop's doing,
+    not the task's cooperation — the §67 documented limitation measured).
+
+    Returns the number of records SERVED (dispatched; skipped records are
+    observable via rt.skipped()).  When it returns, the fair drain is quiet
+    — timers/reactor serviced (the E6 idle-sleep handoff banner: park the
+    OS thread only after this return)."""
+    comptime CLS_LOCAL = Int(1)
+    comptime CLS_REMOTE = Int(2)
+    comptime CLS_INJECT = Int(3)
+    var slices = 0
+    var st = FairLoopState()
+    var fair_drained = False
+    while True:
+        # ---- budget gate: K consecutive local slices -> service first ----
+        if (
+            budget_k > 0
+            and rt.has_local()
+            and st.consecutive_budget >= budget_k
+        ):
+            st.consecutive_budget = 0
+            rt.note_budget_reset()
+            rt.note_service_sweep()
+            service(rt, ud)
+            # drain remote-ready fully, then the injection intake fully
+            while rt.has_remote():
+                var rrec = rt.pop_remote()
+                var rcheck = UnsafePointer[TaskControlBlock[R], MutAnyOrigin](
+                    unsafe_from_address=rrec.tcb_addr
+                )
+                if rcheck[].state() != TaskControlBlock.RUNNABLE:
+                    rt.note_skipped()
+                    continue
+                # H1 no-off-owner assertion (issue #73/#71 coordinate): a
+                # STARTED record must NEVER pop off its owner worker (spec
+                # §19.2; the #71 lane's owner-routed park makes it
+                # unreachable once merged — this is the debug assertion
+                # path; the A1 unpooled sentinel worker_id == 0 skips it).
+                var rown = rcheck[].owner_worker()
+                if rown != 0 and worker_id != 0 and rown != worker_id:
+                    raise Error(
+                        "fair_scheduler_loop: STARTED task "
+                        + String(rrec.task_id)
+                        + " popped remote off-owner (owner "
+                        + String(rown)
+                        + ", worker "
+                        + String(worker_id)
+                        + ") — a started fiber must never migrate (issue #71)"
+                    )
+                if worker_id != 0 and rown == 0:
+                    # FIRST RUN (fair drain): stamp the worker affinity —
+                    # owner worker id (E5, issue #68) AND the owner Runtime
+                    # address (H1; issue #71 wake route target).
+                    rcheck[].set_owner_worker(worker_id)
+                    rcheck[].set_owner_runtime(
+                        Int(UnsafePointer[Runtime, MutAnyOrigin](to=rt))
+                    )
+                rt.note_slice_remote()
+                slices += 1
+                _ = dispatcher(rt, rrec.tcb_addr, rrec.task_id, ud)
+            while rt.has_inject():
+                var irec = rt.pop_inject()
+                var icheck = UnsafePointer[TaskControlBlock[R], MutAnyOrigin](
+                    unsafe_from_address=irec.tcb_addr
+                )
+                if icheck[].state() != TaskControlBlock.RUNNABLE:
+                    rt.note_skipped()
+                    continue
+                if worker_id != 0 and icheck[].owner_worker() == 0:
+                    icheck[].set_owner_worker(worker_id)
+                    icheck[].set_owner_runtime(
+                        Int(UnsafePointer[Runtime, MutAnyOrigin](to=rt))
+                    )
+                rt.note_slice_inject()
+                slices += 1
+                _ = dispatcher(rt, irec.tcb_addr, irec.task_id, ud)
+
+        # ---- pick the next record (spec §21 order: local, remote, inject) --
+        var have = False
+        var rec = TaskRecord(0, 0)
+        var cls = 0
+        if rt.has_local():
+            rec = rt.pop_local()
+            have = True
+            cls = CLS_LOCAL
+        elif rt.has_remote():
+            rec = rt.pop_remote()
+            have = True
+            cls = CLS_REMOTE
+        elif rt.has_inject():
+            rec = rt.pop_inject()
+            have = True
+            cls = CLS_INJECT
+        if not have:
+            # quiet fair-drain: one final service pass before declaring the
+            # worker idle (E6 handoff: sleep only after this return; a wake
+            # produced by the pass re-enters the loop).
+            if fair_drained:
+                break
+            rt.note_service_sweep()
+            service(rt, ud)
+            fair_drained = True
+            continue
+        fair_drained = False
+
+        # ---- serve the record (stale-skip + first-run owner stamp) --------
+        var checker = UnsafePointer[TaskControlBlock[R], MutAnyOrigin](
+            unsafe_from_address=rec.tcb_addr
+        )
+        if checker[].state() != TaskControlBlock.RUNNABLE:
+            rt.note_skipped()
+            continue
+        # H1 no-off-owner assertion (issue #73/#71 coordinate): a STARTED
+        # record picked from the REMOTE-ready queue must belong to this
+        # worker (spec §19.2 — started fibers never migrate).  Local pops
+        # are this worker's own spawns/yields (owner stamped here at first
+        # run); inject records are never started when first popped.
+        if cls == CLS_REMOTE:
+            var mown = checker[].owner_worker()
+            if mown != 0 and worker_id != 0 and mown != worker_id:
+                raise Error(
+                    "fair_scheduler_loop: STARTED task "
+                    + String(rec.task_id)
+                    + " popped remote off-owner (owner "
+                    + String(mown)
+                    + ", worker "
+                    + String(worker_id)
+                    + ") — a started fiber must never migrate (issue #71)"
+                )
+        if worker_id != 0 and checker[].owner_worker() == 0:
+            # FIRST RUN: stamp the worker affinity — owner worker id (E5,
+            # issue #68) AND the owner Runtime address (H1; issue #71 wake
+            # route target).
+            checker[].set_owner_worker(worker_id)
+            checker[].set_owner_runtime(
+                Int(UnsafePointer[Runtime, MutAnyOrigin](to=rt))
+            )
+        if cls == CLS_LOCAL:
+            rt.note_slice_local()
+            st.consecutive_budget += 1
+        elif cls == CLS_REMOTE:
+            rt.note_slice_remote()
+        else:
+            rt.note_slice_inject()
+        slices += 1
+        var yields_before = rt.yields()
+        _ = dispatcher(rt, rec.tcb_addr, rec.task_id, ud)
+
+        # ---- kill-0 starve watch (locally-sourced slices only) ------------
+        if cls == CLS_LOCAL:
+            if checker[].state() != TaskControlBlock.RUNNABLE or rt.yields() != yields_before:
+                # cooperative handoff: parked (WAITING), completed, or
+                # yield_now — the streak is over (fresh watch window).
+                st.streak_task = 0
+                st.streak_len = 0
+            elif st.streak_task == rec.task_id:
+                st.streak_len += 1
+                if budget_k > 0 and st.streak_len == budget_k + 1:
+                    rt.note_starvation()
+            else:
+                st.streak_task = rec.task_id
+                st.streak_len = 1
+    return slices
 
 # ---------------------------------------------------------------------------
 # A1.5 fiber seam (issue #53): the fiber-backed DRIVE lives in

@@ -26,7 +26,15 @@
 # thief steal_front at the front — spec §20 opposite ends); a STARTED
 # record popped under the target deque's guard is RETURNED to the owner
 # (push_back) — never run off-owner (ADR-006/007).
+#
+# A2.6 (issue #72) — E6 idle sleep/wake: the pool assigns each Worker a
+# reference to the SHARED pool idle state (the NativeEvent handle + the
+# lock-free accounting block) via set_pool_idle(); park_os_thread_until_
+# event() is the OS-level idle park the worker loop calls when it finds no
+# local/remote/injection/steal work (spec §21) — it sleeps on the pool's
+# per-pool NativeEvent instead of busy-spinning.
 from mojito_async.integration.sys import BytePtr
+from mojito_async.runtime.idle import idle_park_worker
 from mojito_async.runtime.queue import LocalDeque, RemoteReadyQueue, TaskRecord
 from mojito_async.runtime.runtime import Nil, Runtime, create
 from mojito_async.runtime.scheduler import scheduler_loop
@@ -69,6 +77,13 @@ struct Worker:
 
     Extern-free, allocation-discipline kept: the Worker holds no task
     storage; every TaskControlBlock cell is caller-allocated.
+
+    A2.6 (issue #72) — E6 idle sleep/wake: the pool assigns each Worker a
+    reference to the SHARED pool idle state (the NativeEvent handle + the
+    lock-free accounting block) via set_pool_idle(); park_os_thread_until_
+    event() is the OS-level idle park the worker loop calls when it finds no
+    local/remote/injection/steal work (spec §21) — it sleeps on the pool's
+    per-pool NativeEvent instead of busy-spinning.
     """
 
     var _runtime: Runtime
@@ -76,6 +91,8 @@ struct Worker:
     var _thread: NativeThread
     var _started: Bool
     var _tls_current_worker: NativeTlsKey
+    var _event: Int          # pool NativeEvent handle (shared; 0 = unbound)
+    var _acct: BytePtr       # pool idle-accounting block (shared)
 
     # --- E2-OWNED (issue #68): local runnable deque ---
     var _local: LocalDeque
@@ -92,6 +109,8 @@ struct Worker:
         self._thread = make_native_thread()
         self._started = False
         self._tls_current_worker = NativeTlsKey()
+        self._event = 0
+        self._acct = BytePtr(unsafe_from_address=1)
         self._local = LocalDeque()
         self._index = 0
         self._peers = UnsafePointer[
@@ -106,6 +125,8 @@ struct Worker:
         self._thread = make_native_thread()
         self._started = False
         self._tls_current_worker = NativeTlsKey()
+        self._event = 0
+        self._acct = BytePtr(unsafe_from_address=1)
         self._local = LocalDeque()
         self._index = 0
         self._peers = UnsafePointer[
@@ -246,11 +267,38 @@ struct Worker:
         self._tls_current_worker = key
         self._started = True
 
+    def set_pool_idle(mut self, event: Int, acct: BytePtr):
+        """Pool-owned (A2.6): bind this worker's reference to the SHARED
+        pool idle state — the NativeEvent handle + the lock-free accounting
+        block.  Set during _workers_reinit so the worker loop can park."""
+        self._event = event
+        self._acct = acct
+
+    def pool_event(mut self) -> Int:
+        """The pool's NativeEvent handle this worker parks on."""
+        return self._event
+
+    def pool_acct(mut self) -> BytePtr:
+        """The pool's idle-accounting block this worker reports into."""
+        return self._acct
+
     def tls_worker_ptr(mut self) -> BytePtr:
         """Read THIS OS thread's current_worker slot (coarse entry-only
         value; address 0 when unset).  Only the worker thread itself reads
         its own slot — the pool side never calls this."""
         return tls_get(self._tls_current_worker)
+
+    # --- idle park entry point (A2.6 / E6 seam) ---------------------------
+
+    def park_os_thread_until_event(mut self, deadline_ns: UInt) -> Bool:
+        """Idle-park THIS OS worker on the pool's NativeEvent (spec §21 /
+        issue #72): commits as a sleeper, re-checks announced work (the
+        lost-wakeup guard), sleeps on wait_until(deadline_ns) — an absolute
+        CLOCK_MONOTONIC slice — leaves the sleeper set on wake, classifies
+        the wake (productive vs spurious), and updates the park/wake/spurious
+        counters (spec §71).  Returns the idle.mojo verdict (True = work
+        found at the pre-park re-check, do not sleep)."""
+        return idle_park_worker(self._acct, self._event, deadline_ns)
 
     # --- entry points -------------------------------------------------------
 
