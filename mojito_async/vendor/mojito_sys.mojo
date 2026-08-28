@@ -47,9 +47,12 @@ comptime BytePtr = UnsafePointer[Byte, MutAnyOrigin]
 # ms_stack_alloc writes *out_base / *out_top through.
 comptime OutSlots = UnsafePointer[BytePtr, MutUntrackedOrigin]
 
-# sizeof(ms_ctx_t) per the frozen v2 header (include/mojito_spike.h):
-# regs[12]=x19..x30 @0, fps[8]=d8..d15 @96, sp @160 => 168 bytes.
-comptime MS_CTX_SIZE = 168
+# sizeof(ms_ctx_t) per the v3 header (include/mojito_spike.h, issue #101
+# A2.0 M:N rework): regs[12]=x19..x30 @0, fps[8]=d8..d15 @96, sp @160,
+# return_to @168 => 176 bytes.  (The O(1) in-ctx return link replaces the
+# removed process-global resume table; the fiber heap block grows via the
+# 2*MS_CTX_SIZE + TAIL layout below.)
+comptime MS_CTX_SIZE = 176
 
 
 # Code address of an @export'd abi("C") Mojo callback as a C function
@@ -130,7 +133,7 @@ def ms_stack_total_size() abi("C") -> Int:
     ...
 
 
-# ctx: 168-byte ms_ctx_t write target; stack_top: initial sp (16-aligned);
+# ctx: 176-byte ms_ctx_t write target; stack_top: initial sp (16-aligned);
 # entry: ms_entry_fn code pointer (see entry_pointer above);
 # userdata: passed through unmodified to entry(userdata).
 @extern("ms_ctx_make")
@@ -151,7 +154,7 @@ def ms_ctx_switch(from_: BytePtr, to: BytePtr) abi("C"):
 
 # ---------------------------------------------------------------------------
 # Out-of-line heap block backing (fiber ctx save areas + sidecar; issue #49).
-# The Fiber struct stays all-scalar; its two 168-byte ms_ctx_t slots, the
+# The Fiber struct stays all-scalar; its two 176-byte ms_ctx_t slots, the
 # FiberFrame sidecar and the entry/userdata scratch live in ONE malloc'd
 # block -- so the struct is trivially copy-safe, and destroy() frees one
 # block.  libc is not mojito-sys, but the C-ABI firewall is the single home

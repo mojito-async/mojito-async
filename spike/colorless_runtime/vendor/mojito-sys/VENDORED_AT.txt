@@ -5,18 +5,23 @@ Source tree:       spike/context_switch/ (frozen S0 substrate, A0.1 lane)
 Source commit:     0ad48315bebc1fcb02834074afbff6e59173cdb1
 Frozen contract:   8454212 (S0 SPIKE_REPORT: GO — feasibility proven, all 14 tests green)
 Vendored on:       2026-08-24T04:04:28Z
+RE-PINNED on:      2026-08-28 (A2.0 issue #101 — in-repo substrate rework:
+                    ms_ctx_t v2 168B -> v3 176B, resume-table/global removal)
 
-Files (copied verbatim, byte-identical to the source commit above):
-  include/mojito_spike.h   # frozen v2 ms_ctx_t layout (168 B: x19-x30, d8-d15, sp)
+Files (byte-identical to the PROD mojito_async/vendor/mojito-sys/ tree —
+`diff -r` between the two vendored dirs is empty; the spike harness links
+the same libmojito_spike.dylib, built from PROD):
+  include/mojito_spike.h   # ms_ctx_t v3 layout (176 B: x19-x30, d8-d15, sp,
+                           #   return_to @168)
   native_stack.c           # ms_stack_alloc/free with PROT_NONE guard page
   aarch64_switch.S         # ms_ctx_make/ms_ctx_switch (Apple arm64; #if !__APPLE__ guard)
   ms_ctx.c                 # compile-time layout asserts + sentinel probe (guarded off)
   mojito_spike.mojo        # Mojo 1.0.0b2 bindings (entry_pointer, ms_* externs)
 
-The substrate is UNCHANGED since the frozen contract commit 8454212:
-`git diff 8454212 <source commit> -- spike/context_switch/` is empty (only the
-post-GO precommit-gates commits landed in mojito-sys, touching no substrate
-files). This vendor snapshot is consumed by the A0 spike lanes; it is NOT
-modified here — boundary rule (docs/A0_PLAN.md): the spike uses only this
-vendored surface (ms_stack_alloc/free, ms_ctx_make/switch), never raw
-mmap/pthread/asm.
+DEVIATION FROM FROZEN (issue #101, A2.0 M:N rework) — RECORDED: identical
+deviation to the PROD copy (see mojito_async/vendor/mojito-sys/VENDORED_AT.txt).
+The frozen global resume table + _ms_last_* globals (single-thread-only, 32
+live-fiber cap) are removed; the return link rides in ms_ctx_t.return_to and
+the trampoline derives its own ctx from a stack marker.  Layout grows
+168 B -> 176 B; spike Mojo consumers take MS_CTX_SIZE, so offsets follow.
+Verified by the spike harness + t27_multithread (two-pthread probe).

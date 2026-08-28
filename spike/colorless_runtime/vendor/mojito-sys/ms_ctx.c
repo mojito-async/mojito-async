@@ -12,15 +12,18 @@
 
 #include <stddef.h>
 
-/* 12 GPRs + 8 FP lows + sp, all uint64_t = 21 x 8 = 168 bytes (v2). */
-_Static_assert(sizeof(ms_ctx_t) == 168, "ms_ctx_t must be 12 regs + 8 fps + sp = 168 bytes");
+/* 12 GPRs + 8 FP lows + sp + return_to, all uint64_t = 22 x 8 = 176 bytes
+ * (v3, issue #101 A2.0 M:N rework: `return_to` replaces the removed
+ * process-global resume table so the switch path has no shared writable
+ * state and is thread-safe). */
+_Static_assert(sizeof(ms_ctx_t) == 176, "ms_ctx_t must be 12 regs + 8 fps + sp + return_to = 176 bytes");
 _Static_assert(_Alignof(ms_ctx_t) == 8, "ms_ctx_t must be 8-byte aligned");
 _Static_assert(offsetof(ms_ctx_t, regs) == 0, "regs[] must be first: asm uses base+0..88");
 _Static_assert(offsetof(ms_ctx_t, fps) == 96, "fps[] must be at +96: asm stp/ldp d8-d15");
 _Static_assert(offsetof(ms_ctx_t, sp) == 160, "sp slot must be at +160: asm immediate");
-
-/* reg slot i => x(19+i): fp is regs[10] @80, lr is regs[11] @88.
- * fps[i] => low half of v(8+i) (d8..d15). */
+_Static_assert(offsetof(ms_ctx_t, return_to) == 168, "return_to must be at +168: asm O(1) switch-back link");
+/* regs, fps, sp, return_to: reg slot i => x(19+i). fp=regs[10] @80, lr=regs[11] @88.
+ * fps[i] => low half of v(8+i) (d8..d15); return_to @168. */
 
 /* ----------------------------------------------------------------------- */
 /* Committed sentinel probe (panel evidence for #9/#19).
@@ -173,7 +176,7 @@ __asm__(
 "       mov     x29, sp\n"
 "       str     x0, [sp, #16]\n"               /* arg on our own frame     */
 "       ldr     x0, [x0, #32]\n"               /* tag                      */
-"       bl      _probe_fill\n"                 /* tags x19-x28, d8-d15     */ 
+"       bl      _probe_fill\n"                 /* tags x19-x28, d8-d15     */
 "       mov     x12, sp\n"
 "       tst     x12, #15\n"
 "       b.eq    1f\n"                          /* entry-time sp alignment  */

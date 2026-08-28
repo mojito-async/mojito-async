@@ -5,10 +5,3 @@
 # commit of the same PR) and does NOT block the commit; the failure is still
 # logged. Remove the row as soon as the implementation turns the test green —
 # an unlisted failure blocks the commit.
-#
-# issue #101 RED phase (a2/00-substrate): t27_concurrency_aot (40 live fibers
-# > frozen 32-cap) and the t27_multithread 2-worker C probe both TRAP the
-# process (brk #0x67 / cross-thread clobber => SIGTRAP, exit 133 — a hard
-# process trap, not exit-1, so the whole `suite` harness is red during the
-# rework's RED quarter; removed once a2/00 lands and both go green).
-suite	https://github.com/mojito-async/mojito-async/issues/101

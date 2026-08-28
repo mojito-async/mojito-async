@@ -15,7 +15,7 @@
 #     _caller — the driver's (caller's) continuation, saved by the first
 #               resume() and restored every time the fiber suspends.
 #
-# Layout: the two 168-byte save areas, the 24-byte FiberFrame sidecar and
+# Layout: the two 176-byte save areas, the 24-byte FiberFrame sidecar and
 # the entry/userdata scratch live in ONE malloc'd heap block
 # (2*MS_CTX_SIZE + 40 bytes, 16-aligned), referenced by addresses, freed in
 # destroy().  This keeps the Fiber struct all-scalar.
