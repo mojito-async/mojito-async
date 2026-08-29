@@ -1,0 +1,56 @@
+Vendored mojito-sys S6.3/S6.4/S6.6 readiness substrate —
+mojito_async/vendor/mojito-sys/{mjs_poller.c,mjs_epoll.c,mjs_iouring.c,
+include/mojito_sys.h}
+
+Source repository: github.com/mojito-async/mojito-sys
+Source tree:       native/posix/{mjs_poller.c,mjs_epoll.c,mjs_iouring.c},
+                    native/include/mojito_sys.h
+Source commit:      0bfb5291b698c833b302feb35c5724d44961f6d5 (main)
+Vendored on:        2026-08-28 (A7.1 productionization, issue #75)
+
+FILES (byte-identical to upstream `main` at the commit above; fetched via
+`gh api repos/mojito-async/mojito-sys/contents/<path>` with the raw
+media-type accept header, diff -r against a fresh clone is empty):
+  include/mojito_sys.h   # the FULL frozen native ABI header (S1-S6 blocks:
+                          #   ctx/stack, thread/TLS, mutex/sem/condvar,
+                          #   atomic-wait, event, socket, s6-poller/epoll/
+                          #   ioring).  Vendored WHOLE (not trimmed) so this
+                          #   header stays the single canonical copy other
+                          #   A7 lanes (#77/#78 socket, future epoll/
+                          #   io_uring work) can #include without a second,
+                          #   possibly-divergent partial header appearing
+                          #   under this same vendor tree.
+  mjs_poller.c            # s6-poller: kqueue readiness backend (issue #75).
+                          #   Darwin/BSD: real kqueue implementation.  Every
+                          #   other host: detect-and-exclude stub returning
+                          #   exactly -ENOSYS from every entry point (no
+                          #   #ifdef needed at the call site).
+  mjs_epoll.c              # s6-epoll: Linux epoll readiness backend.  Same
+                          #   detect-and-exclude discipline; -ENOSYS stub on
+                          #   this (Darwin) build host — untested on Linux
+                          #   by this lane, exercised by mjs_poller.c's twin
+                          #   kqueue path instead.  Vendored so
+                          #   reactor/poller.mojo's platform pick has a real
+                          #   epoll target to compile against once a Linux
+                          #   CI host runs this suite (spec §27.1/§28).
+  mjs_iouring.c            # s6-ioring: EXPERIMENTAL completion backend
+                          #   behind the MOJITO_IO_URING=1 capability flag
+                          #   (ADR-SYS-009).  Linux-only; -ENOSYS stub here.
+                          #   reactor/poller.mojo's create_completion_poller
+                          #   binds to this and is exercised only via its
+                          #   guaranteed--ENOSYS-on-this-host path (the
+                          #   acceptance criterion "completion backend is
+                          #   unreachable without the flag").
+
+Nothing else from native/posix/ or native/include/ was pulled: mjs_socket.c
+(NativeSocket/connect/accept, issues #77/#78) is a SEPARATE vendoring slice
+owned by the A7 connect/accept lane, layered on the SAME
+include/mojito_sys.h above (do not vendor a second copy of the header).
+
+The Makefile's `mojito_async/vendor/mojito-sys/*.c`/`*.S` wildcard picks
+these up automatically (see repo-root Makefile header comment); no
+Makefile edit was needed. Verified: `make` links libmojito_spike.dylib
+with mjs_poller.o/mjs_epoll.o/mjs_iouring.o alongside the pre-existing S0
+(ms_ctx/native_stack/aarch64_switch), S2 (cpu_count) and E6 (ms_event)
+objects with zero symbol/header conflicts (disjoint `mjs_`/`ms_`
+extern-prefix families, disjoint #include sets).
