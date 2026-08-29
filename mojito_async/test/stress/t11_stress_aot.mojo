@@ -109,7 +109,14 @@ comptime TB = TaskControlBlock[IntResult]
 
 comptime WAVE_N = Int(10000)
 comptime WAVES = Int(10)
-comptime CELL_BYTES = Int(128)  # >= sizeof(TaskControlBlock[IntResult]) here
+comptime CELL_BYTES = Int(256)  # >= sizeof(TaskControlBlock[IntResult]) here.
+# 256, not the old 128: TaskControlBlock[IntResult] grew to 136 bytes once
+# the A2 owner_worker/owner_runtime/early/claim_epoch fields landed on
+# TCB_Prefix (A3 merge, 2026-08-28) — 128 silently overran every 128B-
+# strided cell by 8 bytes into the next one, corrupting live TCB state
+# mid-wave (root cause of the observed "JoinHandle.join: child not
+# COMPLETED yet" failure; see t32_injection_aot.mojo's banner for the
+# fuller note on this bug class).
 
 
 # --- measure.mojo-style accounting (extern-free, embedded) -------------------

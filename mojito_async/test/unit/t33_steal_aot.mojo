@@ -59,8 +59,13 @@ from mojito_async.task import JoinHandle, claim_running
 
 comptime TB = TaskControlBlock[IntResult]
 # Per-TCB heap stride (generous; sizeof is not available in b2 — the cells
-# are only ever addressed individually via tcb_addrs).
-comptime TCB_STRIDE = Int(128)
+# are only ever addressed individually via tcb_addrs).  256, not the old
+# 128: TaskControlBlock[IntResult] grew to 136 bytes once the A2
+# owner_worker/owner_runtime/early/claim_epoch fields landed on TCB_Prefix
+# (A3 merge, 2026-08-28) — 128 silently overran every heap cell by 8 bytes,
+# corrupting the next cell (t32_injection_aot.mojo's driver B hit the same
+# bug; see its banner for the full root-cause note).
+comptime TCB_STRIDE = Int(256)
 
 
 @extern("pthread_create")

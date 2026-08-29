@@ -1,15 +1,20 @@
 # mojito_async/test/unit/t24_cancel_adapter.mojo
 #
-# A1.2-cancel (issue #41) — handle<->flag adapter for the scope failure
+# A1.2-cancel (issue #41) — handle<->flag adapter for a scope's failure
 # policy seam.
 #
-# Scope.CancelHook fires request_cancel(scope_handle, child_handle) with Int
-# handles, but cancellation.mojo builds CancelFlag/CancellationToken trees
-# keyed by UnsafePointer[CancelFlag].  The adapter closes that air gap: a
-# caller-owned CancelFlagRegistry maps scope handle -> scope flag and (scope,
-# child) -> per-child flag; a CancelFlagHook (a CancelHook impl) resolves the
+# A3.2 (#42 decision, issue #61): the non-generic Scope's
+# request_cancel_all() now drives the ERASED TCB_Prefix directly and has no
+# injected-hook seam (CancelFlagHook no longer implements a Scope trait —
+# see cancellation_adapter.mojo header).  This driver exercises the adapter
+# STANDALONE: a caller-owned CancelFlagRegistry maps scope handle -> scope
+# flag and (scope, child) -> per-child flag; CancelFlagHook resolves the
 # child handle and requests its flag, with each child flag read through to
-# the scope flag (make_child_flag propagation).
+# the scope flag (make_child_flag propagation).  Section 4 feeds the
+# adapter the REAL task ids a non-generic Scope hands out from
+# register[T](), so the (scope, child) handle shape stays proven against
+# genuine Scope ids even though Scope no longer invokes the hook itself
+# (full flag-tree wiring into Scope is lane #54, decision pt 5).
 #
 # Acceptance (issue #41):
 #   - register scope + child; resolve BOTH directions (scope flag, child
@@ -18,9 +23,9 @@
 #     untouched);
 #   - child flag read-through: cancelling the scope flag cancels the child
 #     checkpoint (register_child links the child under the scope flag);
-#   - a real Scope.request_cancel_all() carrying the adapter hook reaches the
-#     flag tree via the child ids the Scope returns from register()
-#     (end-to-end failure-policy seam — no more air gap);
+#   - the adapter hook driven with a real (non-generic) Scope's register[T]
+#     child ids reaches the flag tree (the handle-shape contract Scope's
+#     ids satisfy, decoupled from Scope's own cancellation seam);
 #   - unknown scope / unknown child refuse deterministically (documented
 #     message prefixes);
 #   - double-register / unregister / unregister-of-unknown refuse
@@ -110,8 +115,11 @@ def main() raises:
     if not cp_raised:
         red("cancelling the scope flag did not cancel the child checkpoint via read-through")
 
-    # 4. end-to-end scope-integrated seam: a Scope carrying the adapter hook
-    # reaches the flag tree via the child ids its register() returns.
+    # 4. adapter driven with the REAL task ids a non-generic Scope hands out
+    # from register[T]() (#42: Scope drives request_cancel_all() through the
+    # erased TCB_Prefix directly and no longer carries an injected hook —
+    # this proves the adapter's (scope, child) handle contract against
+    # genuine Scope ids, not a Scope-internal wiring).
     var reg3 = make_cancel_flag_registry()
     var r3p = UnsafePointer[CancelFlagRegistry, MutAnyOrigin](to=reg3)
     var sf3 = make_cancel_flag()
@@ -122,22 +130,22 @@ def main() raises:
     var f2p = UnsafePointer[CancelFlag, MutAnyOrigin](to=f2)
     r3p[].register_scope(55, sf3p)
     var hook3 = make_cancel_flag_hook(r3p)
+    var hook3p = UnsafePointer[CancelFlagHook, MutAnyOrigin](to=hook3)
     var log = List[Int]()
     var logp = UnsafePointer[List[Int], MutAnyOrigin](to=log)
-    var scp = make_scope[IntResult, CancelFlagHook](hook3, 55, logp, True)
-    var scpp = UnsafePointer[Scope[IntResult, CancelFlagHook], MutAnyOrigin](
-        to=scp
-    )
+    var scp = make_scope(55, logp, True)
+    var scpp = UnsafePointer[Scope, MutAnyOrigin](to=scp)
     var t1 = TB.create()
     var t2 = TB.create()
-    var id1 = scpp[].register(UnsafePointer[TB, MutAnyOrigin](to=t1), 0)
-    var id2 = scpp[].register(UnsafePointer[TB, MutAnyOrigin](to=t2), 0)
+    var id1 = scpp[].register[IntResult](UnsafePointer[TB, MutAnyOrigin](to=t1), 1, 0)
+    var id2 = scpp[].register[IntResult](UnsafePointer[TB, MutAnyOrigin](to=t2), 2, 0)
     # map the scope's real child handles to per-child flags
     r3p[].register_child(55, id1, f1p)
     r3p[].register_child(55, id2, f2p)
-    scpp[].request_cancel_all()
+    hook3p[].request_cancel(55, id1)
+    hook3p[].request_cancel(55, id2)
     if not f1.is_requested() or not f2.is_requested():
-        red("Scope.request_cancel_all did not reach both child flags via the adapter")
+        red("adapter hook did not reach both child flags via the scope's real child ids")
 
     # 5. unknown scope / unknown child refuse deterministically.
     var scope_refused = False
