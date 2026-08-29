@@ -63,7 +63,7 @@ def _handle(tcb_addr: Int, tid: Int) -> JoinHandle[IntResult]:
 
 
 struct Scene(ImplicitlyCopyable, ImplicitlyDeletable):
-    """slice@0, a_id@1."""
+    """Shared scene: slice@0, a_id@1."""
 
     var slice: UnsafePointer[Int, MutAnyOrigin]
     var a_id: UnsafePointer[Int, MutAnyOrigin]

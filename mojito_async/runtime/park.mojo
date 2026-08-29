@@ -77,6 +77,7 @@ def unpark_current[R: ResultValue](
     mut rt: Runtime,
     h: JoinHandle[R],
     required_gen: Int = 0,
+    win_reason: Int = SuspendReason.UNCHANGED,
 ) raises:
     """Deliver readiness ONCE per epoch — the two-phase WAKE leg
     (spec §23 / A0-T12), routed to the OWNER worker (spec §19.2).
@@ -100,6 +101,20 @@ def unpark_current[R: ResultValue](
     generation a producer captured at WAITING commit to REJECT a stale wake
     from a previous epoch.  Pass 0 (default) to always claim when WAITING
     (today's single worker: the epoch is trivially current).
+
+    A4.4 (issue #58) — WINNER-REASON STAMP: pass `win_reason` (one of
+    SuspendReason.READY/CANCEL/TIMER/CLOSED) to record WHICH cause won the
+    claim on the WaitNode (spec §25/§29.2).  Stamped ONLY on a SUCCESSFUL
+    claim, and INSIDE THE SAME owner remote-queue guard section that
+    performs wake_claim — never as a separate step before/after this call
+    — so the stamp is atomic with the claim: two causes racing for the
+    same epoch can never have the LOSER's label clobber the WINNER's (the
+    top-level RUNNABLE fast-return below makes every losing call a
+    complete no-op, including its win_reason, before it reaches the guard).
+    The default SuspendReason.UNCHANGED leaves `_reason` exactly as the
+    park side stamped it — EVERY existing call site (mutex, semaphore,
+    channel, timer_service) omits `win_reason` and is BYTE-FOR-BYTE
+    unaffected by this parameter's existence.
 
     H2 (PR #109) — DUPLICATE/STALE claims are QUIET NO-OPs in EVERY task
     state: a wake whose `required_gen` no longer matches the current
@@ -126,6 +141,8 @@ def unpark_current[R: ResultValue](
         claimed = h.tcb()[].wake_claim(required_gen)
         if claimed:
             h.tcb()[].clear_early_readiness()
+            if win_reason != SuspendReason.UNCHANGED:
+                h.tcb()[].wait_node()[].set_reason(win_reason)
     elif st == TaskControlBlock.PARKING or st == TaskControlBlock.RUNNING:
         # Early-wake window: latch readiness for the parker's VALIDATE
         # re-check (A0-T11).  No claim, no transition, no enqueue here —
