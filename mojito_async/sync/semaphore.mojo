@@ -35,7 +35,15 @@ from mojito_async.runtime.queue import SpinLock
 from mojito_async.runtime.runtime import Runtime
 from mojito_async.runtime.task_control_block import ResultValue, TaskControlBlock
 from mojito_async.task import JoinHandle, claim_running
-from mojito_async.runtime.park import park_commit, park_prepare, park_validate, unpark_current
+from mojito_async.runtime.park import (
+    park_commit,
+    park_prepare,
+    park_validate,
+    unpark_current,
+    raise_if_cancel_wake,
+    wake_cancelled,
+)
+from mojito_async.cancellation import CancellationToken
 
 
 comptime PERMIT_GRANTED = Int(1)
@@ -50,6 +58,18 @@ def _perm_waiter_handle[R: ResultValue](
         ),
         tid,
     )
+
+
+def _remove_at_index(mut q: Deque[Int], idx: Int) raises:
+    """Remove the element at `idx` (0-based from the front), preserving the
+    relative FIFO order of every OTHER element (issue #57's cancel_acquire_
+    wait: a cancelled waiter may sit anywhere in the queue).  O(n) rotate —
+    Deque has no native middle-removal (mirrors sync/mutex.mojo's helper)."""
+    var n = len(q)
+    for i in range(n):
+        var v = q.popleft()
+        if i != idx:
+            q.append(v)
 
 
 # ---------------------------------------------------------------------------
@@ -189,6 +209,51 @@ struct Semaphore:
 
     def is_granted[R: ResultValue](self, h: JoinHandle[R]) -> Bool:
         return h.tcb()[].wait_node()[].next() == PERMIT_GRANTED
+
+    # --- token-aware acquire (A4.3, issue #57) ------------------------------
+
+    def acquire_cancellable[R: ResultValue](
+        mut self, mut rt: Runtime, h: JoinHandle[R], token: CancellationToken, n: Int = 1
+    ) raises -> Bool:
+        """Token-aware acquire.  Identical to `acquire()` on every readiness
+        path (fast path, GRANT-marker re-entry, contended park); the ONLY
+        addition is the C6 winner check this waiter's own resume carries:
+        raises ONLY when THIS waiter's `cancel_acquire_wait` won the race
+        (never when readiness/GRANT won — the semaphore is left exactly as
+        `acquire()` would leave it, no permit leaked)."""
+        raise_if_cancel_wake(h)
+        if token.is_cancellation_requested():
+            raise Error("CancellationError: semaphore acquire cancelled")
+        return self.acquire(rt, h, n)
+
+    def cancel_acquire_wait[R: ResultValue](
+        mut self, mut rt: Runtime, h: JoinHandle[R]
+    ) raises -> Bool:
+        """Cancel a parked `acquire_cancellable` waiter (issue #57): removes
+        `h` from the three parallel FIFO queues (addr/id/n) — preserving the
+        ORDER of every OTHER queued waiter — and delivers a CANCEL wake.
+        Returns True iff THIS call found + removed + woke the waiter; False
+        when the id was never queued or a concurrent `release` already
+        popped it (readiness won — no ghost entry, no permit double-count).
+        The FIFO search + removal is ONE guarded critical section (A4.1,
+        issue #55, extended to this A4.3 path during the A4 merge) — see
+        Mutex.cancel_lock_wait for why an unguarded scan/splice here would
+        race a concurrent `release` popping the same Deques."""
+        self._guard.lock()
+        var idx = -1
+        for i in range(len(self._w_id)):
+            if self._w_id[i] == h.id():
+                idx = i
+                break
+        if idx == -1:
+            self._guard.unlock()
+            return False
+        _remove_at_index(self._w_tcb, idx)
+        _remove_at_index(self._w_id, idx)
+        _remove_at_index(self._w_n, idx)
+        self._guard.unlock()
+        wake_cancelled(rt, h)
+        return True
 
 
 # ---------------------------------------------------------------------------
