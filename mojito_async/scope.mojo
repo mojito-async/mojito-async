@@ -46,6 +46,25 @@
 # context manager or TLS, so the runtime is threaded explicitly; the §113
 # prototype shape is transcribed onto this surface (see t29_with_scope).
 #
+# A3.4 (issue #63) — GROUPED joins over a scope's HETEROGENEOUS children,
+# built directly on the #61/#42 non-generic Scope (no with_scope body
+# wrapper required):
+#   * `join_all()` — a WAIT BARRIER (spec §8): raises ChildrenStillLive
+#     while any registered child has not reached COMPLETED, silent once
+#     every child has.  b2 cannot express a single call returning a
+#     heterogeneous collection of typed results (different R per child),
+#     so the grouped ergonomic is this barrier — each child still joins
+#     with its OWN static type at its own `handle.join()` call site, side
+#     by side for mixed R (§96 fan-out shape, §113 join-in-loop shape).
+#   * `first_error(rt)` — the §8.2 default failure policy driven directly
+#     off the erased registry: scan for the FIRST COMPLETED+FAILED child
+#     (mark_failed's erased stamp), cancel siblings
+#     (request_cancel_all), join-all siblings (close(rt), falling back to
+#     drop_children() on refusal — the with_scope abort escape hatch), then
+#     raise the primary error.  READ-ONLY over the failed child's result:
+#     the owning JoinHandle's own join() still re-raises the identical
+#     error afterward (never a double-join).
+#
 # Mojo 1.0.0b2 dialect: `def` only; no static methods -> module factories
 # make_scope / make_nested_scope; Scope holds List fields so it is NOT
 # ImplicitlyCopyable — callers operate through UnsafePointer; absent optional
@@ -188,6 +207,41 @@ struct Scope(Movable, ImplicitlyDeletable):
                 return True
         return False
 
+    def join_all(self) raises:
+        """Grouped-join WAIT BARRIER (spec §8 `scope.join_all()`, issue
+        #63): confirms every REGISTERED child has reached COMPLETED through
+        the erased R-free prefix (the same read `close()`'s
+        `_validate_exit` uses) — VALIDATE-ONLY: it never closes the scope,
+        drops the registry, or consumes any child's result.
+
+        b2 has no in-library scheduler to BLOCK a caller until completion
+        (COOPERATIVE POLICY, spec §88): join_all() is a synchronous check,
+        not a park — callers drive children to COMPLETED (execute() / the
+        embedding scheduler loop) BEFORE calling it.
+
+        This is the GROUPED ergonomic §96/§113 ask for: b2 cannot express a
+        single call that returns a heterogeneous collection of typed
+        results (`different R per child`), so the grouped join is this
+        BARRIER — each child still joins with its OWN static type at its
+        own `handle.join()` call site, side by side for mixed R (§96's
+        `profile.join()`, `posts.join()`, `permissions.join()` shape).
+
+        Raises ChildrenStillLive (documented prefix, decode via
+        is_children_still_live) naming the FIRST unfinished child; nothing
+        is consumed on refusal — a caller may finish driving and retry."""
+        for i in range(len(self._children)):
+            var pre = UnsafePointer[TCB_Prefix, MutAnyOrigin](
+                unsafe_from_address=self._children[i].addr
+            )
+            if not pre[].is_completed():
+                var err = ChildrenStillLive(
+                    "ChildrenStillLive: join_all of scope "
+                    + String(self._handle)
+                    + " found unfinished child "
+                    + String(self._children[i].id)
+                )
+                raise Error(err.message)
+
     # --- registry (typed boundary stamps tag + addr; erased storage) -------
 
     def register[T: ScopeChild](
@@ -328,6 +382,61 @@ struct Scope(Movable, ImplicitlyDeletable):
                     _ = 0  # best-effort: never fail the sweep on a race
             elif st == TaskControlBlock.WAITING:
                 _ = pre[].wake_claim()
+
+    def first_error(mut self, mut rt: Runtime) raises:
+        """Grouped FIRST-ERROR join (spec §8.2 default failure policy,
+        issue #63): implements the policy DIRECTLY on the Scope — no
+        with_scope body wrapper required.  Scans registered children in
+        REGISTRATION order for the FIRST one whose erased R-free prefix is
+        COMPLETED and FAILED (is_failed() — #42's mark_failed erased
+        stamp, set by execute()'s exception path independent of any
+        per-handle join).  A silent no-op (no raise) when no registered
+        child has failed yet — a non-failing poll a caller may retry after
+        driving more children.
+
+        On the FIRST failure, drives the §8.2 sequence exactly as
+        with_scope's body-error path does:
+          1. record the primary error (the failed child's PRESERVED
+             message, read — never consumed — from the erased prefix);
+          2. cancel sibling tasks (request_cancel_all, erased-prefix,
+             best-effort; the found child is already COMPLETED so it is a
+             no-op for it);
+          3. join all siblings (attempt close(rt); on refusal — a live
+             child the cancellation request could not drive to COMPLETED
+             in-library, e.g. a NEW/RUNNABLE child or one whose own
+             cooperative checkpoint has not yet observed the cancellation —
+             fall back to drop_children(), the with_scope abort escape
+             hatch, so the refusal never masks the primary error);
+          4. raise the primary error.
+
+        READ-ONLY over the failed child's result: first_error() never
+        calls take_result()/join() on it, so the owning JoinHandle's OWN
+        consume-once join() still re-raises the IDENTICAL error afterward
+        — first_error() and a handle's join() are independent readers of
+        the same preserved failure stamp, never a double-join (issue #63
+        exit criterion: no child is joined twice)."""
+        var found_addr = 0
+        for i in range(len(self._children)):
+            var pre = UnsafePointer[TCB_Prefix, MutAnyOrigin](
+                unsafe_from_address=self._children[i].addr
+            )
+            if pre[].is_completed() and pre[].is_failed():
+                found_addr = self._children[i].addr
+                break
+        if found_addr == 0:
+            return
+        var msg = UnsafePointer[TCB_Prefix, MutAnyOrigin](
+            unsafe_from_address=found_addr
+        )[].error()
+        try:
+            self.request_cancel_all()
+        except Error:
+            _ = 0  # best-effort: never mask the primary error
+        try:
+            self.close(rt)
+        except Error:
+            self.drop_children()
+        raise Error(msg)
 
     # --- containment -------------------------------------------------------
 
