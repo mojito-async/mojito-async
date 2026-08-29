@@ -265,6 +265,34 @@ struct Channel[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable](
                 return  # already parked as a receiver; never double-register
         self._recv_waiters.append(WaitRecord(Int(h.tcb()), h.id()))
 
+    def unregister_sender(mut self, task_id: Int) raises:
+        """Logical cancellation (A5.4/A5.5 select, issues #92/#93): drop a
+        parked sender waiter by task id, if present.  A `select` LOSING
+        branch must vacate every OTHER branch's wait queue once a winner is
+        claimed elsewhere, so a later real wake on this channel never finds
+        (and double-enqueues) a stale WaitRecord for a task that already
+        resumed through a different branch.  No-op when `task_id` is not
+        currently registered here (idempotent, matches register_* dedupe)."""
+        var kept = Deque[WaitRecord]()
+        while len(self._send_waiters) > 0:
+            var w = self._send_waiters[0]
+            _ = self._send_waiters.popleft()
+            if w.task_id != task_id:
+                kept.append(w)
+        self._send_waiters = kept^
+
+    def unregister_receiver(mut self, task_id: Int) raises:
+        """Logical cancellation (A5.4/A5.5 select, issues #92/#93): drop a
+        parked receiver waiter by task id, if present.  See
+        unregister_sender for the rationale (select's losing branches)."""
+        var kept = Deque[WaitRecord]()
+        while len(self._recv_waiters) > 0:
+            var w = self._recv_waiters[0]
+            _ = self._recv_waiters.popleft()
+            if w.task_id != task_id:
+                kept.append(w)
+        self._recv_waiters = kept^
+
     # --- deferred wakes (driver drains these) ----------------------------------
 
     def pop_to_wake(mut self) raises -> WaitRecord:
