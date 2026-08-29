@@ -250,7 +250,8 @@ struct Scope(Movable, ImplicitlyDeletable):
         self._primary_msg = ""
         self._suppressed = 0
         self._failed = 0
-        self._raised = False        if self._parent:
+        self._raised = False
+        if self._parent:
             self._parent.value()[]._open_subscopes += 1
 
     # --- queries -----------------------------------------------------------
