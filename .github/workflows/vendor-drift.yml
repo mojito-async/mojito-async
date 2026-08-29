@@ -1,0 +1,48 @@
+name: vendor-drift
+
+# mojito-sys#164. mojito_async/vendor/mojito-sys/ is a fork of the canonical
+# substrate that has been diverging in BOTH directions with nothing to notice:
+# the vendored mjs_socket.c grew two entry points marked "NOT upstreamed", and
+# the vendored header dropped canonical's ms_context_set_finish_hook while
+# adding mjs_ctx_call. The Makefile's "byte-identical substrate" comment is
+# false and the pinning is a commit hash in a code comment.
+#
+# This lane is its own workflow rather than a job in ci.yml because it needs
+# BOTH repositories checked out, and because it should be able to go green on
+# its own schedule: it fails today, by design, and that is the point.
+#
+# It is deliberately NOT in the pre-commit gate. The check exits 2 when it
+# cannot resolve a canonical tree, and a developer without a sibling
+# mojito-sys checkout would then be blocked from committing by an
+# environment condition rather than by a defect. CI is where both trees
+# exist, so CI is where it belongs.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - 'mojito_async/vendor/**'
+      - '.github/workflows/vendor-drift.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  drift:
+    name: vendored substrate vs canonical mojito-sys
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: mojito-async
+      - uses: actions/checkout@v4
+        with:
+          repository: mojito-async/mojito-sys
+          path: mojito-sys
+      - name: check-vendored
+        env:
+          MOJITO_SYS_DIR: ${{ github.workspace }}/mojito-sys
+        run: ./mojito_async/vendor/check-vendored.sh
+        working-directory: mojito-async
