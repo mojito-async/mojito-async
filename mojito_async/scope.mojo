@@ -26,12 +26,29 @@
 #     close validate-only and reap by parent handles — documented.
 #   * Failure policy seam: `request_cancel_all()` drives the erased prefix —
 #     RUNNING children are transitioned CANCELLED, WAITING children are
-#     woken via wake_claim; NEW/RUNNABLE children are untouched (their
-#     cancellation requires the #54 flag tree).  Best-effort (never raises
-#     on a child the machine cannot cancel); the full tree propagation is
-#     lane #54.
+#     woken via wake_claim; NEW/RUNNABLE children are untouched (no
+#     state-machine edge reaches them without a live checkpoint).
 #   * Spec §66 (results not Copyable) is DECOUPLED from this decision
 #     (un-landable under any strategy on b2; future work).
+#
+# A3.1 (issue #54, spec §29.1) — CANCELLATION TREE, layered on the #42/#61
+# non-generic shape above: request_cancel_all() is now RECURSIVE — besides
+# driving this scope's own registered children through the erased prefix
+# (unchanged from #61), it DESCENDS into every registered CHILD SCOPE
+# (recursively, same driving) and propagates cancel STATE child->parent: a
+# freshly-cancelled scope reports upward, marking its parent cancelled too,
+# which cancels the parent's remaining children (tasks + scopes) and keeps
+# propagating up the chain.  `_child_scope_ids` / `_child_scope_ptrs` track
+# the direct-child-scope tree edges the walk descends through (mirroring
+# the erased `_children` task registry); populated by the OUT-PARAM
+# `make_nested_scope` factory at the child's FINAL address (b2 move
+# semantics make a return-by-value address unstable), drained on child
+# close so the walk never dangles on / re-descends into a closed child.
+# The walk is idempotent on `_cancelled` at every node: a repeat
+# request_cancel_all (root or leaf) is a no-op — no double-cancel, no
+# re-drive of an already-cancelled subtree.  A scope that is itself
+# cancelled refuses new spawns/registrations and refuses nesting a new
+# child scope under it (`ScopeCancelled`).
 #
 # A1.1 semantics carried forward: close REFUSES (ChildrenStillLive, spec
 # A0-T13/T14) while a genuinely-live (not-yet-COMPLETED) child or an open
@@ -91,6 +108,21 @@ struct ScopeTagMismatch:
 
 
 # ---------------------------------------------------------------------------
+# ScopeCancelled (error model — issue #54)
+# ---------------------------------------------------------------------------
+
+struct ScopeCancelled:
+    """Named error model for refusing operations on a CANCELLED scope
+    (issue #54: a scope that is itself cancelled refuses new spawns and
+    refuses nesting a new child scope under it).  Carried in the message."""
+
+    var message: String
+
+    def __init__(out self, msg: String):
+        self.message = msg
+
+
+# ---------------------------------------------------------------------------
 # ScopeChild is defined in runtime/task_control_block.mojo (re-exported here
 # via the import above) so leaf ResultValue types can conform without
 # importing scope.mojo (avoids a scope.mojo <-> integration/sys.mojo cycle).
@@ -125,10 +157,15 @@ struct TaskRecord(ImplicitlyCopyable, Movable, ImplicitlyDeletable):
 struct Scope(Movable, ImplicitlyDeletable):
     """Structured-concurrency scope owning an ADDRESS-ERASED child registry
     (#42 decision): `_children` TaskRecord cells append only on register
-    growth.  `_open` gates register/close; `_parent` link and
-    `_open_subscopes` enforce inner-before-outer.  `_order_log` records close
-    order for tests/diagnostics.  No type parameters: typed access is
-    per-call-site (`spawn[T]`, `register[T]`, `lookup[T]`, `close_typed[T]`).
+    growth.  `_child_scope_ids` / `_child_scope_ptrs` parallel lists of the
+    OPEN direct child scopes (the §29.1 cancellation tree, issue #54;
+    populated by `make_nested_scope`, drained by child close).  `_open`
+    gates register/close; `_cancelled` is the scope's own cancel state
+    (issue #54: set by request_cancel_all / a cancelled child scope's
+    upward report); `_parent` link and `_open_subscopes` enforce
+    inner-before-outer.  `_order_log` records close order for
+    tests/diagnostics.  No type parameters: typed access is per-call-site
+    (`spawn[T]`, `register[T]`, `lookup[T]`, `close_typed[T]`).
     """
 
     var _handle: Int
@@ -140,6 +177,12 @@ struct Scope(Movable, ImplicitlyDeletable):
     var _parent: Optional[UnsafePointer[Scope, MutAnyOrigin]]
     # Open direct subscopes.
     var _open_subscopes: Int
+    # Scope cancel state (issue #54); gates register()/make_nested_scope and
+    # the re-entrancy guard of the recursive cancel walk.
+    var _cancelled: Bool
+    # Direct child scopes (handle + final pointer), the §29.1 tree walk.
+    var _child_scope_ids: List[Int]
+    var _child_scope_ptrs: List[UnsafePointer[Scope, MutAnyOrigin]]
 
     def __init__(
         out self,
@@ -153,6 +196,9 @@ struct Scope(Movable, ImplicitlyDeletable):
         self._order_log = order_log
         self._parent = parent
         self._open_subscopes = 0
+        self._cancelled = False
+        self._child_scope_ids = List[Int]()
+        self._child_scope_ptrs = List[UnsafePointer[Scope, MutAnyOrigin]]()
         if self._parent:
             self._parent.value()[]._open_subscopes += 1
 
@@ -163,6 +209,12 @@ struct Scope(Movable, ImplicitlyDeletable):
 
     def is_open(self) -> Bool:
         return self._open
+
+    def is_cancelled(self) -> Bool:
+        """The scope's own cancel state (issue #54): set by this scope's
+        request_cancel_all/cancel, or by a cancelled CHILD scope's upward
+        report (spec §29.1 child->parent rule)."""
+        return self._cancelled
 
     def live_child_count(self) -> Int:
         return len(self._children)
@@ -175,6 +227,14 @@ struct Scope(Movable, ImplicitlyDeletable):
 
     def open_subscopes(self) -> Int:
         return self._open_subscopes
+
+    def has_child_scope(self, child_scope_handle: Int) -> Bool:
+        """True when `child_scope_handle` is a registered OPEN child scope
+        of this scope (the §29.1 tree edge used by the cancel walk)."""
+        for i in range(len(self._child_scope_ids)):
+            if self._child_scope_ids[i] == child_scope_handle:
+                return True
+        return False
 
     def has_live_unfinished(self) -> Bool:
         """True when a registered child is not yet COMPLETED (genuinely live;
@@ -197,15 +257,22 @@ struct Scope(Movable, ImplicitlyDeletable):
         parent_task_id: Int,
     ) raises -> Int:
         """Register a child under its RUNTIME task id (the registry key).
-        Refuses a closed scope and a child that already names another scope.
-        Returns the task id (so the caller's JoinHandle id == registry key —
-        is_registered(handle.id()) is exact, not coincidental)."""
+        Refuses a closed scope, a CANCELLED scope (issue #54), and a child
+        that already names another scope.  Returns the task id (so the
+        caller's JoinHandle id == registry key — is_registered(handle.id())
+        is exact, not coincidental)."""
         if not self._open:
             var err = ChildrenStillLive(
                 "ScopeClosed: register into closed scope "
                 + String(self._handle)
             )
             raise Error(err.message)
+        if self._cancelled:
+            var cerr = ScopeCancelled(
+                "ScopeCancelled: register into cancelled scope "
+                + String(self._handle)
+            )
+            raise Error(cerr.message)
         var prior = child[].scope_handle()
         if prior != 0 and prior != self._handle:
             var err = ChildrenStillLive(
@@ -260,10 +327,11 @@ struct Scope(Movable, ImplicitlyDeletable):
         pt 2).  INV-3 inspection: registration is STRUCTURAL here — the child
         cannot become a task without also becoming a member of this scope,
         because register() (the registry's single owner) stamps scope_handle
-        and parent on the child, refuses a CLOSED scope (ScopeClosed), and
-        refuses a child that already names a DIFFERENT scope.  Work-first:
-        spawn only REGISTERS the child as runnable; its first entry happens
-        when execute() or a scheduler trampoline reaches it."""
+        and parent on the child, refuses a CLOSED scope (ScopeClosed) and a
+        CANCELLED scope (ScopeCancelled, issue #54), and refuses a child
+        that already names a DIFFERENT scope.  Work-first: spawn only
+        REGISTERS the child as runnable; its first entry happens when
+        execute() or a scheduler trampoline reaches it."""
         if rt.is_shutdown():
             raise Error("mojito_async.scope.spawn: runtime is shut down")
         tcb[].transition(TaskControlBlock.RUNNABLE)
@@ -304,18 +372,34 @@ struct Scope(Movable, ImplicitlyDeletable):
         )
         raise Error(err.message)
 
-    # --- failure policy seam (erased; #54 lands the flag tree) -------------
+    # --- cancellation tree (issue #54, spec §29.1) --------------------------
 
     def request_cancel_all(mut self) raises:
-        """Request cancellation of every currently-registered child through
-        the ERASED R-free prefix (#42 pt 2): RUNNING children are
-        transitioned CANCELLED; WAITING children are woken (wake_claim,
-        WAITING -> RUNNABLE) so their next checkpoint observes the request;
-        NEW/RUNNABLE children are LEFT UNTOUCHED (the machine has no edge to
-        cancel them, and their cancellation needs the #54 flag tree).
-        Best-effort — a child the machine cannot cancel is skipped, never an
-        error: this is the §8.2 failure-policy seam with_scope drives on a
-        body error."""
+        """RECURSIVE scope cancel (spec §29.1): drive this scope's own
+        registered children through the erased TCB_Prefix (unchanged #42/#61
+        behavior: RUNNING -> CANCELLED, WAITING woken), DESCEND into every
+        registered child scope (recursively, same driving), and — per the
+        child->parent state rule — mark the parent's cancel state, which
+        cancels the parent's remaining children (tasks + scopes).
+        Idempotent: a second request on an already-cancelled scope is a
+        no-op (no double-cancel, no re-drive)."""
+        if self._cancelled:
+            return
+        self._mark_cancelled_with_children()
+        if self._parent:
+            self._parent.value()[]._child_scope_cancelled()
+
+    def cancel(mut self) raises:
+        """Public alias of request_cancel_all (issue #54 public surface)."""
+        self.request_cancel_all()
+
+    def _drive_direct_children(mut self) raises:
+        """Best-effort erased TCB_Prefix drive (carried over from #42/#61):
+        RUNNING children transition to CANCELLED; WAITING children are woken
+        (wake_claim) so their next checkpoint observes the request;
+        NEW/RUNNABLE children are left untouched (no state-machine edge
+        reaches them without a live checkpoint).  Never raises on a child
+        the machine cannot cancel (best-effort sweep, matches #61)."""
         for i in range(len(self._children)):
             var pre = UnsafePointer[TCB_Prefix, MutAnyOrigin](
                 unsafe_from_address=self._children[i].addr
@@ -328,6 +412,32 @@ struct Scope(Movable, ImplicitlyDeletable):
                     _ = 0  # best-effort: never fail the sweep on a race
             elif st == TaskControlBlock.WAITING:
                 _ = pre[].wake_claim()
+
+    def _mark_cancelled_with_children(mut self) raises:
+        """Mark THIS scope cancelled, drive every registered child task, and
+        recurse into every registered child scope (this same internal form,
+        so a DESCENDING walk does not re-report upward).  Idempotent via
+        `_cancelled`."""
+        self._cancelled = True
+        self._drive_direct_children()
+        for i in range(len(self._child_scope_ids)):
+            self._child_scope_ptrs[i][]._mark_cancelled_with_children()
+
+    def _child_scope_cancelled(mut self) raises:
+        """A DIRECT child scope was cancelled (spec §29.1 child->parent
+        rule): mark OUR cancel state, drive our remaining children (the
+        siblings of the reporting scope, task + scope), and keep propagating
+        upward.  Guarded by `_cancelled` so a report on an already-cancelled
+        scope is a no-op — this terminates the cascade and guarantees no
+        double-cancel."""
+        if self._cancelled:
+            return
+        self._cancelled = True
+        self._drive_direct_children()
+        for i in range(len(self._child_scope_ids)):
+            self._child_scope_ptrs[i][]._mark_cancelled_with_children()
+        if self._parent:
+            self._parent.value()[]._child_scope_cancelled()
 
     # --- containment -------------------------------------------------------
 
@@ -377,7 +487,7 @@ struct Scope(Movable, ImplicitlyDeletable):
         if self._order_log:
             self._order_log.value()[].append(self._handle)
         if self._parent:
-            self._parent.value()[]._subscope_closed()
+            self._parent.value()[]._subscope_closed(self._handle)
 
     def close(mut self, mut rt: Runtime) raises:
         """ERASED VALIDATE-ONLY close (#42 decision pt 4): verify the scope
@@ -425,8 +535,20 @@ struct Scope(Movable, ImplicitlyDeletable):
                 _ = tc[].take_result()
         self._close_bookkeeping()
 
-    def _subscope_closed(mut self):
+    def _subscope_closed(mut self, child_handle: Int):
+        """A direct child scope closed: decrement the open-subscope counter
+        AND remove the child from the cancellation-tree registry (issue
+        #54), so the cancel walk never descends into (or dangles on) a
+        closed child."""
         self._open_subscopes -= 1
+        for i in range(len(self._child_scope_ids)):
+            if self._child_scope_ids[i] == child_handle:
+                var last = len(self._child_scope_ids) - 1
+                self._child_scope_ids[i] = self._child_scope_ids[last]
+                self._child_scope_ptrs[i] = self._child_scope_ptrs[last]
+                _ = self._child_scope_ids.pop(last)
+                _ = self._child_scope_ptrs.pop(last)
+                return
 
 
 # ---------------------------------------------------------------------------
@@ -457,9 +579,20 @@ def make_nested_scope(
     parent: UnsafePointer[Scope, MutAnyOrigin],
     order_log: UnsafePointer[List[Int], MutAnyOrigin],
     has_log: Bool,
-) raises -> Scope:
+    out self: Scope,
+) raises:
     """Nested scope: registers an open subscope of `parent`, so the parent
-    cannot close until this scope closes (inner-before-outer)."""
+    cannot close until this scope closes (inner-before-outer).
+
+    OUT-PARAM factory (issue #54): the child scope is constructed IN PLACE at
+    the caller's final binding (`var s = make_nested_scope(...)`), and the
+    child's FINAL address is registered into the parent's cancellation-tree
+    registry (`_child_scope_ids` / `_child_scope_ptrs`).  A return-by-value
+    factory would register a temporary's address that dangles after the move
+    (b2 move semantics), so the tree walk would walk garbage.
+
+    Refuses a closed parent (existing rule), a CANCELLED parent (issue #54),
+    or a duplicate child-scope handle."""
     if not parent[].is_open():
         var err = ChildrenStillLive(
             "ChildrenStillLive: parent scope "
@@ -467,10 +600,30 @@ def make_nested_scope(
             + " already closed"
         )
         raise Error(err.message)
+    if parent[].is_cancelled():
+        var cerr = ScopeCancelled(
+            "ScopeCancelled: parent scope "
+            + String(parent[].handle())
+            + " is cancelled"
+        )
+        raise Error(cerr.message)
+    if parent[].has_child_scope(handle):
+        var err = ChildrenStillLive(
+            "ChildrenStillLive: parent scope "
+            + String(parent[].handle())
+            + " already has child scope "
+            + String(handle)
+        )
+        raise Error(err.message)
     var with_log = _opt_log(order_log, has_log)
     var with_parent = Optional[UnsafePointer[Scope, MutAnyOrigin]](parent)
-    var s = Scope(handle, with_log, with_parent)
-    return s^
+    self = Scope(handle, with_log, with_parent)
+    # register the child scope (handle + FINAL pointer) into the parent's
+    # cancellation-tree registry (issue #54).
+    parent[]._child_scope_ids.append(handle)
+    parent[]._child_scope_ptrs.append(
+        UnsafePointer[Scope, MutAnyOrigin](to=self)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -489,14 +642,14 @@ def with_scope[
 
     Failure policy (§8.2 default, issue #61 acceptance): when the body
     raises, with_scope RECORDS the primary error, cancellation-requests the
-    registered siblings (request_cancel_all — erased prefix, best-effort),
-    and then closes the scope; if the close REFUSES (live children cannot be
-    driven to completion in-library on b2 — the embedding scheduler loop is
-    the driver's job), the registry is dropped (abort escape hatch).  The
-    PRIMARY error is ALWAYS re-raised untouched — teardown errors never mask
-    it.  On normal return the scope is closed (validate-only; the body's own
-    joins reaped the results) and ChildrenStillLive surfaces if the body
-    leaked live children.
+    registered siblings (request_cancel_all — recursive as of issue #54,
+    best-effort), and then closes the scope; if the close REFUSES (live
+    children cannot be driven to completion in-library on b2 — the
+    embedding scheduler loop is the driver's job), the registry is dropped
+    (abort escape hatch).  The PRIMARY error is ALWAYS re-raised untouched —
+    teardown errors never mask it.  On normal return the scope is closed
+    (validate-only; the body's own joins reaped the results) and
+    ChildrenStillLive surfaces if the body leaked live children.
     """
     if rt.is_shutdown():
         raise Error("with_scope: runtime is shut down")
@@ -538,3 +691,9 @@ def is_scope_tag_mismatch(e: Error) -> Bool:
     """True when `e` is a ScopeTagMismatch (message begins with the stable
     "ScopeTagMismatch:" prefix)."""
     return "ScopeTagMismatch:" in String(e)
+
+
+def is_scope_cancelled(e: Error) -> Bool:
+    """True when `e` is a ScopeCancelled refusal (message begins with the
+    stable "ScopeCancelled:" prefix)."""
+    return "ScopeCancelled:" in String(e)
