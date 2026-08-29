@@ -7,9 +7,18 @@
 # blocking sleep/until mechanics; this module deliberately has NO heap.
 # Keeping Deadline name-identical to the spec root surface so A1.4 fills
 # semantics in place.
+#
+# A7.1 reactor lane (issue #75): explicit trait conformance
+# (ImplicitlyCopyable/ImplicitlyDeletable/Movable) added so `Duration` can
+# be carried inside `Optional[Duration]` (the reactor's `Reactor.poll`
+# timeout parameter, reactor/poller.mojo's NativePoller.wait) — b2's
+# `Optional[T: Movable]` bound requires the conformance to be declared
+# explicitly on the struct, it is not inferred from an all-scalar field
+# layout.  Every prior consumer of `Duration` used it by plain value, so
+# this is additive and does not change any existing call site.
 
 
-struct Duration:
+struct Duration(ImplicitlyCopyable, ImplicitlyDeletable, Movable):
     """A monotonic duration: UInt64 ticks in nanoseconds (the unit the A1.4
     timer lane will park on).  Provides from_millis/to_millis consistent with
     the existing Deadline (which is expressed in milliseconds)."""
