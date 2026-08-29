@@ -80,7 +80,7 @@ fi
 # dependency graph in one driver) — also built at `-O 0`.  Every OTHER
 # AOT driver keeps the default optimization level (the suite is NOT
 # rebuilt at -O 0).
-AOT_O0_DRIVERS="t34_two_phase_aot t34b_affinity_aot t34c_duplicate_wake_aot t35_idle_sleep_aot t24_rendezvous_oneshot_aot t39_reactor_aot t40_io_token_aot t41_tcp_connect_aot t42_tcp_accept_aot t42_io_cancel_deadline_aot t44_tcp_read_write_aot t45_reactor_race_aot"
+AOT_O0_DRIVERS="t34_two_phase_aot t34b_affinity_aot t34c_duplicate_wake_aot t35_idle_sleep_aot t24_rendezvous_oneshot_aot t39_reactor_aot t40_io_token_aot t41_tcp_connect_aot t42_tcp_accept_aot t42_io_cancel_deadline_aot t44_tcp_read_write_aot t45_reactor_race_aot t46_reactor_fairness_aot"
 
 failures=0; reds=0; matrix=""
 
