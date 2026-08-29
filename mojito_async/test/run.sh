@@ -66,9 +66,15 @@ fi
 # battery) hit the SAME default-optimization compiler crash as
 # t24_rendezvous_oneshot above once compiled alongside the reactor
 # package's own dependency graph; `-O 0` compiles cleanly and every
-# scenario passes.  Every OTHER AOT driver keeps the default optimization
+# scenario passes.  A7.6 (issue #80): t42_io_cancel_deadline_aot hits the
+# identical crash for the identical reason (real Reactor + real pipe fds
+# compiled alongside reactor/cancel.mojo's own six-scenario battery); same
+# `-O 0` fix.  A7.5/A7.6 (issue #79/#80): t44_tcp_read_write_aot hits the
+# SAME crash (real Reactor + a real TCP loopback pair + tcp_stream.mojo's
+# own six-scenario battery incl. write_all/deadline/cancel/close paths);
+# same `-O 0` fix.  Every OTHER AOT driver keeps the default optimization
 # level (the suite is NOT rebuilt at -O 0).
-AOT_O0_DRIVERS="t34_two_phase_aot t34b_affinity_aot t34c_duplicate_wake_aot t35_idle_sleep_aot t24_rendezvous_oneshot_aot t39_reactor_aot t40_io_token_aot t41_tcp_connect_aot t42_tcp_accept_aot"
+AOT_O0_DRIVERS="t34_two_phase_aot t34b_affinity_aot t34c_duplicate_wake_aot t35_idle_sleep_aot t24_rendezvous_oneshot_aot t39_reactor_aot t40_io_token_aot t41_tcp_connect_aot t42_tcp_accept_aot t42_io_cancel_deadline_aot t44_tcp_read_write_aot"
 
 failures=0; reds=0; matrix=""
 
