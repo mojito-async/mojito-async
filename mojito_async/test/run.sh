@@ -193,6 +193,18 @@ for t in $AOT_TESTS; do
     fi
 done
 
+# --- #143: default-O repeatability lane ------------------------------------
+# The cross-worker drivers above all ran at `-O 0`.  This lane rebuilds the
+# two that exercise the real cross-worker handoff at the DEFAULT
+# optimization level — the way a downstream user builds — and runs them 30
+# times each.  It is deliberately NOT in AOT_O0_DRIVERS: the whole point is
+# the optimization level.
+O_REPEAT_SH="$SCRIPT_DIR/t51_default_o_repeat.sh"
+if [ -x "$O_REPEAT_SH" ]; then
+    out=$("$O_REPEAT_SH" 2>&1); st=$?
+    run_one t51_default_o_repeat "$out" "$st"
+fi
+
 echo ""
 echo "mojito-async A1 acceptance matrix (runtime #33, sync #34, channel #35, timer #36, stress #37, stack cache #52)"
 printf '%b' "$matrix" | sed 's/^/  /'
