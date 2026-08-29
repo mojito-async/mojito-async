@@ -16,7 +16,7 @@
 # the spike (Nil in runtime.mojo, IntResult in event.mojo), kept name-for-name
 # so sibling lanes and the A0 test lineage stay coherent.
 
-from mojito_async.runtime.task_control_block import ResultValue
+from mojito_async.runtime.task_control_block import ScopeChild
 
 
 comptime BytePtr = UnsafePointer[Byte, MutAnyOrigin]
@@ -27,8 +27,10 @@ comptime BytePtr = UnsafePointer[Byte, MutAnyOrigin]
 # Concrete ResultValue slots (single-instantiation targets for the tests)
 # ---------------------------------------------------------------------------
 
-struct IntResult(ResultValue):
-    """Concrete Int result slot for unit-style tasks."""
+struct IntResult(ScopeChild):
+    """Concrete Int result slot for unit-style tasks (A3.2/#61: also a
+    ScopeChild — homogeneous scopes across the suite register IntResult
+    children under one shared tag)."""
 
     var v: Int
 
@@ -37,3 +39,5 @@ struct IntResult(ResultValue):
 
     def __init__(out self, x: Int):
         self.v = x
+
+    comptime TAG = Int(0)
