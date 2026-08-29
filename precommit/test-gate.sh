@@ -225,9 +225,13 @@ else
 fi
 
 echo ""
+# Per-driver verdict row for precommit/gate.sh (issue #141): the gate's own
+# test is a driver like any other, and is allow-listable by name.
 if [ "$failures" -ne 0 ]; then
+    printf 'VERDICT\tgate_selftest\tRED\n'
     echo "gate self-test: RED ($failures of $cases case(s) failed)"
     exit 1
 fi
+printf 'VERDICT\tgate_selftest\tPASS\n'
 echo "gate self-test: PASS ($cases cases)"
 exit 0
