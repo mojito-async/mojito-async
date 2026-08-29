@@ -45,3 +45,10 @@ if [ ! -x "$BENCHSH" ]; then
     exit 3
 fi
 "$BENCHSH" || exit 1
+# --- A6.5 F6 timer-scale bench (issue #88) — same gate discipline ---------
+TIMERBENCHSH="bench/run_timer_scale.sh"
+if [ ! -x "$TIMERBENCHSH" ]; then
+    echo "precommit/run-suite.sh: $TIMERBENCHSH missing; bench coverage LOST."
+    exit 3
+fi
+"$TIMERBENCHSH" || exit 1
