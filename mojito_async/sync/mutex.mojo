@@ -36,7 +36,8 @@ from std.collections import Deque
 from mojito_async.runtime.runtime import Runtime
 from mojito_async.runtime.task_control_block import ResultValue, TaskControlBlock
 from mojito_async.task import JoinHandle
-from mojito_async.runtime.park import park_current, unpark_current
+from mojito_async.runtime.park import park_current, unpark_current, raise_if_cancel_wake, wake_cancelled
+from mojito_async.cancellation import CancellationToken
 
 
 comptime WAITER_GRANTED = Int(1)
@@ -50,6 +51,20 @@ def _waiter_handle[R: ResultValue](tcb_addr: Int, tid: Int) -> JoinHandle[R]:
         ),
         tid,
     )
+
+
+def _remove_at_index(mut q: Deque[Int], idx: Int) raises:
+    """Remove the element at `idx` (0-based from the front), preserving the
+    relative FIFO order of every OTHER element (issue #57's cancel_lock_wait:
+    a cancelled waiter may sit anywhere in the queue, not just the head).
+    Deque has no native middle-removal, so this is an O(n) full rotate —
+    acceptable at the same complexity already budgeted for these small
+    waiter queues elsewhere in this file family."""
+    var n = len(q)
+    for i in range(n):
+        var v = q.popleft()
+        if i != idx:
+            q.append(v)
 
 
 # ---------------------------------------------------------------------------
@@ -155,6 +170,51 @@ struct Mutex[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable](Movable, Imp
     def holds_grant[R: ResultValue](self, h: JoinHandle[R]) -> Bool:
         """Diagnostics: does `h` carry an outstanding GRANT marker?"""
         return h.tcb()[].wait_node()[].next() == WAITER_GRANTED
+
+    # --- token-aware acquire (A4.3, issue #57) ------------------------------
+
+    def lock_cancellable[R: ResultValue](
+        mut self, mut rt: Runtime, h: JoinHandle[R], token: CancellationToken
+    ) raises -> Bool:
+        """Token-aware acquire.  Identical to `lock()` on every readiness
+        path (fast CAS, GRANT-marker re-entry, contended park); the ONLY
+        addition is the C6 winner check this waiter's own resume carries:
+        `raise_if_cancel_wake` fires ONLY when THIS waiter's `cancel_lock_
+        wait` won the race (never when readiness/GRANT won — the mutex is
+        left exactly as `lock()` would leave it).  A pre-park check
+        (`token.checkpoint()` via raise_if_cancel_wake's sibling) is
+        deliberately NOT duplicated here: `lock()`'s fast CAS/GRANT re-entry
+        paths never park, so there is nothing to pre-empt; a caller that
+        wants the "already requested" case to refuse before EVER contending
+        should check `token.is_cancellation_requested()` itself before
+        calling in (mirrors park_cancellable's contract at the primitive
+        boundary)."""
+        raise_if_cancel_wake(h)
+        if token.is_cancellation_requested():
+            raise Error("CancellationError: mutex lock cancelled")
+        return self.lock(rt, h)
+
+    def cancel_lock_wait[R: ResultValue](
+        mut self, mut rt: Runtime, h: JoinHandle[R]
+    ) raises -> Bool:
+        """Cancel a parked `lock_cancellable` waiter (issue #57): removes
+        `h`'s task id from the FIFO wait queue — preserving the ORDER of
+        every OTHER queued waiter — and delivers a CANCEL wake.  Returns
+        True iff THIS call found + removed + woke the waiter (it won the
+        race); False when the id was never queued or a concurrent `unlock`
+        already popped it (readiness won — no ghost entry, no double
+        wake)."""
+        var idx = -1
+        for i in range(len(self._w_id)):
+            if self._w_id[i] == h.id():
+                idx = i
+                break
+        if idx == -1:
+            return False
+        _remove_at_index(self._w_tcb, idx)
+        _remove_at_index(self._w_id, idx)
+        wake_cancelled(rt, h)
+        return True
 
 
 # ---------------------------------------------------------------------------

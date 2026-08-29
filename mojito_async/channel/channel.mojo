@@ -39,7 +39,8 @@ from std.collections import Deque
 from mojito_async.runtime.runtime import Runtime
 from mojito_async.runtime.task_control_block import ResultValue
 from mojito_async.task import JoinHandle
-from mojito_async.runtime.park import park_current
+from mojito_async.runtime.park import park_current, raise_if_cancel_wake, wake_cancelled
+from mojito_async.cancellation import CancellationToken
 
 
 # ---------------------------------------------------------------------------
@@ -62,6 +63,25 @@ struct WaitRecord(ImplicitlyCopyable, ImplicitlyDeletable, Movable):
     def __init__(out self, tcb_addr: Int, task_id: Int):
         self.tcb_addr = tcb_addr
         self.task_id = task_id
+
+
+def _remove_waiter_by_id(mut q: Deque[WaitRecord], task_id: Int) raises -> Bool:
+    """Remove the WaitRecord whose task_id matches (issue #57's cancel_send_
+    wait/cancel_recv_wait: a cancelled waiter may sit anywhere in the FIFO),
+    preserving the relative order of every OTHER waiter.  O(n) rotate —
+    Deque has no native middle-removal.  Only compares/moves the ALREADY-
+    STORED task_id ints — never reconstructs a handle from them (the file
+    header's ban on in-method address reconstruction stays intact).
+    Returns True iff found+removed."""
+    var n = len(q)
+    var found = False
+    for _ in range(n):
+        var w = q.popleft()
+        if w.task_id == task_id and not found:
+            found = True
+            continue
+        q.append(w)
+    return found
 
 
 # ---------------------------------------------------------------------------
@@ -251,6 +271,58 @@ struct Channel[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable](
         park_current(rt, h)
         return Optional[Self.T]()
 
+    # --- token-aware slow paths (A4.3, issue #57) ---------------------------
+
+    def send_cancellable[R: ResultValue](
+        mut self, mut rt: Runtime, h: JoinHandle[R], item: Self.T, token: CancellationToken,
+    ) raises:
+        """Token-aware send.  Identical to `send()` on every readiness path
+        (fast buffer, contended park, re-entry); the ONLY addition is the C6
+        winner check this waiter's own resume carries: raises ONLY when
+        THIS waiter's `cancel_send_wait` won the race (never when a slot
+        opened up first — the ring/queue is left exactly as `send()` would
+        leave it, the item NOT consumed twice)."""
+        raise_if_cancel_wake(h)
+        if token.is_cancellation_requested():
+            raise Error("CancellationError: channel send cancelled")
+        self.send(rt, h, item)
+
+    def recv_cancellable[R: ResultValue](
+        mut self, mut rt: Runtime, h: JoinHandle[R], token: CancellationToken,
+    ) raises -> Optional[Self.T]:
+        """Token-aware receive.  Identical to `recv()` on every readiness
+        path; raises ONLY when THIS waiter's `cancel_recv_wait` won the
+        race (never when a value arrived first)."""
+        raise_if_cancel_wake(h)
+        if token.is_cancellation_requested():
+            raise Error("CancellationError: channel recv cancelled")
+        return self.recv(rt, h)
+
+    def cancel_send_wait[R: ResultValue](
+        mut self, mut rt: Runtime, h: JoinHandle[R]
+    ) raises -> Bool:
+        """Cancel a parked `send_cancellable` waiter (issue #57): removes
+        `h` from `_send_waiters` and delivers a CANCEL wake.  Returns True
+        iff THIS call found + removed + woke the waiter; False when the id
+        was never queued or a concurrent fast-path/close already popped it
+        (readiness/close won — no ghost entry, no double wake)."""
+        if not _remove_waiter_by_id(self._send_waiters, h.id()):
+            return False
+        wake_cancelled(rt, h)
+        return True
+
+    def cancel_recv_wait[R: ResultValue](
+        mut self, mut rt: Runtime, h: JoinHandle[R]
+    ) raises -> Bool:
+        """Cancel a parked `recv_cancellable` waiter (issue #57): removes
+        `h` from `_recv_waiters` and delivers a CANCEL wake.  Returns True
+        iff THIS call found + removed + woke the waiter; False when the id
+        was never queued or a concurrent fast-path/close already popped it."""
+        if not _remove_waiter_by_id(self._recv_waiters, h.id()):
+            return False
+        wake_cancelled(rt, h)
+        return True
+
     # --- waiter registration (FIFO, dedupe by task id) -------------------------
 
     def register_sender[R: ResultValue](mut self, h: JoinHandle[R]) raises:
@@ -355,6 +427,18 @@ struct Sender[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable](
             raise Error("ChannelError: send on closed channel")
         self._chan[].send(rt, h, item)
 
+    def send_cancellable[R: ResultValue](
+        mut self, mut rt: Runtime, h: JoinHandle[R], item: Self.T, token: CancellationToken,
+    ) raises:
+        if self._closed:
+            raise Error("ChannelError: send on closed channel")
+        self._chan[].send_cancellable(rt, h, item, token)
+
+    def cancel_send_wait[R: ResultValue](
+        mut self, mut rt: Runtime, h: JoinHandle[R]
+    ) raises -> Bool:
+        return self._chan[].cancel_send_wait(rt, h)
+
     def close(mut self) raises:
         """Drop this sender's slot.  When the LAST sender closes, the send
         side closes and parked receivers are woken (they drain, then observe
@@ -392,6 +476,16 @@ struct Receiver[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable](
         mut self, mut rt: Runtime, h: JoinHandle[R]
     ) raises -> Optional[Self.T]:
         return self._chan[].recv(rt, h)
+
+    def recv_cancellable[R: ResultValue](
+        mut self, mut rt: Runtime, h: JoinHandle[R], token: CancellationToken,
+    ) raises -> Optional[Self.T]:
+        return self._chan[].recv_cancellable(rt, h, token)
+
+    def cancel_recv_wait[R: ResultValue](
+        mut self, mut rt: Runtime, h: JoinHandle[R]
+    ) raises -> Bool:
+        return self._chan[].cancel_recv_wait(rt, h)
 
     def close(mut self) raises:
         """Drop this receiver's slot.  When the LAST receiver closes, the
