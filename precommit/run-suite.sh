@@ -13,6 +13,21 @@ set -u
 
 cd "$(git rev-parse --show-toplevel)" || exit 2
 
+rc_docs=0
+
+# --- #153 docs-vs-tree consistency ----------------------------------------
+# Needs no toolchain. Checks the claims the README and the spec make against
+# what is actually in the tree: the status section, the module map, the
+# public surfaces that unconditionally raise, dead config fields, and a
+# constant whose comment contradicts its value. A spec that lies costs more
+# than no spec, and two reviewers lost time to this one.
+DOCSSH="precommit/test-docs.sh"
+if [ ! -x "$DOCSSH" ]; then
+    echo "precommit/run-suite.sh: $DOCSSH missing; docs coverage LOST."
+    exit 3
+fi
+"$DOCSSH" || rc_docs=1
+
 RUNSH="spike/colorless_runtime/tests/run.sh"
 if [ ! -x "$RUNSH" ]; then
     echo "precommit/run-suite.sh: $RUNSH missing; suite coverage LOST."
@@ -66,3 +81,5 @@ if [ ! -x "$FAIRNESSBENCHSH" ]; then
     exit 3
 fi
 "$FAIRNESSBENCHSH" || exit 1
+
+exit "$rc_docs"
