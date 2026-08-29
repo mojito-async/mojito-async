@@ -62,7 +62,7 @@ from mojito_async.runtime.scheduler import scheduler_loop
 from mojito_async.runtime.task_control_block import TaskControlBlock
 from mojito_async.runtime.worker import Worker, make_worker
 from mojito_async.task import JoinHandle, claim_running
-from mojito_async.vendor.mojito_sys import c_free, c_malloc, entry_pointer
+from mojito_async.vendor.mojito_sys import c_malloc, entry_pointer
 
 
 @extern("pthread_create")
@@ -473,8 +473,10 @@ def run_scenario(failures: UnsafePointer[Int, MutAnyOrigin], early: Int) raises:
     if rc0 != 0 or rc1 != 0:
         _fail(failures, "pthread_create failed (" + String(rc0) + ", "
                         + String(rc1) + ")")
-        c_free(scp.bitcast[Byte]())
-        c_free(tcb.bitcast[Byte]())
+        # NOT freed: if EITHER pthread_create succeeded, that thread is
+        # already running t34_worker0/t34_worker1 against `scp` — see the
+        # issue #138 note at the bottom of this function for why `scp`/
+        # `tcb`/`cells` are never freed by this driver.
         return
     var budget = 600_000_000
     while budget > 0:
@@ -550,8 +552,28 @@ def run_scenario(failures: UnsafePointer[Int, MutAnyOrigin], early: Int) raises:
                   + String(w1pending)
                   + " — the wake must route to the OWNER remote queue)")
 
-    c_free(scp.bitcast[Byte]())
-    c_free(tcb.bitcast[Byte]())
+    # issue #138 (teardown SIGSEGV, reproduced under host contention on a
+    # pristine origin/main): `scp` (this Scene's backing cell) and `tcb`
+    # must NOT be freed here.  t34_worker0/t34_worker1 (spawned above)
+    # NEVER return — `_park_forever` (see its docstring) spins on
+    # `sc[].progress[me]` FOREVER after their serve loop quiesces, because
+    # a foreign pthread that actually returns crashes the b2 1.0.0b2
+    # runtime (the same documented constraint `_park_forever` works
+    # around).  `run_scenario` runs TWICE from main() (S2 then S1): if
+    # this call's `scp`/`tcb` were freed here, S2's two zombie threads
+    # would keep dereferencing THAT freed memory for the entire duration
+    # of S1's run_scenario call — a genuine use-after-free race (S1's own
+    # c_malloc calls request the SAME sizes and routinely get the SAME
+    # freed addresses back from the allocator) that reproduces as a SIGSEGV
+    # in a still-running t34_worker0/t34_worker1 zombie thread under host
+    # contention, independent of optimization level (confirmed: still
+    # crashes at -O 0).  `cells` (the Scene's field-backing data block,
+    # allocated above) was ALREADY never freed for the identical reason;
+    # `scp`/`tcb` now match it — every allocation a zombie thread can still
+    # reach is intentionally leaked for the remaining life of the process,
+    # which `main()`'s final `_iso_exit` reclaims in one shot.  Not a
+    # WorkerPool issue — this driver drives raw pthreads directly and never
+    # touches WorkerPool.join_all/finalize.
 
 
 def main() raises:
