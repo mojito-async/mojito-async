@@ -47,12 +47,40 @@
 #
 # Mojo 1.0.0b2: `def`-only, module factories (no static methods), no
 # hidden allocation beyond the caller-owned Deque/List backing stores.
+#
+# Cross-worker safety (issue #128, mirrors channel.mojo's treatment):
+# `_guard` is a SpinLock (queue.mojo's) serializing every read/write of
+# `_slot`/`_send_waiters`/`_recv_waiters`/`_to_wake`/`_send_done`/
+# `_send_failed`/the closed flags/the slot counts — see channel.mojo's
+# module header for the full rationale (the same double-acquisition/
+# lost-update class t38_mutex_cross_worker_aot caught for Mutex).  All the
+# matching helpers below (`_match_waiting_receiver`, `_match_waiting_
+# sender`, `_try_advance`, `_take_send_done`, `_take_send_failed`,
+# `register_send_wait`, `register_receiver`) are renamed with a `_locked`
+# suffix and now ASSUME the caller already holds `_guard` — `send()`/
+# `recv()` combine the outcome-marker check, the match attempt, and the
+# slow-path register into ONE guarded critical section (mirrors Mutex.
+# lock's exact shape); `try_send`/`try_recv` wrap the SAME `_locked`
+# helpers in their own single-call guard.  send()/recv() also now park via
+# the TWO-PHASE `park_prepare`/`park_validate`/`park_commit` kernel instead
+# of the single-phase `park_current`, for the identical lost-wakeup reason
+# documented in mutex.mojo's header.  A channel wake carries no ownership
+# transfer (unlike Mutex's GRANT marker) — an early wake therefore LOOPS
+# back to the top-of-function attempt instead of returning; for a sender
+# this naturally re-checks the `_send_done`/`_send_failed` consume-once
+# markers first, which is exactly the same check a fresh re-dispatch would
+# perform (see channel.mojo's `send`/`recv` docstrings for the full
+# rationale).  There are no cancellable variants on this struct, so no
+# cancel-wake check is needed on the early-unwind path.  The SpinLock's
+# Atomic cannot be Movable/ImplicitlyDeletable, so RendezvousChannel drops
+# those conformances too — it now mirrors Channel/Mutex/RWLock.
 from std.collections import Deque, List
 from mojito_async.channel.channel import WaitRecord
+from mojito_async.runtime.queue import SpinLock
 from mojito_async.runtime.runtime import Runtime
 from mojito_async.runtime.task_control_block import ResultValue
-from mojito_async.task import JoinHandle
-from mojito_async.runtime.park import park_current
+from mojito_async.task import JoinHandle, claim_running
+from mojito_async.runtime.park import park_commit, park_prepare, park_validate
 
 
 # ---------------------------------------------------------------------------
@@ -82,14 +110,14 @@ struct SendWait[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable](
 # RendezvousChannel[T] — capacity-0 handoff: no ring, no buffered slot
 # ---------------------------------------------------------------------------
 
-struct RendezvousChannel[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable](
-    ImplicitlyDeletable, Movable
-):
+struct RendezvousChannel[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable]:
     """Capacity-0 channel (issue #89): sender and receiver hand a value off
     directly; try_send/try_recv NEVER buffer — they succeed only when the
     opposite party is already parked waiting.
 
     State:
+      _guard         — SpinLock (issue #128) serializing every read/write of
+                        the fields below — see the module header.
       _slot          — the single handoff cell; holds a value ONLY while a
                         matched receiver is between being woken and its
                         resumed recv() call collecting it (Case A).
@@ -110,6 +138,7 @@ struct RendezvousChannel[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable](
                         discipline as the bounded Channel (#35).
     """
 
+    var _guard: SpinLock
     var _slot: Optional[Self.T]
     var _send_waiters: Deque[SendWait[Self.T]]
     var _recv_waiters: Deque[WaitRecord]
@@ -122,6 +151,7 @@ struct RendezvousChannel[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable](
     var _receivers: Int
 
     def __init__(out self):
+        self._guard = SpinLock()
         self._slot = Optional[Self.T]()
         self._send_waiters = Deque[SendWait[Self.T]]()
         self._recv_waiters = Deque[WaitRecord]()
@@ -135,66 +165,108 @@ struct RendezvousChannel[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable](
 
     # --- queries -------------------------------------------------------
 
-    def is_slot_filled(self) -> Bool:
-        if self._slot:
-            return True
-        return False
+    def is_slot_filled(mut self) -> Bool:
+        self._guard.lock()
+        var f = Bool(self._slot)
+        self._guard.unlock()
+        return f
 
-    def is_send_closed(self) -> Bool:
-        return self._send_closed
+    def is_send_closed(mut self) -> Bool:
+        self._guard.lock()
+        var v = self._send_closed
+        self._guard.unlock()
+        return v
 
-    def is_recv_closed(self) -> Bool:
-        return self._recv_closed
+    def is_recv_closed(mut self) -> Bool:
+        self._guard.lock()
+        var v = self._recv_closed
+        self._guard.unlock()
+        return v
 
-    def is_closed(self) -> Bool:
-        return self._send_closed or self._recv_closed
+    def is_closed(mut self) -> Bool:
+        self._guard.lock()
+        var v = self._send_closed or self._recv_closed
+        self._guard.unlock()
+        return v
 
-    def sender_count(self) -> Int:
-        return self._senders
+    def sender_count(mut self) -> Int:
+        self._guard.lock()
+        var v = self._senders
+        self._guard.unlock()
+        return v
 
-    def receiver_count(self) -> Int:
-        return self._receivers
+    def receiver_count(mut self) -> Int:
+        self._guard.lock()
+        var v = self._receivers
+        self._guard.unlock()
+        return v
 
-    def send_waiters_len(self) -> Int:
-        return len(self._send_waiters)
+    def send_waiters_len(mut self) -> Int:
+        self._guard.lock()
+        var v = len(self._send_waiters)
+        self._guard.unlock()
+        return v
 
-    def recv_waiters_len(self) -> Int:
-        return len(self._recv_waiters)
+    def recv_waiters_len(mut self) -> Int:
+        self._guard.lock()
+        var v = len(self._recv_waiters)
+        self._guard.unlock()
+        return v
 
-    def to_wake_len(self) -> Int:
-        return len(self._to_wake)
+    def to_wake_len(mut self) -> Int:
+        self._guard.lock()
+        var v = len(self._to_wake)
+        self._guard.unlock()
+        return v
 
-    def send_done_len(self) -> Int:
-        return len(self._send_done)
+    def send_done_len(mut self) -> Int:
+        self._guard.lock()
+        var v = len(self._send_done)
+        self._guard.unlock()
+        return v
 
-    def send_failed_len(self) -> Int:
-        return len(self._send_failed)
+    def send_failed_len(mut self) -> Int:
+        self._guard.lock()
+        var v = len(self._send_failed)
+        self._guard.unlock()
+        return v
 
     # --- handle split ----------------------------------------------------
 
     def sender(mut self) raises -> RendezvousSender[Self.T]:
         """Split a new RendezvousSender handle.  Refuses once the send
-        side is closed."""
+        side is closed.  GUARDED (issue #128): the closed check and the
+        slot-count increment are ONE critical section."""
+        self._guard.lock()
         if self._send_closed:
+            self._guard.unlock()
             raise Error("ChannelError: send side already closed; cannot split a sender")
         self._senders += 1
+        self._guard.unlock()
         return RendezvousSender[Self.T](
             UnsafePointer[RendezvousChannel[Self.T], MutAnyOrigin](to=self)
         )
 
     def receiver(mut self) raises -> RendezvousReceiver[Self.T]:
         """Split a new RendezvousReceiver handle.  Refuses once the
-        receive side is closed."""
+        receive side is closed.  GUARDED (issue #128), see `sender`."""
+        self._guard.lock()
         if self._recv_closed:
+            self._guard.unlock()
             raise Error("ChannelError: receive side already closed; cannot split a receiver")
         self._receivers += 1
+        self._guard.unlock()
         return RendezvousReceiver[Self.T](
             UnsafePointer[RendezvousChannel[Self.T], MutAnyOrigin](to=self)
         )
 
     # --- matching helpers (shared by try_*/blocking paths) -----------------
+    # Every helper below is `_locked`: the caller MUST already hold `_guard`
+    # (issue #128) — send()/recv() combine these with their own marker/
+    # closed checks into ONE critical section; a second internal lock here
+    # would deadlock the (non-reentrant) SpinLock.
 
-    def _match_waiting_receiver(mut self, item: Self.T) raises -> Bool:
+    def _match_waiting_receiver_locked(mut self, item: Self.T) raises -> Bool:
         """Case A: deposit `item` into `_slot` for the OLDEST parked
         receiver — only when the single handoff cell is free (an occupied
         cell means an earlier handoff has not been collected yet; a second
@@ -209,7 +281,7 @@ struct RendezvousChannel[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable](
         self._to_wake.append(w)
         return True
 
-    def _match_waiting_sender(mut self) raises -> Optional[SendWait[Self.T]]:
+    def _match_waiting_sender_locked(mut self) raises -> Optional[SendWait[Self.T]]:
         """Case B: pop the OLDEST parked sender's inline item directly (no
         `_slot` round-trip); marks it delivered so its own resumed send()
         short-circuits instead of re-matching."""
@@ -221,7 +293,7 @@ struct RendezvousChannel[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable](
         self._to_wake.append(WaitRecord(sw.tcb_addr, sw.task_id))
         return Optional[SendWait[Self.T]](sw)
 
-    def _try_advance(mut self) raises:
+    def _try_advance_locked(mut self) raises:
         """Once `_slot` frees up, immediately re-match the oldest queued
         pair if BOTH sides still have waiters: two already-parked parties
         that could satisfy each other must never sit as a mutual,
@@ -242,7 +314,7 @@ struct RendezvousChannel[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable](
 
     # --- consume-once outcome markers (resumed-sender re-entry) ------------
 
-    def _take_send_done(mut self, task_id: Int) -> Bool:
+    def _take_send_done_locked(mut self, task_id: Int) -> Bool:
         for i in range(len(self._send_done)):
             if self._send_done[i] == task_id:
                 var rest = List[Int]()
@@ -253,7 +325,7 @@ struct RendezvousChannel[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable](
                 return True
         return False
 
-    def _take_send_failed(mut self, task_id: Int) -> Bool:
+    def _take_send_failed_locked(mut self, task_id: Int) -> Bool:
         for i in range(len(self._send_failed)):
             if self._send_failed[i] == task_id:
                 var rest = List[Int]()
@@ -270,10 +342,15 @@ struct RendezvousChannel[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable](
         """Non-blocking send: succeeds ONLY when a receiver is already
         parked (direct match); otherwise returns False WITHOUT consuming
         `item` and WITHOUT registering a waiter — a rendezvous cannot
-        buffer."""
+        buffer.  GUARDED (issue #128): the closed check and the match
+        attempt are ONE critical section."""
+        self._guard.lock()
         if self._send_closed or self._recv_closed:
+            self._guard.unlock()
             return False
-        return self._match_waiting_receiver(item)
+        var ok = self._match_waiting_receiver_locked(item)
+        self._guard.unlock()
+        return ok
 
     def try_recv(mut self) raises -> Optional[Self.T]:
         """Non-blocking receive: succeeds ONLY when a sender is already
@@ -281,8 +358,10 @@ struct RendezvousChannel[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable](
         SendWait); otherwise returns None.  Never touches `_slot` — a
         value sitting there is already earmarked for a specific woken
         receiver (see module docstring), not fair game for an unrelated
-        try_recv()."""
-        var matched = self._match_waiting_sender()
+        try_recv().  GUARDED (issue #128)."""
+        self._guard.lock()
+        var matched = self._match_waiting_sender_locked()
+        self._guard.unlock()
         if matched:
             return Optional[Self.T](matched.value().item)
         return Optional[Self.T]()
@@ -297,17 +376,41 @@ struct RendezvousChannel[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable](
         raises "closed" WITHOUT touching the match/park logic again — see
         the module docstring for why a blind re-match would double-deliver.
         A genuinely fresh call matches an already-parked receiver directly
-        (Case A) or queues (with `item` inline) and parks (Case B)."""
-        if self._take_send_done(h.id()):
+        (Case A) or queues (with `item` inline) and parks (Case B).
+
+        The marker checks, the closed check, the match attempt, and the
+        slow-path register are ONE guarded critical section (issue #128).
+        Parks via the TWO-PHASE `park_prepare`/`park_validate`/
+        `park_commit` kernel, NOT the single-phase `park_current`, so a
+        cross-worker recv()/close() racing into the PARKING window is
+        never lost.  A wake carries no ownership transfer — an early wake
+        LOOPS back to the top-of-function attempt instead of returning,
+        which naturally re-checks `_send_done`/`_send_failed` first (the
+        exact check a fresh re-dispatch would perform) — see channel.
+        mojo's `send` docstring for the full rationale."""
+        while True:
+            self._guard.lock()
+            if self._take_send_done_locked(h.id()):
+                self._guard.unlock()
+                return
+            if self._take_send_failed_locked(h.id()):
+                self._guard.unlock()
+                raise Error("ChannelError: send on closed channel")
+            if self._send_closed or self._recv_closed:
+                self._guard.unlock()
+                raise Error("ChannelError: send on closed channel")
+            if self._match_waiting_receiver_locked(item):
+                self._guard.unlock()
+                return
+            self._register_send_wait_locked(h, item)
+            self._guard.unlock()
+            park_prepare(h)
+            if park_validate(h):
+                park_commit(h)
+                claim_running(h)
+                continue
+            park_commit(h)
             return
-        if self._take_send_failed(h.id()):
-            raise Error("ChannelError: send on closed channel")
-        if self._send_closed or self._recv_closed:
-            raise Error("ChannelError: send on closed channel")
-        if self._match_waiting_receiver(item):
-            return
-        self.register_send_wait(h, item)
-        park_current(rt, h)
 
     def recv[R: ResultValue](
         mut self, mut rt: Runtime, h: JoinHandle[R]
@@ -315,32 +418,52 @@ struct RendezvousChannel[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable](
         """One-shot receive (issued by a RendezvousReceiver).  Safe to
         re-invoke on resume: both a filled `_slot` (Case A) and a queued
         sender (Case B) are state-derived, idempotent checks — no outcome
-        marker is needed on this side (see module docstring)."""
-        if self._slot:
-            var v = self._slot.value()
-            self._slot = Optional[Self.T]()
-            self._try_advance()
-            return Optional[Self.T](v)
-        var matched = self._match_waiting_sender()
-        if matched:
-            return Optional[Self.T](matched.value().item)
-        if self._send_closed or self._recv_closed:
+        marker is needed on this side (see module docstring).
+
+        GUARDED (issue #128): the slot check, the match attempt, the
+        closed check, and the slow-path register are ONE critical section.
+        Parks via the TWO-PHASE kernel (see `send`); on an early wake, loop
+        back to the top-of-function attempt instead of returning."""
+        while True:
+            self._guard.lock()
+            if self._slot:
+                var v = self._slot.value()
+                self._slot = Optional[Self.T]()
+                self._try_advance_locked()
+                self._guard.unlock()
+                return Optional[Self.T](v)
+            var matched = self._match_waiting_sender_locked()
+            if matched:
+                self._guard.unlock()
+                return Optional[Self.T](matched.value().item)
+            if self._send_closed or self._recv_closed:
+                self._guard.unlock()
+                return Optional[Self.T]()
+            self._register_receiver_locked(h)
+            self._guard.unlock()
+            park_prepare(h)
+            if park_validate(h):
+                park_commit(h)
+                claim_running(h)
+                continue
+            park_commit(h)
             return Optional[Self.T]()
-        self.register_receiver(h)
-        park_current(rt, h)
-        return Optional[Self.T]()
 
     # --- waiter registration (FIFO, dedupe by task id) ----------------------
 
-    def register_send_wait[R: ResultValue](
+    def _register_send_wait_locked[R: ResultValue](
         mut self, h: JoinHandle[R], item: Self.T
     ) raises:
+        """Caller MUST hold `_guard` (issue #128), see the matching-helpers
+        note above."""
         for i in range(len(self._send_waiters)):
             if self._send_waiters[i].task_id == h.id():
                 return  # already parked as a sender; never double-register
         self._send_waiters.append(SendWait[Self.T](Int(h.tcb()), h.id(), item))
 
-    def register_receiver[R: ResultValue](mut self, h: JoinHandle[R]) raises:
+    def _register_receiver_locked[R: ResultValue](mut self, h: JoinHandle[R]) raises:
+        """Caller MUST hold `_guard` (issue #128), see the matching-helpers
+        note above."""
         for i in range(len(self._recv_waiters)):
             if self._recv_waiters[i].task_id == h.id():
                 return  # already parked as a receiver; never double-register
@@ -350,11 +473,16 @@ struct RendezvousChannel[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable](
 
     def pop_to_wake(mut self) raises -> WaitRecord:
         """Pop the oldest deferred wake.  Returns the (0,0) sentinel record
-        when the list is empty (mirrors #35's Channel.pop_to_wake)."""
+        when the list is empty (mirrors #35's Channel.pop_to_wake).
+        GUARDED (issue #128): the embedding driver may run on a DIFFERENT
+        worker than the one whose send()/recv() pushed the wake."""
+        self._guard.lock()
         if len(self._to_wake) == 0:
+            self._guard.unlock()
             return WaitRecord(0, 0)
         var w = self._to_wake[0]
         _ = self._to_wake.popleft()
+        self._guard.unlock()
         return w
 
     # --- close slots ---------------------------------------------------------
@@ -365,30 +493,39 @@ struct RendezvousChannel[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable](
         the deferred wake list: a receiver still finds a genuinely queued
         sender's item if one exists (send-side closing does not cancel an
         already-queued handoff), otherwise it observes close (None).
-        Idempotent."""
+        Idempotent.  GUARDED (issue #128): the slot-count decrement, the
+        closed-flag flip, and the FIFO drain are ONE critical section."""
+        self._guard.lock()
         if self._senders > 0:
             self._senders -= 1
         if self._senders != 0:
+            self._guard.unlock()
             return
         if self._send_closed:
+            self._guard.unlock()
             return
         self._send_closed = True
         while len(self._recv_waiters) > 0:
             var w = self._recv_waiters[0]
             _ = self._recv_waiters.popleft()
             self._to_wake.append(w)
+        self._guard.unlock()
 
     def close_receiver_slot(mut self) raises:
         """One RendezvousReceiver dropped its slot.  When the LAST receiver
         closes, the receive side closes, any in-flight `_slot` value is
         dropped, and every parked sender is moved to the deferred wake list
         with a FAILURE outcome: its resumed send() raises "ChannelError:
-        send on closed channel".  Idempotent."""
+        send on closed channel".  Idempotent.  GUARDED (issue #128), see
+        `close_sender_slot`."""
+        self._guard.lock()
         if self._receivers > 0:
             self._receivers -= 1
         if self._receivers != 0:
+            self._guard.unlock()
             return
         if self._recv_closed:
+            self._guard.unlock()
             return
         self._recv_closed = True
         self._slot = Optional[Self.T]()
@@ -397,6 +534,7 @@ struct RendezvousChannel[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable](
             _ = self._send_waiters.popleft()
             self._send_failed.append(sw.task_id)
             self._to_wake.append(WaitRecord(sw.tcb_addr, sw.task_id))
+        self._guard.unlock()
 
 
 # ---------------------------------------------------------------------------
