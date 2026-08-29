@@ -1,0 +1,43 @@
+Vendored mojito-sys S6.2 socket substrate —
+mojito_async/vendor/mojito-sys/mjs_socket.c
+
+Source repository: github.com/mojito-async/mojito-sys
+Source tree:       native/posix/mjs_socket.c
+Source commit:      a26e9a3550511738252174278af0794f6cbfd104 (main)
+Vendored on:        2026-08-28 (A7.3/A7.4 productionization, issues #77/#78)
+
+Layers on the SAME include/mojito_sys.h the A7.1/A7.2 reactor lane already
+vendored whole (mojito_async/vendor/mojito-sys/VENDORED_AT_S6.txt) — the
+s6-socket header block was diffed byte-identical between that lane's
+vendored commit and this one's before vendoring (both frozen since the
+mojito-sys S6.2 milestone), so no second header copy is introduced here.
+
+mojito_async/vendor/mojito_sys_io/externs.mojo's own header notes it was
+"TRIMMED to the s6-poller/s6-epoll/s6-ioring sections only" by the #75/#76
+lane, deliberately leaving the s6-socket (mjs_socket_*) bindings for this
+lane to add — done in this commit (the s6-socket externs block + probe_*
+shims, inserted ahead of the s6-poller section, vendored from the SAME
+mojito-sys commit as mjs_socket.c above).
+
+DEVIATION FROM FROZEN ABI (issues #77/#78, RECORDED): mjs_socket.c gains
+TWO entry points not in the upstream frozen s6-socket block, appended
+after mjs_socket_close with their own header comment:
+  mjs_socket_set_reuseaddr(fd, enabled) — SO_REUSEADDR, for
+    bind_and_listen's "rebind immediately after restart" deliverable
+    (issue #78).
+  mjs_socket_connect_error(fd, *out_err) — getsockopt(SO_ERROR), the only
+    way to decode a pending non-blocking connect()'s eventual outcome
+    once write-readiness fires (issue #77 plan step 3); the frozen ABI
+    has no other way to express this. Return contract matches every
+    other entry point (0/-errno); *out_err separately carries the
+    connect() outcome (0 established, positive errno on failure).
+These are NOT upstreamed to github.com/mojito-async/mojito-sys; they are
+local additions layered on the vendored copy, matching the deviation
+pattern already recorded in vendor/mojito-sys/VENDORED_AT.txt (M:N ctx
+rework). Matching @extern declarations live at the end of
+vendor/mojito_sys_io/externs.mojo; see vendor/mojito_sys_io/socket.mojo's
+module docblock for the Mojo-side wrapper methods
+(NativeSocket.set_reuseaddr/connect_error).
+
+The Makefile's `mojito_async/vendor/mojito-sys/*.c` wildcard picks this up
+automatically; no Makefile edit needed.
