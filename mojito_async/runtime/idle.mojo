@@ -76,6 +76,7 @@ from std.atomic import Atomic, Ordering
 from mojito_async.integration.sys import BytePtr
 from mojito_async.vendor.mojito_sys import (
     monotonic_now_ns,
+    ms_event_signal,
     native_event_wait_until,
 )
 
@@ -189,6 +190,30 @@ def complete_work(acct: BytePtr, delta: Int) raises:
             + "earlier announce_work"
         )
 
+
+def wake_one(acct: BytePtr, event: Int):
+    """#112-OWNED (item 2, wake-path signaling): the producer-side SIGNAL
+    half of the M2/M7 wake budget — announce_work (above) publishes the
+    unit, this fires the event ONLY IF a worker is actually parked (never
+    burn a wake into nobody).  Mirrors WorkerPool.wake_one()'s guard
+    exactly (worker_pool.mojo is the OTHER caller of this same contract;
+    a Runtime's wake paths — enqueue_local/push_remote/enqueue_global,
+    runtime.mojo — call this directly since a Runtime is armed with
+    (acct, event) but holds no owning WorkerPool reference to reach
+    WorkerPool.wake_one() through).  `event` is the NULL-CAPABLE raw
+    NativeEvent handle (0 = unbound/unarmed, the same convention as every
+    other raw-handle parameter in this codebase, vendor/mojito_sys.mojo
+    header): a Runtime armed with only an acct block (no event, e.g. the
+    t31/t32 unit-test scaffolding) must never dereference a bogus handle,
+    so BOTH guards (armed acct with a real parked sleeper, AND a live
+    event) must hold before the OS-level signal fires.  Before this fold
+    every wake path only announced (M2-partial, PR #106/#107): an
+    idle-parked owner could stall up to the full IDLE_PARK_SLICE_NS
+    backstop (~2s) instead of waking within the event's latency."""
+    if event == 0:
+        return
+    if acct_parked(acct) > 0:
+        ms_event_signal(event)
 
 # --- worker-side counters (module helpers, extern-free) ---------------------
 

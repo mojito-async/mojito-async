@@ -56,6 +56,7 @@
 # PR #104) — hoists the TLS-key read OUT of any loop and delegates the loop
 # to that module fn.
 from std.atomic import Atomic, Ordering
+from std.time import sleep
 from mojito_async.integration.sys import BytePtr
 from mojito_async.runtime.config import RuntimeConfig, make_pool_config
 from mojito_async.runtime.idle import (
@@ -151,6 +152,15 @@ struct WorkerPool:
     var _finalized: Bool              # finalize() ran: no further start()
     var _event: NativeEvent   # A2.6/E6: the per-pool idle park NativeEvent
     var _acct: BytePtr        # A2.6/E6: idle-accounting block (atomics)
+    # #112 (item 1): the ONE shared peer-pointer array E4's steal probe
+    # walks (peers[i] == worker_at(i) for every i).  Pool-owned heap,
+    # built once per start() in _build_cells (addresses are stable across
+    # a start/join_all cycle: worker cells are reinit'd IN PLACE, never
+    # relocated); freed at finalize().  Before this fold worker_pool.mojo
+    # never wired Worker._peers/_index/_n_workers at all, so
+    # try_steal_unstarted's `_n_workers <= 1` guard made stealing
+    # structurally DEAD in the real pool.
+    var _peers_base: BytePtr
 
     def __init__(out self):
         self._config = make_pool_config()
@@ -172,6 +182,8 @@ struct WorkerPool:
         # copy/read may ever dereference the address-1 sentinel; _ensure_idle_
         # state() keeps re-arming it across restarts without reallocating.
         self._acct = c_malloc(ACCT_BYTES)
+        # #112 (item 1): the peer-pointer array (see field doc above).
+        self._peers_base = c_malloc(n * 8)
 
     def __init__(out self, config: RuntimeConfig):
         self._config = config
@@ -193,6 +205,8 @@ struct WorkerPool:
         # copy/read may ever dereference the address-1 sentinel; _ensure_idle_
         # state() keeps re-arming it across restarts without reallocating.
         self._acct = c_malloc(ACCT_BYTES)
+        # #112 (item 1): the peer-pointer array (see field doc above).
+        self._peers_base = c_malloc(n * 8)
 
     # --- addressing ---------------------------------------------------------
 
@@ -285,7 +299,13 @@ struct WorkerPool:
         mark_started per index) — does the spawn.  For every worker,
         mark_started completes BEFORE pthread_create returns, so no worker
         thread can ever run user code before its Worker/TLS wiring is
-        visible (happens-before via pthread_create)."""
+        visible (happens-before via pthread_create).
+
+        #112 (item 6): every worker thread is spawned with a pthread_attr_t
+        stack size of `self._config.stack_reserve_bytes` (validated by
+        start()'s RuntimeConfig.validate() call) instead of pthread's
+        compiled-in default — the config's stack knob used to be validated
+        then silently dropped on the floor."""
         if not self._started:
             raise Error("worker_pool.spawn_all_workers: call start() first")
         if self._spawned:
@@ -300,6 +320,7 @@ struct WorkerPool:
             # into the spawn loop is miscompiled — threads start at a garbage
             # address; the trampoline address crosses as an Int and is
             # re-derived at the extern call site (see thread_entry.mojo).
+            self._config.stack_reserve_bytes,
         )
         self._spawned = True
     def _ensure_idle_state(mut self) raises:
@@ -323,7 +344,18 @@ struct WorkerPool:
         """Write the worker cells (id = i) + entry cells (fresh when no seed
         was applied; the TLS slots + worker pointer always).  Entry cells
         must be fully written BEFORE pthread_create publishes them
-        (happens-before via pthread_create)."""
+        (happens-before via pthread_create).
+
+        #112 (item 1): ALSO (re)builds the shared peer-pointer array
+        (peers[i] == worker_at(i)) BEFORE the reinit loop — worker cell
+        addresses are stable across a start/join_all cycle (stride-
+        addressed heap, never relocated), so the array only needs
+        refilling, never reallocating, on a restart."""
+        var parr = UnsafePointer[
+            UnsafePointer[Worker, MutAnyOrigin], MutUntrackedOrigin
+        ](unsafe_from_address=Int(self._peers_base))
+        for i in range(self._config.worker_count):
+            parr[i] = self.worker_at(i)
         if not self._seeded:
             for i in range(self._config.worker_count):
                 var e = self.entry_at(i)
@@ -336,8 +368,10 @@ struct WorkerPool:
     def _workers_reinit(mut self, i: Int):
         """(Re)write one worker + entry cell: the Worker's id + the entry
         cell's worker pointer + TLS slots + the A2.6/E6 idle park state
-        (NativeEvent handle + accounting block).  Called on every start() so
-        a restarted pool re-arms a fresh Worker (Runtime reset)."""
+        (NativeEvent handle + accounting block) + the #112 peer registry
+        (pool identity + the shared peer array, E4's steal probe).  Called
+        on every start() so a restarted pool re-arms a fresh Worker
+        (Runtime reset)."""
         var w = self.worker_at(i)
         w[0] = Worker(i)
         var e = self.entry_at(i)
@@ -348,6 +382,11 @@ struct WorkerPool:
         e[].event = self._event.handle()
         e[].acct = self._acct
         w[].set_pool_idle(self._event.handle(), self._acct)
+        var parr = UnsafePointer[
+            UnsafePointer[Worker, MutAnyOrigin], MutUntrackedOrigin
+        ](unsafe_from_address=Int(self._peers_base))
+        w[].set_peers(i, parr, self._config.worker_count)
+
 
     # E2-OWNED seam surface (issue #67 acceptance; issue #68 replaces this
     # with real enqueue once the local queues exist): seed `per_worker` seam
@@ -390,20 +429,39 @@ struct WorkerPool:
 
     def request_shutdown(mut self) raises:
         """Latch the shutdown request (RELEASE store) AND wake every parked
-        idle worker so they exit promptly (A2.6/E6, issue #72 step 4): a
-        parked worker is asleep on the pool NativeEvent, so the latch alone
-        would not wake it until its next 50 ms deadline slice.  We therefore
-        signal the event once per currently-parked sleeper (breadth-one);
-        a just-parked worker that raced the signals is still woken by its
-        deadline-slice backstop.  Idempotent."""
+        idle worker so they exit promptly (A2.6/E6, issue #72 step 4; #112
+        item 5 fix).  A parked worker is asleep on the pool NativeEvent, so
+        the latch alone would not wake it until its next IDLE_PARK_SLICE_NS
+        deadline slice.
+
+        #112 item 5 (pool lifecycle hardening): NativeEvent is STICKY +
+        BREADTH-ONE + COALESCING (vendor/mojito_sys.mojo module header:
+        "N signals while a token is pending deliver one token") — the OLD
+        `for i in range(sleepers): native_event_signal(...)` loop signaled
+        `sleepers` times BACK TO BACK, but every call after the FIRST sees
+        the token already pending and is a silent no-op, so a pool with
+        2+ idle sleepers woke only ONE of them; every OTHER sleeper sat out
+        its own full ~2s IDLE_PARK_SLICE_NS backstop before ever re-
+        checking the latch (measured: t30's single-cycle pool lifecycle
+        took ~2s wall time to shut down; a 60-pool churn run, issue #112's
+        own acceptance stress, took ~2 MINUTES).  The fix: signal once
+        (always — the race where nobody is parked YET still needs the
+        sticky token armed for whoever parks next), then re-signal +
+        yield in a bounded retry loop UNTIL nobody is left parked — each
+        retry gives the previously-woken sleeper a chance to consume its
+        token and leave the parked set before the NEXT signal, so
+        signals no longer coalesce away.  The 2s per-worker backstop is
+        still the ultimate fallback for a straggler this loop's bound
+        does not catch."""
         if not self._started:
             raise Error("worker_pool.request_shutdown: pool not started")
         Atomic[DType.uint8].store[ordering=Ordering.RELEASE](self._latch, 1)
-        var sleepers = acct_parked(self._acct)
-        if sleepers < 1:
-            sleepers = 1
-        for i in range(sleepers):
+        native_event_signal(self._event)
+        var attempts = 0
+        while acct_parked(self._acct) > 0 and attempts < 200:
+            sleep(0.0005)
             native_event_signal(self._event)
+            attempts += 1
 
     def wake_one(mut self) raises:
         """Producer side: signal the pool NativeEvent ONLY IF at least one
@@ -497,6 +555,9 @@ struct WorkerPool:
         if Int(self._acct) > 1:
             c_free(self._acct)
             self._acct = BytePtr(unsafe_from_address=1)
+        if Int(self._peers_base) > 1:
+            c_free(self._peers_base)
+            self._peers_base = BytePtr(unsafe_from_address=1)
         if self._event.alive():
             ms_event_destroy(self._event.handle())
             self._event = NativeEvent()

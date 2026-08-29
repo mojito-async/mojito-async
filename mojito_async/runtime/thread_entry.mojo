@@ -62,6 +62,9 @@ from std.memory import stack_allocation
 from std.time import sleep
 from mojito_async.integration.sys import BytePtr
 from mojito_async.runtime.idle import IDLE_PAIR_ASSERT
+from mojito_async.runtime.runtime import Nil, Runtime
+from mojito_async.runtime.scheduler import fair_scheduler_loop
+from mojito_async.runtime.task_control_block import ResultValue
 from mojito_async.runtime.tls import (
     bind_current_scope,
     bind_current_task,
@@ -165,6 +168,11 @@ struct WorkerEntryCell(ImplicitlyCopyable, ImplicitlyDeletable, Movable):
                   atomics: idle sleepers, announced work, spec §71 counters).
     idle_parks  — how many times THIS worker parked as a sleeper (A2.6/E6;
                   the bench's parked-not-spinning observability, post-join).
+    dispatch_ud — #112 (item 1): the SCHEDULED-loop embedder's dispatcher
+                  userdata (task bodies) — set by the embedder before
+                  spawn, read by pool_worker_loop_scheduled.  Address-1
+                  sentinel while unused; the SEAM-UNIT loop
+                  (pool_worker_loop) never touches this field.
     entry_ok    — TLS read-back at ENTRY matched the Worker cell address.
     unit_ok     — every seam unit saw the stable current_worker value.
     loop_ok/exited — the seam ran cleanly / the worker observed the latch.
@@ -188,6 +196,7 @@ struct WorkerEntryCell(ImplicitlyCopyable, ImplicitlyDeletable, Movable):
     var event: Int             # pool NativeEvent handle (E6 park target)
     var acct: BytePtr          # pool idle-accounting block (E6 atomics)
     var idle_parks: Int        # times this worker parked as a sleeper
+    var dispatch_ud: BytePtr   # #112: scheduled-loop dispatcher userdata
 
     def __init__(out self):
         self.worker_id = 0
@@ -210,6 +219,7 @@ struct WorkerEntryCell(ImplicitlyCopyable, ImplicitlyDeletable, Movable):
         self.event = 0
         self.acct = BytePtr(unsafe_from_address=1)
         self.idle_parks = 0
+        self.dispatch_ud = BytePtr(unsafe_from_address=1)
 
 
 # ---------------------------------------------------------------------------
@@ -444,6 +454,7 @@ def spawn_all_workers(
     key: NativeTlsKey,
     n: Int,
     entry_int: Int,
+    stack_size: Int = 0,
 ) raises:
     for i in range(n):
         var w = UnsafePointer[Worker, MutAnyOrigin](
@@ -453,6 +464,147 @@ def spawn_all_workers(
             unsafe_from_address=Int(entries_base) + i * CELL_ENTRY
         )
         var t = spawn_native_thread(
-            BytePtr(unsafe_from_address=entry_int), e.bitcast[Byte]()
+            BytePtr(unsafe_from_address=entry_int), e.bitcast[Byte](), stack_size
         )
         w[].mark_started(t, key)
+
+
+# ---------------------------------------------------------------------------
+# #112 (item 1) — the REAL scheduler-driving pool worker loop.
+#
+# pool_worker_loop (above) is the A2.1 seam-unit loop: EVERY existing
+# embedder (bench/scheduler_scale_aot phase-1, t30/t35/t41) keeps it
+# UNCHANGED — this is an ADDITIONAL entry point, not a replacement, so no
+# existing driver's behavior changes.  Before this fold NO driver ran
+# scheduler_loop/fair_scheduler_loop ON A POOL THREAD: the queue-drive
+# integration the E2 ("pop this worker's LOCAL runnable queue ->
+# scheduler_loop(...)") and E4 (steal) banners promised was never wired
+# into thread_entry's actual worker-thread body — bench phase-2 and every
+# multi-worker scheduler_loop/fair_scheduler_loop call in the test suite
+# (t34/t34b/t34c/t38_mutex_cross_worker/bench) drives the SAME Worker/
+# Runtime pair from the HARNESS thread, never from the worker's own
+# pthread_create'd OS thread.
+#
+# pool_worker_loop_scheduled closes that gap: TLS bind (identical
+# choreography to mjs_pool_entry_main above) -> drive this worker's
+# Runtime to quiet via fair_scheduler_loop (local -> remote-ready ->
+# injection, spec §21, the caller's statically-known dispatcher/service
+# pair per b2 design decision #4 — never dynamic dispatch) -> on a quiet
+# drain, ONE E4 steal round against the pool's peers (Worker.
+# try_steal_unstarted, issue #70) before idling -> TLS clear at exit.  A
+# successful steal is RE-ENQUEUED onto this worker's own local deque
+# (not run directly) so fair_scheduler_loop's normal first-run/owner-
+# stamping path (scheduler.mojo) handles it uniformly on the next pass.
+#
+# LAYER DISCIPLINE (thread_entry.mojo module header): kept at the SAME
+# two-layer depth pool_worker_loop's own E6 idle body uses (embedder's
+# abi("C") wrapper -> this function -> extern) — the idle-park body below
+# is INLINED (not routed through Worker.park_os_thread_until_event /
+# idle.idle_park_worker), matching pool_worker_loop's own documented
+# workaround for the THIRD-layer UInt-arg mis-lowering bug.  This function
+# itself is NOT abi("C") (RAISES, unlike pool_worker_loop's NON-RAISING
+# discipline): the embedder's own `@export("mjs_pool_entry")` trampoline
+# wraps the call in try/except exactly like the PROVEN t38_mutex_cross_
+# worker_aot pattern (test/stress/t38_mutex_cross_worker_aot.mojo's
+# `t38_worker0`/`t38_worker1`) — a raising, non-abi function called from a
+# try/except inside a SEPARATE abi("C") wrapper, not pool_worker_loop's own
+# in-abi(C)-body try/except constraint.
+#
+# EMBEDDING (mirrors the thread_entry.mojo EMBEDDING RULE at the top): the
+# embedder sets entry_at(i)[].dispatch_ud = <its Scene/context pointer>
+# for EVERY worker BEFORE spawn (mirroring how seed_seam_units sets
+# obs/obs_cap) — the entry cell carries it because `mjs_pool_entry`'s
+# fixed abi("C") single-arg signature (the entry-cell address only, per
+# spawn_native_thread's one `arg` slot) has no room for a second userdata
+# pointer:
+#     @export("mjs_pool_entry")
+#     def mjs_pool_entry(ud: BytePtr) abi("C"):
+#         try:
+#             thread_entry.pool_worker_loop_scheduled[F, S, R](
+#                 ud, my_dispatcher, my_service, budget_k
+#             )
+#         except e:
+#             ud.bitcast[WorkerEntryCell]()[].loop_ok = False
+# ---------------------------------------------------------------------------
+
+def pool_worker_loop_scheduled[
+    F: def(mut Runtime, Int, Int, BytePtr) raises -> Int,
+    S: def(mut Runtime, BytePtr) raises,
+    R: ResultValue = Nil,
+](
+    cell: BytePtr,
+    dispatcher: F,
+    service: S,
+    budget_k: Int = 4,
+) raises:
+    """See the module section banner above.  The dispatcher's own userdata
+    (task bodies) rides `cell`'s `dispatch_ud` field (set by the embedder
+    before spawn) — `cell` itself is this worker's entry cell, the SAME
+    address a driver's abi("C") wrapper receives from pthread_create, per
+    the EMBEDDING RULE."""
+    var c = cell.bitcast[WorkerEntryCell]()
+    var cleared = BytePtr(unsafe_from_address=1)
+    if not bind_current_worker(c[].cw, c[].worker):
+        c[].entry_ok = False
+        c[].exited = True
+        return
+    if not bind_current_task(c[].ct, cleared):
+        c[].entry_ok = False
+        c[].exited = True
+        return
+    if not bind_current_scope(c[].cs, cleared):
+        c[].entry_ok = False
+        c[].exited = True
+        return
+    var back = pthread_getspecific(c[].cw.raw())
+    c[].entry_ok = Int(back) == Int(c[].worker)
+    var w = UnsafePointer[Worker, MutAnyOrigin](unsafe_from_address=Int(c[].worker))
+    var ud = c[].dispatch_ud
+    while True:
+        if Int(Atomic[DType.uint8].load[ordering=Ordering.ACQUIRE](c[].latch)) != 0:
+            break
+        # worker_id is 1-based for the scheduler (0 is the "unpinned"
+        # sentinel, scheduler.mojo) — the pool's own 0-based Worker.id() is
+        # offset by one, matching every other multi-worker driver's
+        # convention (t38's W0_ID/W1_ID = 1/2; bench/scheduler_scale_aot's
+        # `w + 1`).
+        _ = fair_scheduler_loop[F, S, R](
+            w[].runtime()[], dispatcher, ud, service, budget_k, w[].id() + 1
+        )
+        var stolen = w[].try_steal_unstarted[R]()
+        if stolen:
+            var rec = stolen.value()
+            w[].runtime()[].enqueue_local(rec.tcb_addr, rec.task_id)
+            continue
+        # E6 idle park — INLINED (see the layer-discipline note above).
+        var deadline = monotonic_now_ns() + IDLE_PARK_SLICE_NS
+        var acctp = c[].acct
+        _ = Atomic[DType.int64].fetch_add[ordering=Ordering.SEQUENTIAL](
+            _idle_cell(acctp, IDLE_ACCT_IDLE), 1
+        )
+        var have_work = _idle_pending(acctp) > 0
+        if have_work:
+            _ = Atomic[DType.int64].fetch_add[ordering=Ordering.SEQUENTIAL](
+                _idle_cell(acctp, IDLE_ACCT_IDLE), -1
+            )
+            sleep(0.0002)
+            continue
+        _ = Atomic[DType.int64].fetch_add[ordering=Ordering.SEQUENTIAL](
+            _idle_cell(acctp, IDLE_ACCT_PARK), 1
+        )
+        var consumed = native_event_wait_until(c[].event, deadline)
+        _ = Atomic[DType.int64].fetch_add[ordering=Ordering.SEQUENTIAL](
+            _idle_cell(acctp, IDLE_ACCT_IDLE), -1
+        )
+        if consumed:
+            _ = Atomic[DType.int64].fetch_add[ordering=Ordering.SEQUENTIAL](
+                _idle_cell(acctp, IDLE_ACCT_WAKE), 1
+            )
+            if _idle_pending(acctp) == 0:
+                _ = Atomic[DType.int64].fetch_add[ordering=Ordering.SEQUENTIAL](
+                    _idle_cell(acctp, IDLE_ACCT_SPUR), 1
+                )
+        c[].idle_parks += 1
+    var clear_ok = clear_worker_tls(c[].cw, c[].ct, c[].cs)
+    c[].loop_ok = clear_ok
+    c[].exited = True
