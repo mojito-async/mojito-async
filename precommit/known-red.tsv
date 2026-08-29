@@ -6,3 +6,4 @@
 # logged. Remove the row as soon as the implementation turns the test green —
 # an unlisted failure blocks the commit.
 suite	https://github.com/mojito-async/mojito-async/issues/61
+t56_idle_accounting_aot	https://github.com/mojito-async/mojito-async/issues/150	2026-08-29
