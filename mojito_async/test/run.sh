@@ -111,7 +111,32 @@ fi
 # artifact, not a defect in Channel[T]'s guard/two-phase-park fix (issue
 # #128) itself.  Every OTHER AOT driver keeps the default optimization
 # level (the suite is NOT rebuilt at -O 0).
-AOT_O0_DRIVERS="t30_worker_pool_aot t33_steal_aot t34_two_phase_aot t34b_affinity_aot t34c_duplicate_wake_aot t35_idle_sleep_aot t36_fairness_aot t41_idle_timer_wake_aot t24_rendezvous_oneshot_aot t39_reactor_aot t40_io_token_aot t41_tcp_connect_aot t42_tcp_accept_aot t42_io_cancel_deadline_aot t44_tcp_read_write_aot t45_reactor_race_aot t46_reactor_fairness_aot t47_pool_scheduler_aot t49_pool_churn_aot t47_channel_cross_worker_aot"
+# Issue #138 (follow-up review of #112/#128): t38_mutex_cross_worker_aot
+# (A4.1, issue #55) drives the SAME `while not h.is_completed():
+# scheduler_loop(...); sleep(...)` outer spin over a plain (non-atomic)
+# TaskControlBlock completion read across its two real worker OS threads
+# as t47_channel_cross_worker_aot above — it was simply never folded into
+# this list when t47 was.  #128's own sandbox observed the identical
+# symptom class on it (~1-in-15-30 runs: a permanently-stuck WAITING task,
+# SPIN_BUDGET watchdog trip, zero progress for the full spin window) at
+# the default optimization level.  Local verification for this fold: the
+# repro methodology was validated against t47 first (still on this list
+# for the identical reason) — under real host contention (concurrent
+# `mojo build`/CPU-load processes, load average ~3-7 on a 10-core host)
+# t47 built at default -O failed 3/30 runs with genuine internal RED
+# verdicts (not external timeouts); the SAME load level and run count
+# produced 0/441 failures for t38 built at default -O on this particular
+# host/toolchain build (Mojo 1.0.0b2, arm64) — this class of bug is a
+# compiler LICM decision that is known to be sensitive to unrelated IR
+# shape (Mutex[Int] call graph vs Channel[T]'s), so a clean local run does
+# not clear the driver; it shares the EXACT vulnerable source pattern
+# already fixed for t34/t34b/t34c/t35/t47 above, so it gets the same `-O 0`
+# treatment defensively, matching the precedent already set for
+# t30/t33/t36 (added to this list purely by risk-class membership, "even
+# though none had individually tripped a miscompile" at addition time).
+# t38 built at -O 0 stayed clean across the same 30-run moderate-load
+# batch.
+AOT_O0_DRIVERS="t30_worker_pool_aot t33_steal_aot t34_two_phase_aot t34b_affinity_aot t34c_duplicate_wake_aot t35_idle_sleep_aot t36_fairness_aot t41_idle_timer_wake_aot t24_rendezvous_oneshot_aot t39_reactor_aot t40_io_token_aot t41_tcp_connect_aot t42_tcp_accept_aot t42_io_cancel_deadline_aot t44_tcp_read_write_aot t45_reactor_race_aot t46_reactor_fairness_aot t47_pool_scheduler_aot t49_pool_churn_aot t47_channel_cross_worker_aot t38_mutex_cross_worker_aot"
 
 failures=0; reds=0; matrix=""
 
