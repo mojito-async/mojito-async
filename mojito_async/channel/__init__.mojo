@@ -19,3 +19,25 @@ from mojito_async.channel.channel import (
     make_receiver,
     make_sender,
 )
+
+# A5.1 rendezvous + oneshot (issue #89): capacity-0 handoff and
+# single-value/single-delivery channels re-exported from
+# mojito_async.channel.rendezvous / mojito_async.channel.oneshot so
+# consumers import them the same way as the bounded Channel above.
+from mojito_async.channel.rendezvous import (
+    RendezvousChannel,
+    RendezvousReceiver,
+    RendezvousSender,
+    SendWait,
+    make_rendezvous,
+    make_rendezvous_receiver,
+    make_rendezvous_sender,
+)
+from mojito_async.channel.oneshot import (
+    Oneshot,
+    OneshotReceiver,
+    OneshotSender,
+    make_oneshot,
+    make_oneshot_receiver,
+    make_oneshot_sender,
+)
