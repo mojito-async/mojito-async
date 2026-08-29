@@ -1,4 +1,4 @@
-# mojito_async/test/stress/t29_park_cancel_stress.mojo
+# mojito_async/test/stress/t29_park_cancel_stress_aot.mojo
 #
 # A4.7 (issue #65) — park/cancel model+race battery: the cross-cutting
 # volume acceptance for #57's token-aware park/sync waits.
@@ -23,9 +23,22 @@
 # the VOLUME cross-check (exactly-one-winner and no lost wakeup hold at
 # scale, not just for 3 waiters).
 #
+# RENAMED from t29_park_cancel_stress.mojo to t29_park_cancel_stress_aot.mojo
+# (A4 merge, 2026-08-28): each storm's N=600 TCB cells now live in a
+# malloc/free heap pool (see the TCB_STRIDE comment below) instead of
+# `stack_allocation[N, TB]()` — fixing a b2 stack_allocation oversized-
+# array crash the merge onto current main exposed (TaskControlBlock grew
+# to 136 bytes once A3's fields landed, pushing this storm's pool past the
+# threshold, exactly the t32_injection_aot/t11_stress_aot/t33_steal_aot bug
+# class).  The malloc/free `@extern`s are local to this driver, but this
+# driver's own storms still crash under `mojo run` regardless (b2 JIT
+# instability at this task-storm volume, not the modular/modular#6971
+# import-indirection case those other drivers hit) — AOT (`mojo build` +
+# execute) is reliably green, matching run.sh's existing `_aot.mojo` glob
+# convention for drivers that cannot run under the JIT loop.
+#
 # Verdict: exit 0 + "PASS"; any RED prints + raises (exit 1).
 from std.collections import List
-from std.memory import stack_allocation
 from mojito_async.cancellation import CancelFlag, CancellationToken, is_cancellation, make_cancel_flag
 from mojito_async.channel import Channel, Receiver, Sender, make_channel
 from mojito_async.integration.sys import BytePtr, IntResult
@@ -37,12 +50,35 @@ from mojito_async.sync import Mutex, Semaphore
 from mojito_async.task import JoinHandle, claim_running, spawn
 
 
+# A4 merge fix (2026-08-28): each storm's N=600 TCB cells previously lived
+# in ONE `stack_allocation[N, TB]()` pool.  That was safe when this branch
+# was authored against an older main where TaskControlBlock[IntResult] was
+# 112 bytes (600*112 = ~67KB); merging onto the CURRENT main — where A3's
+# owner_worker/owner_runtime/early/claim_epoch fields already grew TB to
+# 136 bytes (600*136 = ~82KB) — tripped the SAME b2 stack_allocation
+# oversized-array compiler bug already documented/fixed in
+# t32_injection_aot.mojo/t11_stress_aot.mojo/t33_steal_aot.mojo (silent
+# corruption / SIGSEGV, not a logic bug in this file).  HEAP-backed
+# (malloc/free), the t32-proven allocation shape, same as those drivers.
+# This driver still crashes under `mojo run` even after the heap-pool fix
+# (see the file-header rename note) — the file is AOT-only (`_aot.mojo`
+# suffix, run.sh's existing convention), not JIT-safe despite the `@extern`
+# being local rather than routed through an imported module.
+@extern("malloc")
+def _c_malloc(size: Int) abi("C") -> BytePtr: ...
+
+
+@extern("free")
+def _c_free(ptr: BytePtr) abi("C"): ...
+
+
 def red(what: String) raises -> None:
     print("T29 park/cancel stress: RED (" + what + ")")
     raise Error(what)
 
 
 comptime TB = TaskControlBlock[IntResult]
+comptime TCB_STRIDE = Int(256)  # generous, >= real TB size (136 currently)
 
 comptime N = Int(600)
 comptime CANCEL_EVERY = Int(3)  # every CANCEL_EVERY-th waiter is cancelled
@@ -155,7 +191,8 @@ def storm_mutex() raises:
     # feasible at this N; the pool gives every cell a fixed address for the
     # whole storm, matching the caller-allocates-the-TCB discipline every
     # other driver in this suite already follows).
-    var tcb_pool = stack_allocation[N, TB]()
+    var cells = _c_malloc(N * TCB_STRIDE)
+    var tcb_pool = UnsafePointer[TB, MutAnyOrigin](unsafe_from_address=Int(cells))
     var handles = List[JoinHandle[IntResult]]()
     for _ in range(N):
         handles.append(JoinHandle[IntResult](UnsafePointer[TB, MutAnyOrigin](unsafe_from_address=1), 0))
@@ -217,6 +254,7 @@ def storm_mutex() raises:
     if rt.pending() != 0:
         red("mtx-storm: runnable queue not quiet after the storm")
 
+    _c_free(cells)
     print("T29 storm A (Mutex, N=" + String(N) + "): PASS")
 
 
@@ -311,7 +349,8 @@ def storm_semaphore() raises:
     var scp = UnsafePointer[SemStorm, MutAnyOrigin](to=sc)
     var ud = scp.bitcast[Byte]()
 
-    var tcb_pool = stack_allocation[N, TB]()
+    var cells_b = _c_malloc(N * TCB_STRIDE)
+    var tcb_pool = UnsafePointer[TB, MutAnyOrigin](unsafe_from_address=Int(cells_b))
     var handles = List[JoinHandle[IntResult]]()
     for _ in range(N):
         handles.append(JoinHandle[IntResult](UnsafePointer[TB, MutAnyOrigin](unsafe_from_address=1), 0))
@@ -363,6 +402,7 @@ def storm_semaphore() raises:
     if rt.pending() != 0:
         red("sem-storm: runnable queue not quiet after the storm")
 
+    _c_free(cells_b)
     print("T29 storm B (Semaphore, N=" + String(N) + "): PASS")
 
 
@@ -468,7 +508,8 @@ def storm_channel() raises:
     var scp = UnsafePointer[ChanStorm, MutAnyOrigin](to=sc)
     var ud = scp.bitcast[Byte]()
 
-    var tcb_pool = stack_allocation[N, TB]()
+    var cells_c = _c_malloc(N * TCB_STRIDE)
+    var tcb_pool = UnsafePointer[TB, MutAnyOrigin](unsafe_from_address=Int(cells_c))
     var handles = List[JoinHandle[IntResult]]()
     for _ in range(N):
         handles.append(JoinHandle[IntResult](UnsafePointer[TB, MutAnyOrigin](unsafe_from_address=1), 0))
@@ -531,6 +572,7 @@ def storm_channel() raises:
     if rt.pending() != 0:
         red("chan-storm: runnable queue not quiet after the storm")
 
+    _c_free(cells_c)
     print("T29 storm C (Channel, N=" + String(N) + "): PASS")
 
 
