@@ -13,30 +13,47 @@
 #     on the single cooperative worker a plain state check is atomic within a
 #     worker slice (no invisible preemption), mirroring the spec's atomic
 #     model without a spur.
-#   - slow path: publish the current task as an embedded FIFO waiter; park it
-#     via the A1.1 `park_current`; the caller is free to drive other
-#     tasks.  A later unlock grants the head waiter (per-waiter GRANT marker
-#     in its embedded WaitNode), re-dispatches it; its lock() claims the
-#     marker and acquires without re-checking the contended state.
+#   - slow path: publish the current task as an embedded FIFO waiter; park
+#     it via the TWO-PHASE `park_prepare`/`park_validate`/`park_commit`
+#     kernel (A4.1, issue #55 — promoted from the single-phase `park_current`
+#     used through A2.5); the caller is free to drive other tasks.  A later
+#     unlock grants the head waiter (per-waiter GRANT marker in its
+#     embedded WaitNode), re-dispatches it; its lock() claims the marker
+#     and acquires without re-checking the contended state.
 #   - unlock: FIFO handoff to ONE waiter (spec §34.3 — no thundering herd).
 #     `_locked` stays held through the handoff window so a new acquirer
 #     cannot steal the lock ahead of the granted waiter.
 #   - FIFO fairness: waiters are handed the lock in arrival order.
 #
-# Lost-wakeup safety: within one dispatcher slice there is no interleaving, so
-# publish+park on the slow path is atomic with respect to other tasks; a
-# release therefore always finds its waiter already parked (WAITING) and the
-# A1.1 `unpark_current` delivers readiness exactly once per epoch.
+# Lost-wakeup safety (A4.1, issue #55): on the A1 single cooperative worker,
+# publish+park was atomic with respect to other tasks — a release always
+# found its waiter already parked.  On the A2 M:N scheduler a cross-worker
+# unlock() can race into the PARKING window BETWEEN `park_prepare` and the
+# WAITING commit; the single-phase `park_current` never consulted the
+# early-wake latch there, so that race silently dropped the wake.  The
+# two-phase kernel closes it: `park_validate` re-checks the latch before
+# `park_commit` decides WAITING vs. an immediate RUNNABLE unwind, so the
+# grant is never lost regardless of which worker's unlock() wins the race.
+# `unpark_current` still delivers readiness exactly once per epoch and
+# routes to the OWNER worker's remote-ready queue (spec §19.2).
 #
 # Mojo 1.0.0b2 (def-only) constraints honored: `def` only; generic methods
 # parameterized on the caller's ResultValue R; module-level factories; the
 # slow-path waiter FIFO is a Deque of (addr,id) with no per-suspension
 # allocation on the fast path.
 from std.collections import Deque
+from mojito_async.runtime.queue import SpinLock
 from mojito_async.runtime.runtime import Runtime
 from mojito_async.runtime.task_control_block import ResultValue, TaskControlBlock
-from mojito_async.task import JoinHandle
-from mojito_async.runtime.park import park_current, unpark_current, raise_if_cancel_wake, wake_cancelled
+from mojito_async.task import JoinHandle, claim_running
+from mojito_async.runtime.park import (
+    park_commit,
+    park_prepare,
+    park_validate,
+    unpark_current,
+    raise_if_cancel_wake,
+    wake_cancelled,
+)
 from mojito_async.cancellation import CancellationToken
 
 
@@ -71,10 +88,24 @@ def _remove_at_index(mut q: Deque[Int], idx: Int) raises:
 # Mutex[T]
 # ---------------------------------------------------------------------------
 
-struct Mutex[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable](Movable, ImplicitlyDeletable):
+struct Mutex[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable]:
     """Task-aware mutex owning + guarding a value of type `T` (spec §34).
 
     State:
+      _guard  — SpinLock (A4.1, issue #55) serializing every read/write of
+                `_locked` and the waiter FIFO: on the A2 M:N scheduler two
+                REAL worker OS threads can call try_lock()/lock()/unlock()
+                on the SAME Mutex concurrently, and a plain check-then-set
+                on `_locked` (correct only on the A1 single cooperative
+                worker, where no interleaving happens inside a slice) let
+                two callers both observe UNLOCKED and both set LOCKED — an
+                undetected double acquisition (empirically reproduced by
+                t38's cross-worker stress: a corrupted final counter with
+                zero hangs, zero raises).  Same SpinLock as queue.mojo's
+                LocalDeque/RemoteReadyQueue guard; this struct therefore
+                drops the Movable/ImplicitlyDeletable conformances the
+                SpinLock's Atomic cannot support (mirrors Runtime/Worker,
+                which embed the identical guard for the identical reason).
       _locked — UNLOCKED(False) / LOCKED(True); a handoff keeps it True while
                 the granted waiter is about to claim.
       _value  — the protected value.
@@ -84,15 +115,19 @@ struct Mutex[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable](Movable, Imp
     lock sets when it hands ownership over in unlock(); the resumed task's
     lock() claims (clears) it and returns True.  The marker is per-waiter, so
     several waiters can be granted in separate unlock calls without a shared
-    slot.
+    slot.  The marker itself needs no guard: only the resumed owner-task
+    ever reads/clears it, strictly after the wake claim that resumed it
+    (happens-before via the SAME claim the guard below serializes).
     """
 
+    var _guard: SpinLock
     var _locked: Bool
     var _value: Self.T
     var _w_tcb: Deque[Int]
     var _w_id: Deque[Int]
 
     def __init__(out self, initial: Self.T):
+        self._guard = SpinLock()
         self._locked = False
         self._value = initial
         self._w_tcb = Deque[Int]()
@@ -104,22 +139,35 @@ struct Mutex[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable](Movable, Imp
         """Mutable access to the protected value (authorized while held)."""
         return UnsafePointer[Self.T, MutAnyOrigin](to=self._value)
 
-    def is_locked(self) -> Bool:
-        return self._locked
+    def is_locked(mut self) -> Bool:
+        self._guard.lock()
+        var v = self._locked
+        self._guard.unlock()
+        return v
 
-    def waiter_count(self) -> Int:
-        return len(self._w_tcb)
+    def waiter_count(mut self) -> Int:
+        self._guard.lock()
+        var n = len(self._w_tcb)
+        self._guard.unlock()
+        return n
 
     # --- fast path (spec §34.1) --------------------------------------------
 
     def try_lock(mut self) -> Bool:
-        """Uncontended acquire: CAS UNLOCKED -> LOCKED.
-
-        Single cooperative worker => a plain state check is atomic within a
-        slice.  No allocation, no scheduler lookup, no park."""
+        """Uncontended acquire: GUARDED compare-and-set UNLOCKED -> LOCKED
+        (A4.1, issue #55).  A plain check-then-set was correct only on the
+        A1 single cooperative worker (no interleaving inside a slice); on
+        the A2 M:N scheduler two REAL worker OS threads calling try_lock()
+        concurrently could both observe UNLOCKED and both set LOCKED — an
+        undetected double acquisition, empirically reproduced by t38's
+        cross-worker stress before this fix.  No allocation, no scheduler
+        lookup, no park."""
+        self._guard.lock()
         if self._locked:
+            self._guard.unlock()
             return False
         self._locked = True
+        self._guard.unlock()
         return True
 
     # --- lock / slow path (spec §34.2) --------------------------------------
@@ -129,24 +177,59 @@ struct Mutex[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable](Movable, Imp
     ) raises -> Bool:
         """Task-aware acquire.  Returns True when THIS call owns the lock.
 
-        Fast path returns immediately.  On contention: publish the caller as
-        an embedded FIFO waiter, park it via the A1.1 `park_current`, and
-        return False — the caller's dispatcher is free to drive other tasks.
-        A later unlock grants the head waiter, which is re-dispatched, enters
-        lock() again, claims its GRANT marker and returns True.
+        Fast path returns immediately.  On contention: publish the caller
+        as an embedded FIFO waiter, then park via the TWO-PHASE PREPARE/
+        VALIDATE/COMMIT kernel (A2.5, issue #71) — NOT the single-phase
+        `park_current` — so a cross-worker `unlock()` that races into the
+        PARKING window is never lost (A4.1, issue #55: `park_current` never
+        consults the early-wake latch, so a foreign release landing between
+        PARKING and the WAITING commit was silently dropped).  VALIDATE
+        re-checks the latch BEFORE committing to WAITING; a grant delivered
+        inside that window unwinds PARKING -> RUNNABLE in THIS SAME call
+        (the task never sleeps) and this call re-claims RUNNING and
+        consumes the grant marker `unlock()` already stamped.  Returns
+        False only when the park genuinely commits to WAITING — the
+        caller's dispatcher is then free to drive other tasks.  A later
+        unlock grants the head waiter, which is re-dispatched, enters
+        lock() again, claims its GRANT marker (step 1) and returns True.
         """
-        # 1) claim an outstanding grant handed over by a prior unlock()
+        # 1) claim an outstanding grant handed over by a prior unlock() —
+        # only the resumed owner-task itself ever reaches this after being
+        # granted (happens-before via the wake claim that resumed it), so
+        # no guard is needed for this read/clear.
         var dbg_marker = h.tcb()[].wait_node()[].next()
         if dbg_marker == WAITER_GRANTED:
             h.tcb()[].wait_node()[].set_next(0)
             return True
-        # 2) fast path
-        if self.try_lock():
+        # 2) fast path / 3) publish as a FIFO waiter — ONE guarded critical
+        # section (A4.1, issue #55): checking `_locked` and, on contention,
+        # appending to the FIFO must be atomic with respect to a concurrent
+        # unlock() on another worker — two separately-guarded calls here
+        # would let a release land BETWEEN them and pop an empty FIFO,
+        # missing this waiter entirely (a genuine lost wakeup distinct from
+        # the PARKING-window one below).
+        self._guard.lock()
+        if not self._locked:
+            self._locked = True
+            self._guard.unlock()
             return True
-        # 3) contended slow path
         self._w_tcb.append(Int(h.tcb()))
         self._w_id.append(h.id())
-        park_current(rt, h)
+        self._guard.unlock()
+        # two-phase park (issue #55): NOT the single-phase `park_current`,
+        # exactly as documented above.
+        park_prepare(h)
+        if park_validate(h):
+            # A foreign unlock() already handed off INSIDE the PREPARE/
+            # COMMIT window (A0-T11): the grant marker is already stamped,
+            # this waiter was already popped off the FIFO.  Close the
+            # window (unwinds to RUNNABLE without ever entering WAITING)
+            # and re-claim RUNNING — this call never actually suspended.
+            park_commit(h)
+            claim_running(h)
+            h.tcb()[].wait_node()[].set_next(0)
+            return True
+        park_commit(h)
         return False
 
     # --- unlock / handoff (spec §34.3) -------------------------------------
@@ -156,12 +239,17 @@ struct Mutex[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable](Movable, Imp
 
         True when ownership was handed off; False when released cold.  The
         lock STAYS held across the handoff window so a new acquirer cannot
-        steal it before the granted waiter runs and claims (no herd)."""
+        steal it before the granted waiter runs and claims (no herd).  The
+        `_locked`/FIFO check-and-pop is ONE guarded critical section (A4.1,
+        issue #55) — see lock()'s matching section for why."""
+        self._guard.lock()
         if len(self._w_tcb) == 0:
             self._locked = False
+            self._guard.unlock()
             return False
         var tcb = self._w_tcb.popleft()
         var tid = self._w_id.popleft()
+        self._guard.unlock()
         var hw = _waiter_handle[R](tcb, tid)
         hw.tcb()[].wait_node()[].set_next(WAITER_GRANTED)
         unpark_current(rt, hw)
@@ -203,16 +291,24 @@ struct Mutex[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable](Movable, Imp
         True iff THIS call found + removed + woke the waiter (it won the
         race); False when the id was never queued or a concurrent `unlock`
         already popped it (readiness won — no ghost entry, no double
-        wake)."""
+        wake).  The FIFO search + removal is ONE guarded critical section
+        (A4.1, issue #55, extended to this A4.3 path during the A4 merge):
+        `_w_tcb`/`_w_id` are shared mutable state a concurrent `unlock()`
+        on another worker can pop from at the same instant; scanning/
+        splicing them unguarded would race the same Deque storage `unlock`
+        already serializes through `self._guard`."""
+        self._guard.lock()
         var idx = -1
         for i in range(len(self._w_id)):
             if self._w_id[i] == h.id():
                 idx = i
                 break
         if idx == -1:
+            self._guard.unlock()
             return False
         _remove_at_index(self._w_tcb, idx)
         _remove_at_index(self._w_id, idx)
+        self._guard.unlock()
         wake_cancelled(rt, h)
         return True
 

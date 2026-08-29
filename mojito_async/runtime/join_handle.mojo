@@ -22,7 +22,21 @@ from mojito_async.runtime.task_control_block import ResultValue, TaskControlBloc
 # ---------------------------------------------------------------------------
 
 struct SuspendReason:
-    """Why a task waits — stamped on the embedded WaitNode.  Open set."""
+    """Why a task waits — stamped on the embedded WaitNode.  Open set.
+
+    A4.4 (issue #58) — DOUBLE DUTY, documented: `_reason` also carries the
+    WINNING WAKE CAUSE once a park is claimed.  Nothing in this tree reads
+    `WaitNode.reason()` as "why parked" after the park commits (grep-
+    verified: only `set_reason` call sites exist pre-#58), so overloading
+    the same cell for "why WOKE" costs nothing and needs no new field:
+    `unpark_current`'s optional `win_reason` (park.mojo) stamps one of
+    READY/CANCEL/TIMER/CLOSED into `_reason` ATOMICALLY with the claim
+    (inside the same owner remote-queue guard that serializes wake_claim),
+    so a losing racer's label can never clobber the winner's — the top-
+    level RUNNABLE fast-return in unpark_current makes every losing call a
+    complete no-op before it reaches the stamp.  CANCEL and TIMER already
+    existed (reused as winner labels); READY/CLOSED are new.
+    """
 
     comptime NONE = Int(0)
     comptime YIELD = Int(1)
@@ -30,6 +44,14 @@ struct SuspendReason:
     comptime PARK = Int(3)
     comptime CANCEL = Int(4)
     comptime TIMER = Int(5)
+    comptime READY = Int(6)
+    comptime CLOSED = Int(7)
+    # Sentinel for `unpark_current`'s `win_reason` default: "do not stamp a
+    # winner reason" — every EXISTING wake producer (mutex/semaphore/
+    # channel/timer-service) keeps its call sites unchanged and its
+    # WaitNode's `_reason` cell untouched by the wake leg (issue #58 is
+    # strictly additive: no default-path behavior changes).
+    comptime UNCHANGED = Int(-1)
 
 
 # ---------------------------------------------------------------------------
