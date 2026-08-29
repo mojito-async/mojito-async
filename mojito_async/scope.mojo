@@ -430,13 +430,24 @@ struct Scope(Movable, ImplicitlyDeletable):
         CANCELLED scope (ScopeCancelled, issue #54), and refuses a child
         that already names a DIFFERENT scope.  Work-first: spawn only
         REGISTERS the child as runnable; its first entry happens when
-        execute() or a scheduler trampoline reaches it."""
+        execute() or a scheduler trampoline reaches it.
+
+        A2.2/#68 integration fix (found landing this A3 wave, 2026-08-28):
+        enqueues via `rt.enqueue_local()` (THIS worker's local deque, owner
+        push_back — LIFO spawn locality), matching `mojito_async.task.spawn`
+        exactly.  The old `rt.enqueue()` call this used to make targets the
+        A1-era `_ready` FIFO, which the current post-A2 `scheduler_loop`
+        (runtime/scheduler.mojo) never drains (it only pops `_local`/
+        `_remote`) — spawning through a scope silently orphaned every task
+        on any post-A2 scheduler drive; `_ready` was a dead letter box.  The
+        #61/#54/#63/#64 branches never caught this because they were each
+        developed and tested against a pre-A2 scheduler.mojo snapshot."""
         if rt.is_shutdown():
             raise Error("mojito_async.scope.spawn: runtime is shut down")
         tcb[].transition(TaskControlBlock.RUNNABLE)
         var id = rt.next_id()
         _ = self.register[T](tcb, id, parent_id)
-        rt.enqueue(Int(tcb), id)
+        rt.enqueue_local(Int(tcb), id)
         return JoinHandle[T](tcb, id)
 
     # --- typed boundary cast (comptime-tag-checked) ------------------------
