@@ -77,21 +77,41 @@ fi
 # six-scenario battery incl. write_all/deadline/cancel/close paths); same
 # `-O 0` fix.  A7.7 (issue #81): t45_reactor_race_aot hits the SAME crash
 # for the same reason (real Reactor + the full runtime/park/timer
-# dependency graph in one driver) — also built at `-O 0`.  Issue #128:
-# t47_channel_cross_worker_aot hits the SAME class of bug t34/t34b/t34c/t35
-# document above (NOT the reactor-dependency-graph compiler crash, the
-# cross-thread-handshake one): its two REAL worker OS threads spin on
-# `while not h.is_completed(): scheduler_loop(...); sleep(...)` waiting for
-# a cross-worker wake delivered via a plain (non-atomic) TaskControlBlock
-# state field — at the default optimization level the compiler can hoist
-# that plain read out of the loop (never re-reading the OTHER thread's
-# write), producing a driver-side false "lost wakeup" (empirically: 100%
-# reproducible within a handful of iterations at default -O, 0/30+ at
-# `-O 0`) that is a MISCOMPILATION artifact, not a defect in Channel[T]'s
-# guard/two-phase-park fix (issue #128) itself.  Every OTHER
-# AOT driver keeps the default optimization level (the suite is NOT
-# rebuilt at -O 0).
-AOT_O0_DRIVERS="t34_two_phase_aot t34b_affinity_aot t34c_duplicate_wake_aot t35_idle_sleep_aot t24_rendezvous_oneshot_aot t39_reactor_aot t40_io_token_aot t41_tcp_connect_aot t42_tcp_accept_aot t42_io_cancel_deadline_aot t44_tcp_read_write_aot t45_reactor_race_aot t46_reactor_fairness_aot t47_channel_cross_worker_aot"
+# dependency graph in one driver) — also built at `-O 0`.
+#
+# #112 (item 10, EPIC #2 review consensus): "rebuild t30/t33/t34/t35/t36/
+# bench at -O 0 (b2 -O3 miscompiles cross-thread code)".  t34/t34b/t34c/
+# t35 were already on this list; t30/t33/t36 join them here (all four are
+# real 2+-OS-thread pool/steal/fairness scheduler drivers — the exact class
+# the review flagged, even though none had individually tripped a
+# miscompile yet).  bench/scheduler_scale_aot.mojo already builds at -O 0
+# unconditionally (bench/run.sh's own hardcoded flag, H4 repeatability).
+# t47_pool_scheduler_aot (issue #112 item 1) and t49_pool_churn_aot
+# (item 5) are NEW drivers this same fold adds: both hit the IDENTICAL
+# default-optimization compiler CRASH (not a runtime bug — `mojo build`
+# itself segfaults) as t24/t39/t40/t41/t42/t44/t45 once compiled alongside
+# their full WorkerPool/scheduler dependency graph — `-O 0` is REQUIRED
+# for them to build at all, not merely a defensive choice.  Discovered the
+# SAME way: this fold's growth of idle.mojo/thread_entry.mojo/worker.mojo/
+# worker_pool.mojo/runtime.mojo pushed t41_idle_timer_wake_aot (issue #86)
+# over the same default-optimization crash threshold (it built fine before
+# this fold; a fresh `mojo build` segfault, not a runtime bug, confirmed
+# `-O 0` fixes it) — every OTHER driver that imports the SAME modules
+# keeps the default optimization level (they stayed under the threshold).
+# Issue #128: t47_channel_cross_worker_aot hits the SAME class of bug
+# t34/t34b/t34c/t35 document above (NOT the pool/scheduler-dependency-
+# graph compiler crash the previous paragraph describes): its two REAL
+# worker OS threads spin on `while not h.is_completed(): scheduler_loop(
+# ...); sleep(...)` waiting for a cross-worker wake delivered via a plain
+# (non-atomic) TaskControlBlock state field — at the default optimization
+# level the compiler can hoist that plain read out of the loop (never
+# re-reading the OTHER thread's write), producing a driver-side false
+# "lost wakeup" (empirically: 100% reproducible within a handful of
+# iterations at default -O, 0/30+ at `-O 0`) that is a MISCOMPILATION
+# artifact, not a defect in Channel[T]'s guard/two-phase-park fix (issue
+# #128) itself.  Every OTHER AOT driver keeps the default optimization
+# level (the suite is NOT rebuilt at -O 0).
+AOT_O0_DRIVERS="t30_worker_pool_aot t33_steal_aot t34_two_phase_aot t34b_affinity_aot t34c_duplicate_wake_aot t35_idle_sleep_aot t36_fairness_aot t41_idle_timer_wake_aot t24_rendezvous_oneshot_aot t39_reactor_aot t40_io_token_aot t41_tcp_connect_aot t42_tcp_accept_aot t42_io_cancel_deadline_aot t44_tcp_read_write_aot t45_reactor_race_aot t46_reactor_fairness_aot t47_pool_scheduler_aot t49_pool_churn_aot t47_channel_cross_worker_aot"
 
 failures=0; reds=0; matrix=""
 

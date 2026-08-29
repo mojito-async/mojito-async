@@ -257,6 +257,38 @@ def pthread_setspecific(key: UInt, value: BytePtr) abi("C") -> Int32:
 
 
 # ---------------------------------------------------------------------------
+# #112 (item 6): pthread_attr_t plumbing — RuntimeConfig.stack_reserve_bytes
+# reaches pthread_create as a real reserved-stack size instead of being
+# validated and then silently dropped (every worker thread spawned with
+# pthread's DEFAULT attrs regardless of config).  PTHREAD_ATTR_BYTES is a
+# generous, rounded scratch size (the same "round + headroom, not a brittle
+# exact sizeof" convention as thread_entry.mojo's CELL_WORKER/CELL_ENTRY):
+# Darwin's opaque pthread_attr_t is 64 bytes (8-byte __sig + 56-byte
+# __opaque), glibc's is 56 bytes; 128 covers either with headroom.
+# `stack_initial_commit_bytes` (RuntimeConfig's OTHER stack knob) has no
+# portable pthread_attr_* equivalent (eager page-commit is an OS-specific
+# mmap flag, not a pthread attribute) — it stays advisory-only, as
+# config.mojo's own doc already frames it ("0 = commit on demand").
+# ---------------------------------------------------------------------------
+comptime PTHREAD_ATTR_BYTES = Int(128)
+
+
+@extern("pthread_attr_init")
+def pthread_attr_init(attr: BytePtr) abi("C") -> Int32:
+    ...
+
+
+@extern("pthread_attr_setstacksize")
+def pthread_attr_setstacksize(attr: BytePtr, stacksize: UInt) abi("C") -> Int32:
+    ...
+
+
+@extern("pthread_attr_destroy")
+def pthread_attr_destroy(attr: BytePtr) abi("C") -> Int32:
+    ...
+
+
+# ---------------------------------------------------------------------------
 # NativeThread — one OS thread handle (pthread_t on LP64 Darwin; the A2.1
 # worker pool's worker carrier).  Value type: holding a handle does not own
 # the thread; join_native_thread is the only release path (like
@@ -281,17 +313,51 @@ def make_native_thread() -> NativeThread:
     return NativeThread()
 
 
-def spawn_native_thread(entry: BytePtr, arg: BytePtr) raises -> NativeThread:
-    """Create one OS thread running entry(arg) with default pthread attrs.
+def spawn_native_thread(
+    entry: BytePtr, arg: BytePtr, stack_size: Int = 0
+) raises -> NativeThread:
+    """Create one OS thread running entry(arg).
 
     `entry` is the C-ABI code address of an @export'd abi("C") def obtained
     via entry_pointer[...] (the S2.2 adrp/add recipe).  Raises when
     pthread_create fails (thread limit / resource exhaustion); the caller
     stays the thread's creator and MUST eventually join it.
-    """
+
+    `stack_size` (issue #112 item 6): 0 (default) keeps the ORIGINAL
+    default-pthread-attrs behavior — every existing caller (bench,
+    t35/t41's raw spawns, the pool's non-worker-pool test paths) is
+    BYTE-FOR-BYTE unaffected.  A positive value builds a scratch
+    pthread_attr_t (PTHREAD_ATTR_BYTES above), sets its stack size via
+    pthread_attr_setstacksize, and passes that attr's ADDRESS through
+    pthread_create's existing `attr: UInt` slot — the same NULL-CAPABLE
+    raw-value convention this module's other pthread_* calls already use
+    for a maybe-pointer C parameter (module header); the attr is
+    destroyed (POSIX allows this immediately after pthread_create returns
+    — the implementation copies what it needs) and freed before this
+    function returns either way.  worker_pool.mojo's spawn_all_workers is
+    the one production caller that passes RuntimeConfig.stack_reserve_bytes
+    here (M6, issue #112 item 6: the config's validated stack knob used to
+    be validated then silently dropped)."""
     var t = NativeThread()
     var tp = UnsafePointer[UInt, MutAnyOrigin](to=t._tid)
-    var rc = pthread_create(tp, 0, entry, arg)
+    if stack_size <= 0:
+        var rc = pthread_create(tp, 0, entry, arg)
+        if rc != 0:
+            raise Error(String(rc))
+        return t
+    var attr = c_malloc(PTHREAD_ATTR_BYTES)
+    var irc = pthread_attr_init(attr)
+    if irc != 0:
+        c_free(attr)
+        raise Error(String(irc))
+    var src = pthread_attr_setstacksize(attr, UInt(stack_size))
+    if src != 0:
+        _ = pthread_attr_destroy(attr)
+        c_free(attr)
+        raise Error(String(src))
+    var rc = pthread_create(tp, UInt(Int(attr)), entry, arg)
+    _ = pthread_attr_destroy(attr)
+    c_free(attr)
     if rc != 0:
         # NOTE (b2 1.0.0b2 #compiler-crash, probed in this lane): mixing a
         # const String literal + a dynamic String(rc) in one concatenation

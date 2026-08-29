@@ -22,17 +22,37 @@
 #     deadline variant (sleep_until).  Deadline is the A1.1 ms Deadline;
 #     mapped onto the ns clock by the lane's tick convention.
 #
-# The wake path is the single canonical park/wake (issue #39): arm FIRST
-# (publish the timer), THEN park — under the single cooperative worker there
-# is no concurrent service pass inside a task body, so the arm-before-park
-# order removes any park/expiry race for the unit surface.
+# The wake path is the single canonical park/wake (issue #39).  Arm FIRST
+# (publish the timer under the heap's own guard), THEN park — mirroring the
+# ordering mutex.lock()/semaphore.acquire() already use (publish as a
+# potential waiter BEFORE parking).
+#
+# TWO-PHASE PARK (#112, issue #112 item 3 — migrated from single-phase
+# `park_current`): worker_timer.mojo's cross-worker deadline delivery
+# (A6.3, issue #86: `arm_remote`/`deliver_deadline`, routed through the
+# SAME owner_worker stamp `unpark_current`/`_owner_rt` use) means a timer
+# armed here can expire and wake this task from ANOTHER worker while this
+# call is still between `heap.arm` and the WAITING commit — the identical
+# lost-wakeup window A4.1 (issue #55) closed for Mutex/Semaphore: a single-
+# phase `park_current` never consults the early-wake latch, so a foreign
+# expiry landing in that window would silently park the task FOREVER (the
+# timer already fired and will never fire again).  `park_prepare` +
+# `park_validate` + `park_commit` close it exactly like mutex.lock()'s
+# slow path: a validate hit unwinds PARKING -> RUNNABLE in THIS SAME call
+# (the task never actually slept) and `claim_running` re-establishes
+# RUNNING before the caller's own code resumes past the sleep — a sleep
+# whose deadline the very act of arming it made immediately due (or that
+# raced a foreign delivery) returns exactly as if it had already elapsed,
+# instead of losing the wakeup.  On the A1 single worker (owner_runtime
+# == 0) this is a no-op fast path identical to the old single-phase
+# behavior (park.mojo's module header: "no cross-worker interleaving").
 from mojito_async.runtime.runtime import Runtime
 from mojito_async.runtime.task_control_block import ResultValue
-from mojito_async.task import JoinHandle, SuspendReason
+from mojito_async.task import JoinHandle, SuspendReason, claim_running
 from mojito_async.time.clock import MonotonicClock
 from mojito_async.time.deadline import Deadline, Duration
 from mojito_async.time.timer_heap import TimerHeap
-from mojito_async.runtime.park import park_current
+from mojito_async.runtime.park import park_commit, park_prepare, park_validate
 
 
 def sleep(duration: Duration) raises:
@@ -70,14 +90,21 @@ def sleep_current[R: ResultValue](
 ) raises:
     """Park the CURRENT task for `duration` (monotonic ns) via a timer.
 
-    Arms the heap (deadline = clock.now() + duration.ticks()) and parks
-    through the canonical path (RUNNING -> PARKING -> WAITING, reason TIMER).
-    The task is woken by the scheduler-loop servicing hook when the deadline
-    is due.  No OS-thread block; no per-suspend allocation beyond the heap's
-    owned storage."""
+    Arms the heap (deadline = clock.now() + duration.ticks()) then parks
+    through the TWO-PHASE kernel (module header, issue #112 item 3):
+    PARKING -> WAITING (reason TIMER) normally, or PARKING -> RUNNABLE in
+    THIS SAME call if a cross-worker deadline delivery already landed in
+    the window.  The task is woken by the scheduler-loop servicing hook
+    (or resumes immediately, in the race case) — no OS-thread block; no
+    per-suspend allocation beyond the heap's owned storage."""
     var deadline = clock.now() + duration.ticks()
     _ = heap.arm(h.id(), Int(h.tcb()), deadline)
-    park_current(rt, h, SuspendReason.TIMER)
+    park_prepare(h)
+    if park_validate(h):
+        park_commit(h)
+        claim_running(h)
+        return
+    park_commit(h, SuspendReason.TIMER)
 
 
 def sleep_until_current[R: ResultValue](
@@ -89,7 +116,8 @@ def sleep_until_current[R: ResultValue](
 ) raises:
     """Park the CURRENT task until the absolute monotonic `deadline` (A1.1
     ms Deadline, mapped onto the ns clock by tick*1000000).  No OS-thread
-    block; timer-based park like sleep_current."""
+    block; two-phase timer-based park like sleep_current (module header,
+    issue #112 item 3)."""
     var ticks = UInt64(deadline.at_ms()) * 1000000
     var now = clock.now()
     if ticks <= now:
@@ -97,4 +125,9 @@ def sleep_until_current[R: ResultValue](
         # hook still wakes this task through the canonical path (no spin).
         ticks = now
     _ = heap.arm(h.id(), Int(h.tcb()), ticks)
-    park_current(rt, h, SuspendReason.TIMER)
+    park_prepare(h)
+    if park_validate(h):
+        park_commit(h)
+        claim_running(h)
+        return
+    park_commit(h, SuspendReason.TIMER)
