@@ -241,6 +241,35 @@ def timeout_branch(
     return SelectBranch(SelectBranch.DEADLINE, 0, 0, ticks, Int(heap))
 
 
+# Sentinel tick value a `now_ticks` reading can never reach (issue #85 gap
+# fill): the largest representable Int, mirroring timer_heap.mojo's
+# NO_DEADLINE (UInt64 max) one field-width down since SelectBranch.
+# deadline_ticks is a plain (signed) Int.
+comptime NEVER_TICKS = Int(0x7FFF_FFFF_FFFF_FFFF)
+
+
+def never() -> SelectBranch:
+    """A DEADLINE branch that can NEVER resolve (issue #85 deliverable: "a
+    `never()` branch never fires and only ever loses"; used for
+    channel-only selects where no deadline applies, e.g. a socket-only
+    wait with an optional timeout the caller sometimes omits).
+
+    `heap_addr` stays 0 (never armed — mirrors the bare #92 ticks-only
+    `deadline_branch(deadline_ticks)` descriptor exactly, so `select()`
+    never touches the heap for this branch: the `b.heap_addr != 0` guard
+    in both the arm site and `_cancel_armed_timer` already skips it) and
+    `deadline_ticks` is NEVER_TICKS, so `classify_branch`'s `now_ticks >=
+    branch.deadline_ticks` test can never be satisfied by any real or
+    virtual clock reading in this codebase's lifetime.  The branch
+    therefore always classifies BLOCKED: `select()` registers it as a
+    genuinely blockable branch (satisfying the "at least one
+    blockable/claimable branch" well-formedness guard even when a
+    `never()` branch sits alongside a single live channel branch) but it
+    can never itself become the winner — the select still completes via
+    another branch, exactly as issue #85 requires."""
+    return SelectBranch(SelectBranch.DEADLINE, 0, 0, NEVER_TICKS)
+
+
 # ---------------------------------------------------------------------------
 # Readiness classification (issue #93 precedence table)
 # ---------------------------------------------------------------------------
@@ -507,16 +536,36 @@ def _unregister_others[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable](
 
 
 def _cancel_armed_timer(
-    branches: List[SelectBranch], mut state: SelectState, task_id: Int
+    branches: List[SelectBranch],
+    mut state: SelectState,
+    task_id: Int,
+    closed_recv_win: Bool = False,
 ) raises:
-    """Timer/data cancellation symmetry (issue #91): once ANY branch is
-    claimed, drop a still-armed deadline timer from the heap so a channel
-    winner never leaves a stale entry behind — the reverse direction (a
-    deadline winner leaving channel registrations behind) is already
-    covered by `_unregister_others`.  No-op when no timer was armed this
-    cycle, or when the DEADLINE branch itself won and the timer service
-    already popped its own entry (`cancel_token` on a missing entry is a
-    documented no-op, `time/timer_heap.mojo`)."""
+    """Timer/data cancellation symmetry (issue #91), WITH the issue #85
+    close exception: once a branch delivering a REAL operation (data
+    recv'd, data sent, or the DEADLINE branch itself) is claimed, drop a
+    still-armed deadline timer from the heap so a channel winner never
+    leaves a stale entry behind — the reverse direction (a deadline winner
+    leaving channel registrations behind) is already covered by
+    `_unregister_others`.
+
+    EXCEPTION (issue #85 "close + timer semantics"): a RECV branch winning
+    by observing CLOSE-AND-EMPTY (`closed_recv_win=True`) is NOT a real
+    operation completing — it must "fail only the channel branch" while
+    "the timer keeps its own lifetime" (no implicit cancellation just
+    because the channel closed, spec §38/39).  Callers pass
+    `closed_recv_win=out.kind == SelectBranch.RECV and out.closed`; every
+    other outcome shape cancels exactly as issue #91 specifies.  A timer
+    left armed here fires no duplicate wake later: `service_timers` only
+    resumes a task still WAITING, and this task already completed via the
+    close winner (`time/timer_service.mojo`).
+
+    No-op when no timer was armed this cycle, or when the DEADLINE branch
+    itself won and the timer service already popped its own entry
+    (`cancel_token` on a missing entry is a documented no-op,
+    `time/timer_heap.mojo`)."""
+    if closed_recv_win:
+        return
     if not state._timer_armed:
         return
     for i in range(len(branches)):
@@ -553,7 +602,9 @@ def select_fast[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable, R: Result
         return SelectOutcome[T]()
     var out = _claim_at[T](branches, idx)
     _unregister_others[T](branches, h.id(), idx)
-    _cancel_armed_timer(branches, state, h.id())
+    _cancel_armed_timer(
+        branches, state, h.id(), out.kind == SelectBranch.RECV and out.closed
+    )
     state.winner = idx
     return out^
 
@@ -595,7 +646,9 @@ def select[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable, R: ResultValue
     if idx != -1:
         var out = _claim_at[T](branches, idx)
         _unregister_others[T](branches, h.id(), idx)
-        _cancel_armed_timer(branches, state, h.id())
+        _cancel_armed_timer(
+            branches, state, h.id(), out.kind == SelectBranch.RECV and out.closed
+        )
         state.winner = idx
         return out^
     var any_blocked = False
