@@ -9,6 +9,22 @@
 # (NEW/RUNNABLE/RUNNING/PARKING/WAITING/COMPLETED/CANCELLED) so sibling lanes
 # and the A0 suite stay coherent.
 #
+# A3.2 (#42 decision, issue #61) — UNIFORM-PREFIX RELAYOUT.  The R-free
+# bookkeeping moves into the non-generic `TCB_Prefix` struct (state,
+# generation, wait node, consume-once flag, preserved-failure stamp, parent
+# and scope links) and `TaskControlBlock[T]` becomes
+# `{ _pre: TCB_Prefix; _result: Self.T }` — the T-typed result slot is the
+# TAIL.  Because the prefix is a named non-generic struct at offset 0,
+# an erased registry (the #42 non-generic Scope) may read and drive the
+# prefix of ANY TaskControlBlock[T] through an
+# `UnsafePointer[TCB_Prefix, MutAnyOrigin]` reinterpretation: the layout
+# guarantee is structural (first member at offset 0), no casting through a
+# canonical R is needed, and the failed/error stamp (`mark_failed`) makes
+# per-child FAILURE visible erased — the linchpin for the #63/#64 grouped
+# first-error lanes.  The public method surface of TaskControlBlock is
+# UNCHANGED (every prefix method is delegated), so existing callers compile
+# without edits.
+#
 # Mojo 1.0.0b2 dialect notes (spike conventions):
 #   - `def`, not `fn`; `comptime` for constants.
 #   - Mutable instance methods take `mut self`; constructors `out self`.
@@ -26,6 +42,22 @@ trait ResultValue(ImplicitlyCopyable, ImplicitlyDeletable):
     default-constructible.  Conform with a zero-argument `__init__`."""
 
     def __init__(out self): ...
+
+
+# ---------------------------------------------------------------------------
+# ScopeChild — the non-generic Scope's typed-boundary constraint (#42)
+# ---------------------------------------------------------------------------
+
+trait ScopeChild(ResultValue):
+    """Constraint for children of the non-generic Scope (#42 decision,
+    issue #61): a ResultValue outcome slot PLUS a comptime TAG used by the
+    erased registry (mojito_async.scope.TaskRecord) to tag-check every
+    boundary cast.  Conform with a zero-argument `__init__` and
+    `comptime TAG = Int(...)` (unique within any one registry).  Lives here
+    (not in scope.mojo) so leaf ResultValue types (e.g.
+    integration/sys.IntResult) can conform without importing scope.mojo."""
+
+    comptime TAG: Int
 
 
 # ---------------------------------------------------------------------------
@@ -77,30 +109,26 @@ struct WaitNode(ImplicitlyCopyable, ImplicitlyDeletable):
 
 
 # ---------------------------------------------------------------------------
-# TaskControlBlock
+# TCB_Prefix — the R-free uniform prefix (A3.2, #42 decision)
 # ---------------------------------------------------------------------------
 
-struct TaskControlBlock[T: ResultValue](ImplicitlyCopyable, ImplicitlyDeletable):
-    """Task control block + A0.5 task state machine (pure Mojo, no C).
+struct TCB_Prefix(ImplicitlyCopyable, ImplicitlyDeletable):
+    """R-free task bookkeeping + A0.5 state machine (non-generic).
 
-    State constants (comptime Int).  The encoded machine (spec A0.5):
+    Holds everything an ERASED observer may read or drive without knowing the
+    child's result type: the state machine (constants, transition table),
+    generation, the embedded wait node, the consume-once result flag, the
+    preserved-failure stamp (`_failed`/`_err` — set by execute()'s exception
+    path; read by the scope's erased stricture and the #63 grouped joins)
+    and the structured-concurrency links.
 
-        NEW -> RUNNABLE -> RUNNING -> PARKING -> WAITING -> RUNNABLE
-                       \\                      `- RUNNABLE (early wake)
-                        \\-> COMPLETED
-                         `-> CANCELLED -> COMPLETED
-
-    Allowed transitions (any other pair raises IllegalTransitionError):
-
-        NEW -> RUNNABLE
-        RUNNABLE -> RUNNING
-        RUNNING -> PARKING
-        PARKING -> RUNNABLE      (early wake)
-        PARKING -> WAITING
-        WAITING -> RUNNABLE      (readiness or cancellation; one edge)
-        RUNNING -> COMPLETED
-        RUNNING -> CANCELLED
-        CANCELLED -> COMPLETED
+    Layout contract (#42 decision pt 6): this struct is the FIRST member of
+    `TaskControlBlock[T]`, and `_result: T` is the tail — so the prefix
+    offsets are IDENTICAL for every T instantiation (C layout: first member
+    at offset 0).  Erased access is an UnsafePointer[TCB_Prefix]
+    reinterpretation of the TCB address; the t29 mixed-type driver is the
+    churn fixture proving prefix ops on Profile AND Activity cells through
+    one non-generic Scope.
     """
 
     comptime NEW = Int(0)
@@ -117,9 +145,11 @@ struct TaskControlBlock[T: ResultValue](ImplicitlyCopyable, ImplicitlyDeletable)
     var _generation: Int
     # Embedded waiter — allocation-free park/wake (spec §24).
     var _wait: WaitNode
-    # Result slot + consume-once guard.
-    var _result: Self.T
+    # Result-slot consume-once guard (the T-typed value lives in the TCB tail).
     var _has_result: Bool
+    # Preserved-failure stamp (#42: erased-visible child failure).
+    var _failed: Bool
+    var _err: String
     # Structured-concurrency links.  Cell handles (0 = none).
     var _parent: Int
     var _scope: Int
@@ -167,11 +197,12 @@ struct TaskControlBlock[T: ResultValue](ImplicitlyCopyable, ImplicitlyDeletable)
     # decision (issue #68 memory-ordering banner).
     var _claim_epoch: Int
     def __init__(out self):
-        self._state = TaskControlBlock.NEW
+        self._state = TCB_Prefix.NEW
         self._generation = 1
         self._wait = WaitNode()
-        self._result = Self.T()
         self._has_result = False
+        self._failed = False
+        self._err = ""
         self._parent = 0
         self._scope = 0
         self._started = False
@@ -191,26 +222,26 @@ struct TaskControlBlock[T: ResultValue](ImplicitlyCopyable, ImplicitlyDeletable)
     @staticmethod
     def _is_allowed(from_: Int, to: Int) -> Bool:
         """Central transition table (spec A0.5); single source of truth."""
-        if from_ == TaskControlBlock.NEW:
-            return to == TaskControlBlock.RUNNABLE
-        if from_ == TaskControlBlock.RUNNABLE:
-            return to == TaskControlBlock.RUNNING
-        if from_ == TaskControlBlock.RUNNING:
+        if from_ == TCB_Prefix.NEW:
+            return to == TCB_Prefix.RUNNABLE
+        if from_ == TCB_Prefix.RUNNABLE:
+            return to == TCB_Prefix.RUNNING
+        if from_ == TCB_Prefix.RUNNING:
             return (
-                to == TaskControlBlock.PARKING
-                or to == TaskControlBlock.COMPLETED
-                or to == TaskControlBlock.CANCELLED
+                to == TCB_Prefix.PARKING
+                or to == TCB_Prefix.COMPLETED
+                or to == TCB_Prefix.CANCELLED
             )
-        if from_ == TaskControlBlock.PARKING:
+        if from_ == TCB_Prefix.PARKING:
             return (
-                to == TaskControlBlock.RUNNABLE or to == TaskControlBlock.WAITING
+                to == TCB_Prefix.RUNNABLE or to == TCB_Prefix.WAITING
             )
-        if from_ == TaskControlBlock.WAITING:
-            return to == TaskControlBlock.RUNNABLE
-        if from_ == TaskControlBlock.COMPLETED:
+        if from_ == TCB_Prefix.WAITING:
+            return to == TCB_Prefix.RUNNABLE
+        if from_ == TCB_Prefix.COMPLETED:
             return False
-        if from_ == TaskControlBlock.CANCELLED:
-            return to == TaskControlBlock.COMPLETED
+        if from_ == TCB_Prefix.CANCELLED:
+            return to == TCB_Prefix.COMPLETED
         return False
 
     def _apply(mut self, to: Int):
@@ -227,7 +258,7 @@ struct TaskControlBlock[T: ResultValue](ImplicitlyCopyable, ImplicitlyDeletable)
     def transition(mut self, to: Int) raises:
         """Validate and perform a transition; raises
         IllegalTransitionError-as-Error for non-allowed pairs."""
-        if not Self._is_allowed(self._state, to):
+        if not TCB_Prefix._is_allowed(self._state, to):
             var what = (
                 "IllegalTransitionError: illegal transition "
                 + String(self._state)
@@ -246,7 +277,7 @@ struct TaskControlBlock[T: ResultValue](ImplicitlyCopyable, ImplicitlyDeletable)
         generation discipline in `wake_claim`) is the A2/EPIC#2 seam; on the
         single cooperative worker there is no interleaving inside a dispatch
         slice, so the plain check is exact for today."""
-        if self._state == from_ and Self._is_allowed(from_, to):
+        if self._state == from_ and TCB_Prefix._is_allowed(from_, to):
             self._apply(to)
             return True
         return False
@@ -382,16 +413,221 @@ struct TaskControlBlock[T: ResultValue](ImplicitlyCopyable, ImplicitlyDeletable)
         """True while a result is stored and not yet consumed."""
         return self._has_result
 
+    def mark_result_flag(mut self):
+        self._has_result = True
+
+    def clear_result_flag(mut self):
+        self._has_result = False
+
+    def mark_failed(mut self, msg: String):
+        """Record the preserved child failure on the PREFIX (erased-visible:
+        the non-generic Scope's prefix reads and the #63/#64 grouped joins
+        see it without knowing T).  Called by execute()'s exception path in
+        parallel with the JoinHandle-level fail()."""
+        self._failed = True
+        self._err = msg
+
+    def is_failed(self) -> Bool:
+        return self._failed
+
+    def error(self) -> String:
+        return self._err
+
+
+# ---------------------------------------------------------------------------
+# TaskControlBlock
+# ---------------------------------------------------------------------------
+
+struct TaskControlBlock[T: ResultValue](ImplicitlyCopyable, ImplicitlyDeletable):
+    """Task control block + A0.5 task state machine (pure Mojo, no C).
+
+    Layout (A3.2, #42 decision): `_pre: TCB_Prefix` (R-free uniform prefix,
+    FIRST member) + `_result: Self.T` (typed TAIL).  The state machine,
+    generation discipline, wait node, consume-once flag, failure stamp and
+    structured-concurrency links live in `_pre`; every prefix method is
+    delegated so the public surface is unchanged.
+
+    State constants mirror TCB_Prefix (comptime aliases; MUST stay in
+    lockstep — the t29 churn fixture exercises erased prefix ops on mixed
+    types to catch drift).
+
+    Encoded machine (spec A0.5):
+
+        NEW -> RUNNABLE -> RUNNING -> PARKING -> WAITING -> RUNNABLE
+                       \\                      `- RUNNABLE (early wake)
+                        \\-> COMPLETED
+                         `-> CANCELLED -> COMPLETED
+
+    Allowed transitions (any other pair raises IllegalTransitionError):
+
+        NEW -> RUNNABLE
+        RUNNABLE -> RUNNING
+        RUNNING -> PARKING
+        PARKING -> RUNNABLE      (early wake)
+        PARKING -> WAITING
+        WAITING -> RUNNABLE      (readiness or cancellation; one edge)
+        RUNNING -> COMPLETED
+        RUNNING -> CANCELLED
+        CANCELLED -> COMPLETED
+    """
+
+    comptime NEW = TCB_Prefix.NEW
+    comptime RUNNABLE = TCB_Prefix.RUNNABLE
+    comptime RUNNING = TCB_Prefix.RUNNING
+    comptime PARKING = TCB_Prefix.PARKING
+    comptime WAITING = TCB_Prefix.WAITING
+    comptime COMPLETED = TCB_Prefix.COMPLETED
+    comptime CANCELLED = TCB_Prefix.CANCELLED
+
+    var _pre: TCB_Prefix
+    # Typed result TAIL: only the typed boundary (mark_result/take_result /
+    # close_typed[T]) touches it.
+    var _result: Self.T
+
+    def __init__(out self):
+        self._pre = TCB_Prefix()
+        self._result = Self.T()
+
+    # --- construction ------------------------------------------------------
+
+    @staticmethod
+    def create() -> Self:
+        """Fresh TCB: state NEW, generation 1, no result, no parent/scope."""
+        return Self()
+
+    # --- state machine (delegated to the prefix) ---------------------------
+
+    def transition(mut self, to: Int) raises:
+        self._pre.transition(to)
+
+    def conditional_transition(mut self, from_: Int, to: Int) -> Bool:
+        return self._pre.conditional_transition(from_, to)
+
+    def wake_claim(mut self, required_gen: Int = 0) -> Bool:
+        return self._pre.wake_claim(required_gen)
+
+    # --- queries (delegated) ----------------------------------------------
+
+    def state(self) -> Int:
+        return self._pre.state()
+
+    def generation(self) -> Int:
+        return self._pre.generation()
+
+    def wait_node(mut self) -> UnsafePointer[WaitNode, MutAnyOrigin]:
+        return self._pre.wait_node()
+
+    def parent_id(self) -> Int:
+        return self._pre.parent_id()
+
+    def scope_handle(self) -> Int:
+        return self._pre.scope_handle()
+
+    def set_parent_id(mut self, id: Int):
+        self._pre.set_parent_id(id)
+
+    def set_scope_handle(mut self, h: Int):
+        self._pre.set_scope_handle(h)
+
+    def owner_worker(self) -> Int:
+        """The worker that first ran this task (0 = not started / not
+        pinned; A2.2 issue #68, E5 surface)."""
+        return self._pre.owner_worker()
+
+    def set_owner_worker(mut self, worker_id: Int):
+        """Stamp the first-run worker (called by the scheduler loop at
+        dispatch; A2.2 issue #68)."""
+        self._pre.set_owner_worker(worker_id)
+
+    def owner_runtime(self) -> Int:
+        """Address of the owner worker's Runtime cell (0 = none; stamped
+        with owner_worker at first dispatch — A2.5 issue #71)."""
+        return self._pre.owner_runtime()
+
+    def set_owner_runtime(mut self, addr: Int):
+        """Stamp the owner Runtime address (scheduler loop, first dispatch;
+        A2.5 issue #71)."""
+        self._pre.set_owner_runtime(addr)
+
+    def early_readiness(self) -> Bool:
+        """Two-phase early-wake latch (A0-T11): True once a wake was
+        delivered while the task was RUNNING/PARKING (before the WAITING
+        commit).  Guarded by the OWNER's remote-ready queue spinlock;
+        consumed by park_commit (the unwind-vs-WAITING decision)."""
+        return self._pre.early_readiness()
+
+    def set_early_readiness(mut self):
+        self._pre.set_early_readiness()
+
+    def clear_early_readiness(mut self):
+        self._pre.clear_early_readiness()
+
+    def claimed_epoch(self) -> Int:
+        """H2 (PR #109): the generation of the last consumed wake claim
+        (0 = none).  unpark_current's duplicate detector: a wake whose
+        required_gen equals this value arrives AFTER its epoch was already
+        claimed and must no-op quietly in every task state.  Guarded by the
+        OWNER's remote-ready queue spinlock (with `_early` and the claim
+        decision)."""
+        return self._pre.claimed_epoch()
+
+    # --- STARTED latch consumption (A2.5 issue #71; E4 #70 shares) ---------
+
+    def is_started(self) -> Bool:
+        """Spec §14.1 `started`, TCB form: True exactly once this task has
+        entered user code (latched at the first RUNNABLE -> RUNNING).
+        A started task is worker-affine and NEVER stealable (spec §19.2 /
+        ADR-006), even while its yield re-enqueue leaves it RUNNABLE."""
+        return self._pre.is_started()
+
+    def is_pre_start(self) -> Bool:
+        """Spec §19.1: True while the task has NEVER entered user code —
+        the exact stealability predicate (NEW/RUNNABLE + never ran)."""
+        return self._pre.is_pre_start()
+
+    def is_completed(self) -> Bool:
+        return self._pre.is_completed()
+
+    def is_cancelled(self) -> Bool:
+        return self._pre.is_cancelled()
+
+    def is_waiting(self) -> Bool:
+        return self._pre.is_waiting()
+
+    def has_result_pending(self) -> Bool:
+        return self._pre.has_result_pending()
+
+    def is_failed(self) -> Bool:
+        return self._pre.is_failed()
+
+    def error(self) -> String:
+        return self._pre.error()
+
+    def mark_failed(mut self, msg: String):
+        """Record the preserved child failure on the prefix (#42 erased
+        visibility).  Called by execute()'s exception path alongside the
+        JoinHandle-level fail()."""
+        self._pre.mark_failed(msg)
+
+    # --- result slot (typed tail) -----------------------------------------
+
+    def mark_result(mut self, val: Self.T):
+        """Stash the task result.  Repeat calls overwrite; take_result()
+        enforces consume-once."""
+        self._result = val
+        self._pre.mark_result_flag()
+
     def take_result(mut self) raises -> Self.T:
         """Consume-once result.  Raises when no result is available."""
-        if not self._has_result:
+        if not self._pre.has_result_pending():
             raise Error(
                 "TaskControlBlock.take_result: no result (never marked or "
                 "already consumed)"
             )
         var out = self._result
-        self._has_result = False
+        self._pre.clear_result_flag()
         return out
+
 
 # ---------------------------------------------------------------------------
 # Error predicates (decode the documented message prefixes)
