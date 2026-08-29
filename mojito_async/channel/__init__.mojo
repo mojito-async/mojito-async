@@ -19,3 +19,16 @@ from mojito_async.channel.channel import (
     make_receiver,
     make_sender,
 )
+from mojito_async.channel.select import (
+    SelectBranch,
+    SelectOutcome,
+    SelectState,
+    branch_ready,
+    classify_branch,
+    deadline_branch,
+    recv_branch,
+    rescan,
+    select,
+    select_fast,
+    send_branch,
+)
