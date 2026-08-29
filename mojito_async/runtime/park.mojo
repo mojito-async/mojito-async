@@ -56,6 +56,8 @@
 from mojito_async.runtime.runtime import Runtime
 from mojito_async.runtime.task_control_block import ResultValue, TaskControlBlock
 from mojito_async.runtime.join_handle import JoinHandle, SuspendReason
+from mojito_async.runtime.checkpoint import checkpoint
+from mojito_async.cancellation import CancellationToken
 
 
 def park_current[R: ResultValue](
@@ -351,3 +353,120 @@ def park_commit[R: ResultValue](
 #     issue #68's; the NativeEvent idle path is E6 (#72).
 #   - cross-worker wakes route through wake_target_worker (scheduler.mojo,
 #     A1.3 affinity seam) + the owner-routing in unpark_current above.
+
+
+# ---------------------------------------------------------------------------
+# TASK-AWARE CANCELLATION (A4.3, issue #57) — token-aware park + push-cancel
+# ---------------------------------------------------------------------------
+#
+# The two-phase COMMIT above documents its own cancellation seam: "the
+# settle policy (cancellation FIRST, then readiness) is the caller's
+# pre-check ... the commit's readiness unwind covers the no-cancel
+# geometry".  This section is that pre-check PLUS the receive-side half the
+# seam defers: a park that already observed a request never parks
+# (park_cancellable), and a WAITING task can be reached from OUTSIDE by a
+# holder of its JoinHandle who decided its CancellationToken lost patience
+# (wake_cancelled) — matching how a readiness wake (unpark_current) already
+# reaches a WAITING task from outside today.
+#
+# C6 winner rule (readiness vs cancel): wake_cancelled is a THIN wrapper
+# over the unchanged unpark_current — it inherits the SAME exactly-once
+# generation claim (wake_claim) unpark_current already guarantees, so
+# "exactly one winner" falls out of the existing kernel for free.  The
+# WaitNode's `_reason` field (stamped CANCEL only by the call that actually
+# WINS the claim) is what lets the resumed primitive tell readiness and
+# cancellation apart: unpark_current's own no-op branches (already-
+# RUNNABLE, stale/duplicate generation) never touch `_reason`, so a losing
+# wake_cancelled call leaves the WINNING wake's stamp untouched.  Mutex /
+# Semaphore / Channel own the OTHER half of "exactly one winner, coherent
+# state": their `cancel_*_wait` methods (sync/mutex.mojo, sync/semaphore.
+# mojo, channel/channel.mojo) remove the waiter from their OWN FIFO before
+# calling wake_cancelled, so a readiness handoff that already popped the
+# same waiter leaves nothing for a racing cancel to find (no ghost queue
+# entry, no leaked permit/lock/slot — spec: "cancel unblocks ... leaving
+# the primitive in a coherent state").
+#
+# `_reason` re-stamp safety: park_current/park_commit stamp `_reason` FRESH
+# on every new park, so a CANCEL left over from a resumed-and-consumed wait
+# can never leak into a LATER, unrelated wait — but the consuming side
+# (raise_if_cancel_wake / with_cancel) MUST clear it back to NONE the
+# moment it is observed (own doing, not park's), for the same reason.
+def park_cancellable[R: ResultValue](
+    mut rt: Runtime,
+    h: JoinHandle[R],
+    token: CancellationToken,
+    reason: Int = SuspendReason.PARK,
+) raises:
+    """Token-aware park (issue #57): the caller-side pre-check the COMMIT
+    docs above defer to.  Raises CancellationError-as-Error (reusing
+    cancellation.mojo's checkpoint naming verbatim, deliverable #2) WITHOUT
+    parking when `token` already requested cancellation — a task is never
+    parked with no live path back except an external wake it cannot
+    guarantee.  Otherwise delegates to `park_current` unchanged; a later
+    `wake_cancelled` against this same handle is what delivers a MID-wait
+    cancel."""
+    checkpoint(token)
+    park_current(rt, h, reason)
+
+
+def wake_cancelled[R: ResultValue](mut rt: Runtime, h: JoinHandle[R]) raises:
+    """Push-cancel a WAITING task (issue #57): stamp the wait reason CANCEL
+    then deliver the SAME wake `unpark_current` would for readiness.
+
+    Callers that own a primitive-specific wait queue (Mutex/Semaphore/
+    Channel) MUST remove `h` from their own queue FIRST (see module header)
+    — this function only performs the state transition, exactly like
+    unpark_current's contract.  If readiness already claimed the wake (the
+    task is no longer WAITING), unpark_current's existing no-op path fires
+    and `_reason` is left untouched — the earlier winner's stamp (or lack
+    of one) stands; this call never overwrites a settled outcome."""
+    h.tcb()[].wait_node()[].set_reason(SuspendReason.CANCEL)
+    unpark_current(rt, h)
+
+
+def is_cancel_wake[R: ResultValue](h: JoinHandle[R]) -> Bool:
+    """True when this waiter's most recent wake was the CANCEL winner
+    (wake_cancelled's stamp survived unpark_current's claim) — the C6
+    post-resume winner read.  Non-consuming query; pair with
+    raise_if_cancel_wake / with_cancel to also clear the stamp."""
+    return h.tcb()[].wait_node()[].reason() == SuspendReason.CANCEL
+
+
+def raise_if_cancel_wake[R: ResultValue](h: JoinHandle[R]) raises:
+    """Post-resume winner check + raise (issue #57 C6): if wake_cancelled
+    won this wait, clear the stamp (module-header re-stamp-safety) and
+    raise CancellationError-as-Error; a no-op when readiness won."""
+    if is_cancel_wake(h):
+        h.tcb()[].wait_node()[].set_reason(SuspendReason.NONE)
+        raise Error("CancellationError: park/wait cancelled")
+
+
+def with_cancel[R: ResultValue](
+    mut rt: Runtime,
+    h: JoinHandle[R],
+    token: CancellationToken,
+    reason: Int = SuspendReason.PARK,
+) raises -> Bool:
+    """Cancellable park, UNBLOCKS-WITHOUT-RAISE form (issue #57 deliverable
+    4): the with_cancel counterpart to park_cancellable's raise, for the
+    PRE-park check only.  True = parked normally (proceed exactly as
+    park_current would — the caller is free to drive other tasks); False =
+    the token was ALREADY requested — the wait was never entered (same
+    "commit aborts the wait" contract as park_cancellable), returned
+    instead of raised so a caller with its own error surface can decide how
+    to report it.
+
+    Cooperative re-entrant model (spec §88: no blocking call, no fiber):
+    park_current never suspends the call stack — it stamps WAITING and
+    RETURNS to the driver immediately, so a resume is a SEPARATE later
+    re-entry, never observable inside this same call.  with_cancel therefore
+    covers ONLY the pre-park half; the POST-resume winner check is the
+    caller's job on its OWN next re-entry via is_cancel_wake /
+    raise_if_cancel_wake — the exact two-call shape Mutex.lock_cancellable /
+    Semaphore.acquire_cancellable / Channel.send_cancellable/recv_cancellable
+    already use (raise_if_cancel_wake at the TOP of the re-entrant method,
+    the park attempt at the bottom)."""
+    if token.is_cancellation_requested():
+        return False
+    park_current(rt, h, reason)
+    return True
