@@ -3,6 +3,17 @@
 # A3.3 (issue #62) — NESTED-SCOPE + CANCELLATION/FAILURE STORM stress suite
 # (EPIC #3 A3 exit criteria).
 #
+# A3.2 (#42 decision, issue #61) REBASE: migrated onto the NON-GENERIC Scope
+# (mojito_async/scope.mojo) — `make_scope(handle, order_log, has_log)` /
+# `make_nested_scope(handle, parent, order_log, has_log)` (no type params, no
+# injected CancelHook: the hook seam is RETIRED), `scope.register[T](child,
+# task_id, parent_task_id)`, `scope.spawn[T](rt, tcb, parent_id)`.  S1/S3 are
+# UNCHANGED semantically (their per-task cancellation/failure choreography
+# never went through the scope's hook); S2 is REWRITTEN against the erased
+# `request_cancel_all()` (drives the TCB_Prefix directly: RUNNING ->
+# CANCELLED, WAITING woken via wake_claim) since the CancelFlag/adapter
+# oracle it used pre-#61 no longer applies (no hook to observe through).
+#
 # Three deterministic scenarios over the scope machinery, no sleep-based
 # waits, every counter exact:
 #
@@ -22,19 +33,19 @@
 #     tasks, every task parked mid-flight, then ONE root-level cancel
 #     (scope.request_cancel_all — the #54 seam: a scope cancel MUST descend
 #     into child scopes per spec §29.1 "cancelling a scope recursively
-#     requests cancellation of descendants").  Asserts every task's flag is
-#     requested (exactly once each), every task observes the cancellation
-#     exactly once, the root's close returns only after every descendant
-#     settled, and every registry drains.
+#     requests cancellation of descendants").  Asserts every descendant
+#     task is REACHED by the root-level cancel (its TCB leaves WAITING —
+#     the same wake_claim edge request_cancel_all already applies to its
+#     OWN direct WAITING children, spec §54), and every registry drains.
 #
 #     ON CURRENT MAIN THIS IS THE RED (the #54 hole): today
-#     request_cancel_all fires the CancelHook only for the scope's
-#     REGISTERED direct children, and subscopes are not registered children
-#     — a root-level cancel reaches zero task flags and every parked
-#     descendant would run un-cancelled (missed == 1024).  The known-red
-#     row points at issue #54; the driver is written against the A1.1
-#     machinery so the SAME file compiles and passes once the
-#     recursive-descend semantics land.
+#     request_cancel_all drives ONLY the scope's own REGISTERED direct
+#     TaskRecord children, and subscopes are tracked separately (parent/
+#     open-subscope bookkeeping, never in `_children`) — a root-level
+#     cancel reaches zero descendant tasks and every parked descendant
+#     stays WAITING un-cancelled (missed == 1024).  The known-red row
+#     points at issue #54; the driver compiles against the #61 machinery
+#     unchanged and turns GREEN once the recursive-descend semantics land.
 #
 #   S3 (failure storm): children raise errors through the scopes under the
 #     CURRENT failure contract ("first error recorded, error propagated at
@@ -61,12 +72,6 @@ from mojito_async.cancellation import (
     is_cancellation,
     make_cancel_flag,
 )
-from mojito_async.cancellation_adapter import (
-    CancelFlagHook,
-    CancelFlagRegistry,
-    make_cancel_flag_hook,
-    make_cancel_flag_registry,
-)
 from mojito_async.integration.sys import BytePtr, IntResult
 from mojito_async.runtime.runtime import Runtime, create
 from mojito_async.runtime.scheduler import scheduler_loop
@@ -82,7 +87,6 @@ def red(what: String) raises -> None:
 
 
 comptime TB = TaskControlBlock[IntResult]
-comptime SC = Scope[IntResult, CancelFlagHook]
 
 # task roles (per-scope role assignment is deterministic by index)
 comptime RoleComplete = Int(0)
@@ -240,10 +244,9 @@ def dispatch(mut rt: Runtime, tcb_addr: Int, tid: Int, ud: BytePtr) raises -> In
 # ---------------------------------------------------------------------------
 
 def build_deep_tree(
-    hook: CancelFlagHook,
     round_no: Int,
     n: Int,
-    mut scopes: List[SC],
+    mut scopes: List[Scope],
     logp: UnsafePointer[List[Int], MutAnyOrigin],
 ) raises:
     """k-deep nested scope tree in ONE preloaded List (b2: List element
@@ -253,23 +256,17 @@ def build_deep_tree(
     capture the param copy's stack storage, not the caller's list object —
     b2 trap)."""
     for _ in range(n):
-        scopes.append(make_scope[IntResult, CancelFlagHook](
-            hook, 1, logp, False
-        ))
-    scopes[0] = make_scope[IntResult, CancelFlagHook](
-        hook, round_no * 100, logp, True
-    )
+        scopes.append(make_scope(1, logp, False))
+    scopes[0] = make_scope(round_no * 100, logp, True)
     for i in range(1, n):
-        var parent = UnsafePointer[SC, MutAnyOrigin](to=scopes[i - 1])
-        scopes[i] = make_nested_scope[IntResult, CancelFlagHook](
-            hook, round_no * 100 + i, parent, logp, True
-        )
+        var parent = UnsafePointer[Scope, MutAnyOrigin](to=scopes[i - 1])
+        scopes[i] = make_nested_scope(round_no * 100 + i, parent, logp, True)
 
 
 def run_deep_round(
     mut rt: Runtime,
     round_no: Int,
-    mut scopes: List[SC],
+    mut scopes: List[Scope],
     ud: BytePtr,
 ) raises:
     """Drive one S1 round to quiescence: wave 1 parks cancelees and settles
@@ -310,7 +307,7 @@ def run_deep_round(
 def assert_round_drains(
     mut rt: Runtime,
     round_no: Int,
-    mut scopes: List[SC],
+    mut scopes: List[Scope],
     logp: UnsafePointer[List[Int], MutAnyOrigin],
     ud: BytePtr,
 ) raises:
@@ -443,6 +440,149 @@ def assert_round_drains(
 
 
 # ---------------------------------------------------------------------------
+# S2 helpers — every wave-1 task just parks (the storm is a pure root-level
+# cancel, no per-task role branching).
+#
+# Address-stability note: `make_nested_scope`'s out-param constructs the
+# child scope AT THE CALLER'S BINDING and captures that FINAL address into
+# the parent's `_child_scope_ptrs` registry (issue #54) — so every child
+# MUST be a fresh, never-moved-again `var` (the t29_cancel_tree_aot
+# convention).  A `List[Scope]` append/index-assign is NOT that binding (the
+# out-param materializes into a temporary the list then MOVES, leaving the
+# parent's captured pointer dangling — verified: it corrupts the cancel
+# walk).  S1/S3 never call request_cancel_all(), so their List[Scope]
+# storage (unaffected by a dangling `_child_scope_ptrs` entry — close()
+# never dereferences it) is unchanged; S2 exercises the cancel walk, so its
+# 64 sibling scopes are built RECURSIVELY instead — one stack frame per
+# sibling, each owning its own `var s = make_nested_scope(...)` that stays
+# alive (stable address) for the rest of the storm, collected by POINTER
+# (freely copyable/list-storable, unlike the Scope value itself) into
+# `child_ptrs` at the innermost frame where the storm actually runs.
+# ---------------------------------------------------------------------------
+
+def dispatch_park(mut rt: Runtime, tcb_addr: Int, tid: Int, ud: BytePtr) raises -> Int:
+    var h = _handle(tcb_addr, tid)
+    claim_running(h)
+    park_current(rt, h)
+    return 1
+
+
+def run_s2_storm(
+    mut rt2: Runtime,
+    root_sp: UnsafePointer[Scope, MutAnyOrigin],
+    mut child_ptrs: List[UnsafePointer[Scope, MutAnyOrigin]],
+) raises:
+    """Innermost S2 body: every sibling child scope now exists at a STABLE
+    address (the recursive builder below).  Spawn S2_PER tasks into each,
+    park every task mid-flight, fire ONE root-level cancel, assert every
+    descendant was REACHED (WAITING -> RUNNABLE, the wake_claim edge
+    request_cancel_all already applies recursively as of issue #54) and
+    every scope (root + every child) is marked cancelled, then tear the
+    tree down via the containment escape hatch: request_cancel_all only
+    WAKES a parked child — it never drives it to COMPLETED (no cooperative
+    checkpoint reads scope-level cancel state yet), so a normal
+    join-integrated close is not yet possible; with_scope's own error path
+    uses the identical drop_children + close fallback (scope.mojo)."""
+    var s2_cells = List[TB]()
+    for _ in range(S2_TASKS):
+        s2_cells.append(TB.create())
+    var s2_handles = List[JoinHandle[IntResult]]()
+    for i in range(S2_TASKS):
+        var sc_idx = i / S2_PER
+        var h = child_ptrs[sc_idx][].spawn[IntResult](
+            rt2, UnsafePointer[TB, MutAnyOrigin](to=s2_cells[i]), 0
+        )
+        s2_handles.append(h)
+    var s2_ud = UnsafePointer[Int, MutAnyOrigin](unsafe_from_address=1).bitcast[Byte]()
+
+    # ---- wave 1: every task parks mid-flight -------------------------------
+    var s2_served1 = scheduler_loop(rt2, dispatch_park, s2_ud)
+    if s2_served1 != S2_TASKS:
+        red("S2 wave1 served " + String(s2_served1) + " != "
+            + String(S2_TASKS))
+    for i in range(S2_TASKS):
+        if not s2_handles[i].tcb()[].is_waiting():
+            red("S2 task " + String(i) + " not WAITING after wave 1")
+    if rt2.pending() != 0:
+        red("S2 queue not quiet after wave 1")
+    if rt2.enqueued() != S2_TASKS:
+        red("S2 enqueued " + String(rt2.enqueued()) + " != "
+            + String(S2_TASKS))
+
+    # ---- THE STORM: ONE root-level cancel (the #54 seam) -------------------
+    root_sp[].request_cancel_all()
+
+    # every descendant task must be REACHED (exactly once each): the
+    # root-level cancel must descend through every child scope and apply the
+    # same WAITING -> RUNNABLE (wake_claim) edge request_cancel_all already
+    # applies to its OWN direct children (spec #54).
+    var missed = 0
+    for i in range(S2_TASKS):
+        if s2_handles[i].tcb()[].is_waiting():
+            missed += 1
+    if missed != 0:
+        red("S2 " + String(missed) + "/" + String(S2_TASKS)
+            + " descendant tasks NOT reached by the root-level cancel — a "
+            + "scope cancel must descend through child scopes (recursive "
+            + "cancellation tree, issue #54)")
+
+    # every scope in the tree (root + every child) must carry the cancelled
+    # state too (spec §29.1 — the walk marks every node it descends into).
+    if not root_sp[].is_cancelled():
+        red("S2 root scope not marked cancelled by its own request")
+    for c in range(S2_CHILD):
+        if not child_ptrs[c][].is_cancelled():
+            red("S2 child scope " + String(c) + " not marked cancelled")
+
+    # ---- tear down: request_cancel_all only WAKES parked children — it
+    # never drives one to COMPLETED, so drop the (cancelled-but-unsettled)
+    # registries via the containment escape hatch rather than demanding a
+    # completed join the driver never scheduled --------------------------
+    for c in range(S2_CHILD):
+        child_ptrs[c][].drop_children()
+        try:
+            child_ptrs[c][].close(rt2)
+        except Error:
+            red("S2 child scope " + String(c)
+                + " close refused after drop_children")
+        if child_ptrs[c][].live_child_count() != 0:
+            red("S2 child scope " + String(c)
+                + " registry NOT drained (leak)")
+    root_sp[].drop_children()
+    try:
+        root_sp[].close(rt2)
+    except Error:
+        red("S2 root close refused after drop_children")
+    if root_sp[].is_open():
+        red("S2 root scope still open after close")
+    if root_sp[].live_child_count() != 0:
+        red("S2 root registry NOT drained (leak)")
+
+    print("T18 scope storm: S2 PASS (1 root x 64 child scopes x 16 tasks, "
+          + "root-level cancel, 1024/1024 descendants reached)")
+
+
+def build_s2_child(
+    mut rt2: Runtime,
+    c: Int,
+    root_sp: UnsafePointer[Scope, MutAnyOrigin],
+    log2p: UnsafePointer[List[Int], MutAnyOrigin],
+    mut child_ptrs: List[UnsafePointer[Scope, MutAnyOrigin]],
+) raises:
+    """Construct sibling `c` at a FRESH, never-moved-again `var` (the only
+    address-stable binding — see the module note above), collect its
+    pointer, then recurse to sibling `c + 1`.  The innermost call (all
+    S2_CHILD siblings alive on the stack) runs the storm itself."""
+    var s = make_nested_scope(20100 + c, root_sp, log2p, True)
+    var sp = UnsafePointer[Scope, MutAnyOrigin](to=s)
+    child_ptrs.append(sp)
+    if c + 1 < S2_CHILD:
+        build_s2_child(rt2, c + 1, root_sp, log2p, child_ptrs)
+    else:
+        run_s2_storm(rt2, root_sp, child_ptrs)
+
+
+# ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
 
@@ -452,13 +592,10 @@ def main() raises:
     # =========================================================================
     for round_no in range(N_ROUNDS):
         var rt = create()
-        var tmp_reg = make_cancel_flag_registry()
-        var tmp_regp = UnsafePointer[CancelFlagRegistry, MutAnyOrigin](to=tmp_reg)
-        var hook = make_cancel_flag_hook(tmp_regp)
-        var scopes = List[SC]()
+        var scopes = List[Scope]()
         var log = List[Int]()
         var logp = UnsafePointer[List[Int], MutAnyOrigin](to=log)
-        build_deep_tree(hook, round_no, K_DEPTH, scopes, logp)
+        build_deep_tree(round_no, K_DEPTH, scopes, logp)
 
         # Stable per-round cells: TCB pool, flags (fresh: observed flags
         # cannot reset), token pointers, roles/counts, owner handles.
@@ -503,11 +640,11 @@ def main() raises:
             elif i % M_TASKS == 1:
                 scene.roles[i] = RoleCancel
             var level = i / M_TASKS
-            var scope_cell = UnsafePointer[SC, MutAnyOrigin](to=scopes[level])
+            var scope_cell = UnsafePointer[Scope, MutAnyOrigin](to=scopes[level])
             var h = spawn(rt, UnsafePointer[TB, MutAnyOrigin](to=cells[i]), 0)
             handles.append(h)
-            _ = scope_cell[].register(
-                UnsafePointer[TB, MutAnyOrigin](to=cells[i]), h.id()
+            _ = scope_cell[].register[IntResult](
+                UnsafePointer[TB, MutAnyOrigin](to=cells[i]), h.id(), 0
             )
             buf[16 + h.id()] = i  # tid -> task index
         scene.owners = UnsafePointer[List[JoinHandle[IntResult]], MutAnyOrigin](
@@ -524,195 +661,22 @@ def main() raises:
 
     # =========================================================================
     # S2: CANCELLATION STORM — 1 root x 64 child scopes x 16 tasks, all
-    # parked mid-flight, ONE root-level cancel (the #54 seam); every task's
-    # flag must be requested by the root cancel, every task must observe the
-    # cancellation exactly once, the root close returns only after every
-    # descendant settled.
+    # parked mid-flight, then ONE root-level cancel (the #54 seam: a scope
+    # cancel MUST descend into child scopes per spec §29.1).  Asserts every
+    # descendant task is REACHED (the same wake_claim edge request_cancel_all
+    # already applies to its own direct WAITING children — spec #54 makes it
+    # recursive), every scope in the tree marked cancelled, and every
+    # registry drains.  The 64 siblings are built RECURSIVELY (see the S2
+    # helpers header) so each keeps the address-stable `var` binding
+    # `make_nested_scope`'s out-param (issue #54) requires.
     # =========================================================================
     var rt2 = create()
-    var reg2 = make_cancel_flag_registry()
-    var reg2p = UnsafePointer[CancelFlagRegistry, MutAnyOrigin](to=reg2)
-    var hook2 = make_cancel_flag_hook(reg2p)
     var log2 = List[Int]()
     var log2p = UnsafePointer[List[Int], MutAnyOrigin](to=log2)
-    var s2_scopes = List[SC]()
-    for _ in range(S2_CHILD + 1):
-        s2_scopes.append(make_scope[IntResult, CancelFlagHook](
-            hook2, 1, log2p, False
-        ))
-    s2_scopes[0] = make_scope[IntResult, CancelFlagHook](
-        hook2, 20000, log2p, True
-    )
-    var root_sp = UnsafePointer[SC, MutAnyOrigin](to=s2_scopes[0])
-    for c in range(S2_CHILD):
-        s2_scopes[c + 1] = make_nested_scope[IntResult, CancelFlagHook](
-            hook2, 20100 + c, root_sp, log2p, True
-        )
-
-    # the adapter registry mirrors the real tree: every scope handle -> its
-    # flag, every (scope, child) -> the task flag (linked under the scope
-    # flag).  The root-level cancel must reach ALL of them via the hook.
-    var s2_scope_flags = List[CancelFlag]()
-    for _ in range(S2_CHILD + 1):
-        s2_scope_flags.append(make_cancel_flag())
-    var s2_scope_flag_ptrs = List[UnsafePointer[CancelFlag, MutAnyOrigin]]()
-    for i in range(S2_CHILD + 1):
-        s2_scope_flag_ptrs.append(
-            UnsafePointer[CancelFlag, MutAnyOrigin](to=s2_scope_flags[i])
-        )
-    reg2p[].register_scope(20000, s2_scope_flag_ptrs[0])
-    for c in range(S2_CHILD):
-        reg2p[].register_scope(20100 + c, s2_scope_flag_ptrs[c + 1])
-    var s2_task_flags = List[CancelFlag]()
-    for _ in range(S2_TASKS):
-        s2_task_flags.append(make_cancel_flag())
-    var s2_task_ptrs = List[UnsafePointer[CancelFlag, MutAnyOrigin]]()
-    for i in range(S2_TASKS):
-        s2_task_ptrs.append(
-            UnsafePointer[CancelFlag, MutAnyOrigin](to=s2_task_flags[i])
-        )
-
-    var s2_cells = List[TB]()
-    for _ in range(S2_TASKS):
-        s2_cells.append(TB.create())
-    var s2_handles = List[JoinHandle[IntResult]]()
-    var s2_cids = List[Int]()
-    for _ in range(S2_TASKS):
-        s2_cids.append(0)
-    var s2_buf = List[Int]()
-    for _ in range(16 + 3 * S2_TASKS):
-        s2_buf.append(0)
-    var s2_scene = StormScene()
-    s2_scene.tokens = UnsafePointer[
-        UnsafePointer[CancelFlag, MutAnyOrigin], MutAnyOrigin
-    ](unsafe_from_address=Int(s2_task_ptrs.unsafe_ptr()))
-    s2_scene.base = UnsafePointer[Int, MutAnyOrigin](
-        unsafe_from_address=Int(s2_buf.unsafe_ptr()) + 0 * 8
-    )
-    s2_scene.tid_map = UnsafePointer[Int, MutAnyOrigin](
-        unsafe_from_address=Int(s2_buf.unsafe_ptr()) + 16 * 8
-    )
-    s2_scene.counts = UnsafePointer[Int, MutAnyOrigin](
-        unsafe_from_address=Int(s2_buf.unsafe_ptr()) + (17 + S2_TASKS) * 8
-    )
-    s2_scene.roles = UnsafePointer[Int, MutAnyOrigin](
-        unsafe_from_address=Int(s2_buf.unsafe_ptr())
-        + (17 + 2 * S2_TASKS) * 8
-    )
-    s2_buf[4] = 2  # scenario S2
-    s2_buf[5] = 0  # phase: wave 1 (park)
-    for i in range(S2_TASKS):
-        s2_scene.roles[i] = RoleCancel
-        var sc_idx = 1 + i / S2_PER
-        var s2_cell = UnsafePointer[SC, MutAnyOrigin](to=s2_scopes[sc_idx])
-        var h = spawn(rt2, UnsafePointer[TB, MutAnyOrigin](to=s2_cells[i]), 0)
-        s2_handles.append(h)
-        var cid = s2_cell[].register(
-            UnsafePointer[TB, MutAnyOrigin](to=s2_cells[i]), h.id()
-        )
-        s2_cids[i] = cid
-        reg2p[].register_child(20100 + sc_idx - 1, cid, s2_task_ptrs[i])
-        s2_buf[16 + h.id()] = i
-    s2_scene.owners = UnsafePointer[
-        List[JoinHandle[IntResult]], MutAnyOrigin
-    ](to=s2_handles)
-    var s2_sp = UnsafePointer[StormScene, MutAnyOrigin](to=s2_scene)
-    var ud2 = s2_sp.bitcast[Byte]()
-
-    # ---- wave 1: every task parks mid-flight ------------------------------
-    var s2_served1 = scheduler_loop(rt2, dispatch, ud2)
-    if s2_served1 != S2_TASKS:
-        red("S2 wave1 served " + String(s2_served1) + " != "
-            + String(S2_TASKS))
-    if s2_scene.parked()[] != S2_TASKS:
-        red("S2 parked " + String(s2_scene.parked()[]) + " != "
-            + String(S2_TASKS))
-    for i in range(S2_TASKS):
-        if not s2_handles[i].tcb()[].is_waiting():
-            red("S2 task " + String(i) + " not WAITING after wave 1")
-    if rt2.pending() != 0:
-        red("S2 queue not quiet after wave 1")
-    if rt2.enqueued() != S2_TASKS:
-        red("S2 enqueued " + String(rt2.enqueued()) + " != "
-            + String(S2_TASKS))
-
-    # ---- THE STORM: ONE root-level cancel (the #54 seam) ------------------
-    s2_scopes[0].request_cancel_all()
-
-    # every task's flag must be requested (exactly once each): the root-level
-    # cancel must descend into every child scope.
-    var missed = 0
-    for i in range(S2_TASKS):
-        if not s2_task_flags[i].is_requested():
-            missed += 1
-    if missed != 0:
-        red("S2 " + String(missed) + "/" + String(S2_TASKS)
-            + " task flags NOT requested by the root-level cancel — a scope "
-            + "cancel must descend through child scopes (recursive "
-            + "cancellation tree, issue #54)")
-
-    # ---- wake every parked descendant, then wave 2 ------------------------
-    for i in range(S2_TASKS):
-        unpark_current(rt2, s2_handles[i])
-    var s2_served2 = scheduler_loop(rt2, dispatch, ud2)
-    if s2_served2 != S2_TASKS:
-        red("S2 wave2 served " + String(s2_served2) + " != "
-            + String(S2_TASKS))
-
-    # ---- every task observed the cancellation exactly once ----------------
-    for i in range(S2_TASKS):
-        if not s2_task_flags[i].observed():
-            red("S2 task " + String(i) + " never observed its cancellation")
-        if not s2_handles[i].is_completed():
-            red("S2 task " + String(i) + " not COMPLETED after the storm")
-        var raised = False
-        try:
-            _ = s2_handles[i].join()
-        except e:
-            raised = True
-            if not is_cancellation(e):
-                red("S2 task " + String(i)
-                    + " join raised a non-cancellation error: " + String(e))
-        if not raised:
-            red("S2 task " + String(i) + " join did not re-raise its cancel")
-
-    # ---- close EVERY child scope before the root (inner-before-outer);
-    # the root's close returning proves all descendants settled ------------
-    for c in range(S2_CHILD):
-        s2_scopes[c + 1].close(rt2)
-        if s2_scopes[c + 1].live_child_count() != 0:
-            red("S2 child scope " + String(c)
-                + " registry NOT drained (leak)")
-    root_sp[].close(rt2)
-    if root_sp[].is_open():
-        red("S2 root scope still open after close")
-    if root_sp[].live_child_count() != 0:
-        red("S2 root registry NOT drained (leak)")
-
-    # ---- storms leave no strays: queue quiet, exact counters, no orphans --
-    var s2_orphans = 0
-    for i in range(S2_TASKS):
-        if s2_cells[i].has_result_pending():
-            s2_orphans += 1
-    if s2_orphans != 0:
-        red("S2 " + String(s2_orphans) + " orphaned results")
-    if rt2.pending() != 0 or rt2.skipped() != 0:
-        red("S2 runnable queue not quiet / stale records after the storm")
-    if rt2.enqueued() != 2 * S2_TASKS:
-        red("S2 enqueued " + String(rt2.enqueued()) + " != "
-            + String(2 * S2_TASKS))
-
-    # ---- adapter teardown: symmetric unregister (severs parent links) -----
-    for i in range(S2_TASKS):
-        reg2p[].unregister_child(20100 + i / S2_PER, s2_cids[i])
-    for c in range(S2_CHILD):
-        reg2p[].unregister_scope(20100 + c)
-    reg2p[].unregister_scope(20000)
-    if reg2p[].has_scope(20000) or reg2p[].has_scope(20100):
-        red("S2 adapter registry not drained after unregister")
-
-    print("T18 scope storm: S2 PASS (1 root x 64 child scopes x 16 tasks, "
-          + "root-level cancel, 1024/1024 flags requested, 1024 observed)")
+    var root2 = make_scope(20000, log2p, True)
+    var root2p = UnsafePointer[Scope, MutAnyOrigin](to=root2)
+    var child_ptrs = List[UnsafePointer[Scope, MutAnyOrigin]]()
+    build_s2_child(rt2, 0, root2p, log2p, child_ptrs)
 
     # =========================================================================
     # S3: FAILURE STORM — children raise errors through the scopes; current
@@ -721,24 +685,15 @@ def main() raises:
     # (join + close combined), all siblings settle clean, registries drain.
     # =========================================================================
     var rt3 = create()
-    var tmp_reg3 = make_cancel_flag_registry()
-    var tmp_reg3p = UnsafePointer[CancelFlagRegistry, MutAnyOrigin](to=tmp_reg3)
-    var hook3 = make_cancel_flag_hook(tmp_reg3p)
     var log3 = List[Int]()
     var log3p = UnsafePointer[List[Int], MutAnyOrigin](to=log3)
-    var s3_scopes = List[SC]()
+    var s3_scopes = List[Scope]()
     for _ in range(S3_CHILD + 1):
-        s3_scopes.append(make_scope[IntResult, CancelFlagHook](
-            hook3, 1, log3p, False
-        ))
-    s3_scopes[0] = make_scope[IntResult, CancelFlagHook](
-        hook3, 30000, log3p, True
-    )
-    var root3_sp = UnsafePointer[SC, MutAnyOrigin](to=s3_scopes[0])
+        s3_scopes.append(make_scope(1, log3p, False))
+    s3_scopes[0] = make_scope(30000, log3p, True)
+    var root3_sp = UnsafePointer[Scope, MutAnyOrigin](to=s3_scopes[0])
     for c in range(S3_CHILD):
-        s3_scopes[c + 1] = make_nested_scope[IntResult, CancelFlagHook](
-            hook3, 30100 + c, root3_sp, log3p, True
-        )
+        s3_scopes[c + 1] = make_nested_scope(30100 + c, root3_sp, log3p, True)
 
     var s3_cells = List[TB]()
     for _ in range(S3_TASKS):
@@ -769,11 +724,11 @@ def main() raises:
         if i % S3_PER == 0:
             s3_scene.roles[i] = RoleFail
         var sc_idx = 1 + i / S3_PER
-        var s3_cell = UnsafePointer[SC, MutAnyOrigin](to=s3_scopes[sc_idx])
+        var s3_cell = UnsafePointer[Scope, MutAnyOrigin](to=s3_scopes[sc_idx])
         var h = spawn(rt3, UnsafePointer[TB, MutAnyOrigin](to=s3_cells[i]), 0)
         s3_handles.append(h)
-        _ = s3_cell[].register(
-            UnsafePointer[TB, MutAnyOrigin](to=s3_cells[i]), h.id()
+        _ = s3_cell[].register[IntResult](
+            UnsafePointer[TB, MutAnyOrigin](to=s3_cells[i]), h.id(), 0
         )
         s3_buf[16 + h.id()] = i
     s3_scene.owners = UnsafePointer[
