@@ -34,6 +34,7 @@ from mojito_async.channel.select import (
     branch_ready,
     classify_branch,
     deadline_branch,
+    never,
     recv_branch,
     rescan,
     select,
