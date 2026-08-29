@@ -136,7 +136,10 @@ fi
 # though none had individually tripped a miscompile" at addition time).
 # t38 built at -O 0 stayed clean across the same 30-run moderate-load
 # batch.
-AOT_O0_DRIVERS="t30_worker_pool_aot t33_steal_aot t34_two_phase_aot t34b_affinity_aot t34c_duplicate_wake_aot t35_idle_sleep_aot t36_fairness_aot t41_idle_timer_wake_aot t24_rendezvous_oneshot_aot t39_reactor_aot t40_io_token_aot t41_tcp_connect_aot t42_tcp_accept_aot t42_io_cancel_deadline_aot t44_tcp_read_write_aot t45_reactor_race_aot t46_reactor_fairness_aot t47_pool_scheduler_aot t49_pool_churn_aot t47_channel_cross_worker_aot t38_mutex_cross_worker_aot"
+# Issue #145: t58_stack_registry_aot would rather be a DEFAULT-`-O` driver
+# (its out-slot-origin scenario is only meaningful there), but `mojo build`
+# crashes on it at default -O — the upstream optimizer crash #140 excludes.
+AOT_O0_DRIVERS="t58_stack_registry_aot t30_worker_pool_aot t33_steal_aot t34_two_phase_aot t34b_affinity_aot t34c_duplicate_wake_aot t35_idle_sleep_aot t36_fairness_aot t41_idle_timer_wake_aot t24_rendezvous_oneshot_aot t39_reactor_aot t40_io_token_aot t41_tcp_connect_aot t42_tcp_accept_aot t42_io_cancel_deadline_aot t44_tcp_read_write_aot t45_reactor_race_aot t46_reactor_fairness_aot t47_pool_scheduler_aot t49_pool_churn_aot t47_channel_cross_worker_aot t38_mutex_cross_worker_aot"
 
 failures=0; reds=0; matrix=""
 
