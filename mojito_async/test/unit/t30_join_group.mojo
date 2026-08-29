@@ -155,7 +155,7 @@ def main() raises:
     var s_b = make_scope(71, _logp, False)
     var sp_b = UnsafePointer[Scope, MutAnyOrigin](to=s_b)
     var m_b = TB_M.create()
-    _ = sp_b[].spawn[Metric](rt, _mp(m_b), 0)
+    var h_b = sp_b[].spawn[Metric](rt, _mp(m_b), 0)
     var refused = False
     try:
         sp_b[].join_all()
@@ -167,7 +167,6 @@ def main() raises:
         red("join_all() refusal consumed or closed the registry")
     # drive it to completion and close for a clean teardown:
     idc = 1
-    var h_b = sp_b[].spawn[Metric](rt, _mp(m_b), 0)
     _ = execute(h_b, body_metric, idp)
     sp_b[].join_all()
     _ = h_b.join()
