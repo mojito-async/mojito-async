@@ -136,7 +136,14 @@ fi
 # though none had individually tripped a miscompile" at addition time).
 # t38 built at -O 0 stayed clean across the same 30-run moderate-load
 # batch.
-AOT_O0_DRIVERS="t30_worker_pool_aot t33_steal_aot t34_two_phase_aot t34b_affinity_aot t34c_duplicate_wake_aot t35_idle_sleep_aot t36_fairness_aot t41_idle_timer_wake_aot t24_rendezvous_oneshot_aot t39_reactor_aot t40_io_token_aot t41_tcp_connect_aot t42_tcp_accept_aot t42_io_cancel_deadline_aot t44_tcp_read_write_aot t45_reactor_race_aot t46_reactor_fairness_aot t47_pool_scheduler_aot t49_pool_churn_aot t47_channel_cross_worker_aot t38_mutex_cross_worker_aot"
+# Issue #142: t50_park_commit_window_aot joins for the SAME reason t47/t38
+# are here, met from the DRIVER side rather than the runtime side — its
+# three-thread round handshake is plain non-atomic Int cells read in spin
+# loops, and at default -O the compiler hoists those loads clean out of the
+# loops (the first build "completed" 4000 rounds in 6ms having never once
+# observed another thread).  That is issue #143's LICM hoist; when #143
+# lands, this pin comes off with the others.
+AOT_O0_DRIVERS="t50_park_commit_window_aot t30_worker_pool_aot t33_steal_aot t34_two_phase_aot t34b_affinity_aot t34c_duplicate_wake_aot t35_idle_sleep_aot t36_fairness_aot t41_idle_timer_wake_aot t24_rendezvous_oneshot_aot t39_reactor_aot t40_io_token_aot t41_tcp_connect_aot t42_tcp_accept_aot t42_io_cancel_deadline_aot t44_tcp_read_write_aot t45_reactor_race_aot t46_reactor_fairness_aot t47_pool_scheduler_aot t49_pool_churn_aot t47_channel_cross_worker_aot t38_mutex_cross_worker_aot"
 
 failures=0; reds=0; matrix=""
 
