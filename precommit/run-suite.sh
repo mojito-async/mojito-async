@@ -13,6 +13,18 @@ set -u
 
 cd "$(git rev-parse --show-toplevel)" || exit 2
 
+# --- #141 gate self-test — the gate's OWN tripwire test --------------------
+# Runs first and needs no toolchain: it drives precommit/gate.sh inside a
+# throwaway sandbox and asserts the gate actually blocks what it claims to
+# block.  Nothing else in this tree tests the gate, which is how a blanket
+# `suite` allow-list row survived on main for weeks.
+SELFTEST="precommit/test-gate.sh"
+if [ ! -x "$SELFTEST" ]; then
+    echo "precommit/run-suite.sh: $SELFTEST missing; gate self-test coverage LOST."
+    exit 3
+fi
+"$SELFTEST" || exit 1
+
 RUNSH="spike/colorless_runtime/tests/run.sh"
 if [ ! -x "$RUNSH" ]; then
     echo "precommit/run-suite.sh: $RUNSH missing; suite coverage LOST."
