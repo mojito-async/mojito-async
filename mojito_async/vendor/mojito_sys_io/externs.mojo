@@ -31,6 +31,179 @@
 # Opaque byte-buffer pointer: raw event-batch payloads handed to/from C.
 comptime ByteBuf = UnsafePointer[Byte, MutAnyOrigin]
 
+# ---- s6-socket bindings (issues #77/#78) ------------------------------------
+#
+# A7.3/A7.4 (issues #77/#78) — vendored from mojito-sys
+# `mojito_sys/io/externs.mojo` @ commit a26e9a3550511738252174278af0794f6cbfd104,
+# the s6-socket slice this file's own header notes was deliberately left
+# out of the #75/#76 trim. Same LEAF discipline as the s6-poller bindings
+# below: raw @extern declarations + non-raising probe_* shims ONLY.
+#
+# AGGREGATE RULE (matches the s6-poller note above): the 136-byte neutral
+# mjs_sockaddr travels as an opaque byte buffer (`ByteBuf`) callers
+# fill/inspect with SCALAR loads/stores only.
+
+# A socket descriptor as it crosses the ABI (POSIX fd currency).
+comptime SockFd = Int32
+
+# int* / size_t* out-slots. MutAnyOrigin: the pointer escapes into an
+# opaque callee, and MutAnyOrigin pins the post-call slot load AFTER the
+# call.
+comptime FdSlot = UnsafePointer[Int32, MutAnyOrigin]
+comptime SizeSlot = UnsafePointer[UInt64, MutAnyOrigin]
+
+
+@extern("mjs_socket_socket")
+def mjs_socket_socket(
+    family: Int32, sock_type: Int32, out_fd: FdSlot
+) abi("C") -> Int32:
+    ...
+
+
+@extern("mjs_socket_set_nonblocking")
+def mjs_socket_set_nonblocking(fd: SockFd, enabled: Int32) abi("C") -> Int32:
+    ...
+
+
+@extern("mjs_socket_bind")
+def mjs_socket_bind(fd: SockFd, addr: ByteBuf) abi("C") -> Int32:
+    ...
+
+
+@extern("mjs_socket_listen")
+def mjs_socket_listen(fd: SockFd, backlog: Int32) abi("C") -> Int32:
+    ...
+
+
+@extern("mjs_socket_connect")
+def mjs_socket_connect(fd: SockFd, addr: ByteBuf) abi("C") -> Int32:
+    ...
+
+
+@extern("mjs_socket_accept")
+def mjs_socket_accept(
+    fd: SockFd, out_client: FdSlot, out_peer: ByteBuf
+) abi("C") -> Int32:
+    ...
+
+
+@extern("mjs_socket_recv")
+def mjs_socket_recv(
+    fd: SockFd, buf: ByteBuf, length: UInt64, out_n: SizeSlot
+) abi("C") -> Int32:
+    ...
+
+
+@extern("mjs_socket_send")
+def mjs_socket_send(
+    fd: SockFd, buf: ByteBuf, length: UInt64, out_n: SizeSlot
+) abi("C") -> Int32:
+    ...
+
+
+@extern("mjs_socket_shutdown")
+def mjs_socket_shutdown(fd: SockFd, how: Int32) abi("C") -> Int32:
+    ...
+
+
+@extern("mjs_socket_close")
+def mjs_socket_close(fd: SockFd) abi("C") -> Int32:
+    ...
+
+
+@extern("mjs_sockaddr_ipv4")
+def mjs_sockaddr_ipv4(
+    dotted: ByteBuf, port: Int32, out_addr: ByteBuf
+) abi("C") -> Int32:
+    ...
+
+
+@extern("mjs_sockaddr_format4")
+def mjs_sockaddr_format4(
+    addr: ByteBuf, out_buf: ByteBuf, cap: UInt64, out_len: SizeSlot
+) abi("C") -> Int32:
+    ...
+
+
+# ---- non-raising call shims (leaf-module boundary) --------------------------
+
+
+def probe_socket(family: Int32, sock_type: Int32, out_fd: FdSlot) -> Int32:
+    return mjs_socket_socket(family, sock_type, out_fd)
+
+
+def probe_set_nonblocking(fd: SockFd, enabled: Int32) -> Int32:
+    return mjs_socket_set_nonblocking(fd, enabled)
+
+
+def probe_bind(fd: SockFd, addr: ByteBuf) -> Int32:
+    return mjs_socket_bind(fd, addr)
+
+
+def probe_listen(fd: SockFd, backlog: Int32) -> Int32:
+    return mjs_socket_listen(fd, backlog)
+
+
+def probe_connect(fd: SockFd, addr: ByteBuf) -> Int32:
+    return mjs_socket_connect(fd, addr)
+
+
+def probe_accept(fd: SockFd, out_client: FdSlot, out_peer: ByteBuf) -> Int32:
+    return mjs_socket_accept(fd, out_client, out_peer)
+
+
+def probe_recv(fd: SockFd, buf: ByteBuf, length: UInt64, out_n: SizeSlot) -> Int32:
+    return mjs_socket_recv(fd, buf, length, out_n)
+
+
+def probe_send(fd: SockFd, buf: ByteBuf, length: UInt64, out_n: SizeSlot) -> Int32:
+    return mjs_socket_send(fd, buf, length, out_n)
+
+
+def probe_shutdown(fd: SockFd, how: Int32) -> Int32:
+    return mjs_socket_shutdown(fd, how)
+
+
+def probe_close(fd: SockFd) -> Int32:
+    return mjs_socket_close(fd)
+
+
+def probe_sockaddr_ipv4(dotted: ByteBuf, port: Int32, out_addr: ByteBuf) -> Int32:
+    return mjs_sockaddr_ipv4(dotted, port, out_addr)
+
+
+def probe_sockaddr_format4(
+    addr: ByteBuf, out_buf: ByteBuf, cap: UInt64, out_len: SizeSlot
+) -> Int32:
+    return mjs_sockaddr_format4(addr, out_buf, cap, out_len)
+
+
+# ---- A7.3/A7.4 (issues #77/#78) deviation externs ---------------------------
+#
+# Not part of the frozen upstream mojito-sys s6-socket block (see
+# socket.mojo's module docblock + vendor/mojito-sys/VENDORED_AT_S6_SOCKET.txt
+# for the C-side mjs_socket.c additions this binds). Same leaf discipline:
+# raw @extern + non-raising probe_* shim only.
+
+
+@extern("mjs_socket_set_reuseaddr")
+def mjs_socket_set_reuseaddr(fd: SockFd, enabled: Int32) abi("C") -> Int32:
+    ...
+
+
+@extern("mjs_socket_connect_error")
+def mjs_socket_connect_error(fd: SockFd, out_err: FdSlot) abi("C") -> Int32:
+    ...
+
+
+def probe_set_reuseaddr(fd: SockFd, enabled: Int32) -> Int32:
+    return mjs_socket_set_reuseaddr(fd, enabled)
+
+
+def probe_connect_error(fd: SockFd, out_err: FdSlot) -> Int32:
+    return mjs_socket_connect_error(fd, out_err)
+
+
 # ---- s6-poller bindings (issue #75) ------------------------------------------
 #
 # SCALAR BOUNDARY NOTES (byval-poison class, b2):
