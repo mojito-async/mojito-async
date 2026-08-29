@@ -46,6 +46,11 @@ struct SuspendReason:
     comptime TIMER = Int(5)
     comptime READY = Int(6)
     comptime CLOSED = Int(7)
+    # A7.1 reactor lane (issue #75): a task parked waiting for native I/O
+    # readiness (Reactor.register_and_park / attach_waiter — see
+    # mojito_async/reactor/reactor.mojo).  8 is the next free code (0-7
+    # are taken: NONE/YIELD/JOIN/PARK/CANCEL/TIMER/READY/CLOSED).
+    comptime IO = Int(8)
     # Sentinel for `unpark_current`'s `win_reason` default: "do not stamp a
     # winner reason" — every EXISTING wake producer (mutex/semaphore/
     # channel/timer-service) keeps its call sites unchanged and its
