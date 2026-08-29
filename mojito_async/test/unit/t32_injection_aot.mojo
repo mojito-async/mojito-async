@@ -1,4 +1,4 @@
-# mojito_async/test/unit/t32_injection.mojo
+# mojito_async/test/unit/t32_injection_aot.mojo
 #
 # A2.3 (issue #69) — global injection queue with backpressure: acceptance
 # driver (TDD red->green).
@@ -59,9 +59,19 @@
 #
 # EXTERN DISCIPLINE (b2, modular/modular#6971): pthread externs live at
 # CONCRETE MODULE SCOPE in this driver (never in library modules); the
-# library modules (inject_queue/runtime/scheduler) are extern-free.  The
-# driver is a plain `mojo run` JIT unit driver like t27_generation_wake, so
-# it is named t32_injection.mojo (not *_aot).  Mojo 1.0.0b2 (def-only):
+# library modules (inject_queue/runtime/scheduler) are extern-free.
+# RENAMED from t32_injection.mojo to t32_injection_aot.mojo (A3 merge,
+# 2026-08-28): this driver also imports c_malloc/c_free/entry_pointer FROM
+# mojito_async.vendor.mojito_sys (an IMPORTED module, not local @extern) —
+# under `mojo run` that indirection hits the SAME modular/modular#6971 JIT
+# dylib-symbol-through-an-imported-module limitation every other pthread
+# driver in this suite (t11_stress_aot, t33_steal_aot, t34*_aot) already
+# works around by running AOT.  Driver A's crash (below) previously
+# masked this: it SIGSEGV'd during single-threaded setup, before any
+# producer thread ever called into the imported symbols, so the JIT
+# limitation was never actually reached.  Fixing the setup crash exposed
+# it; `mojo build` + execute (this file's new AOT identity) sidesteps it
+# exactly like its siblings.  Mojo 1.0.0b2 (def-only):
 # `def` only, `@export` callbacks abi("C"), `entry_pointer` for thread
 # starts.  All thread entries CATCH the scaffold raises ("not implemented" —
 # the TDD-red signal) and terminate cleanly so main never joins a spinning
@@ -114,6 +124,17 @@ comptime N_EP = Int(3)                # driver C: park/wake episodes
 comptime MAX_PUSH_ATTS = Int(20000)   # producer retry bound (RED bail)
 comptime MAX_SPIN = Int(3000000)      # bounded spin cap for coordinating polls
 comptime NB = Int(CAP_FULL + 2 * CAP_OVER + 16)
+# Per-TCB heap stride (generous; b2 has no sizeof — cells are addressed
+# individually via tcb pointers; matches the t34_two_phase_aot/
+# t34b_affinity_aot/t34c_duplicate_wake_aot convention).  Root-cause fix
+# (2026-08-28 A3 merge): TaskControlBlock[IntResult] grew to 136 bytes once
+# the A2 owner_worker/owner_runtime/early/claim_epoch fields landed on
+# TCB_Prefix — the old hardcoded 128B "generous" stride here (and in
+# t11_stress_aot.mojo's CELL_BYTES, t33_steal_aot.mojo's TCB_STRIDE) was 8
+# bytes too small, silently overrunning every heap cell by 8 bytes on each
+# write and corrupting the next cell/allocation.  256 restores real
+# headroom.
+comptime TCB_STRIDE = Int(256)
 
 # Ledger counter slots (counts[] array; runs[] is the per-task ledger):
 comptime P_DONE = Int(0)       # producers that finished pushing
@@ -469,8 +490,16 @@ def main() raises:
         runs_buf[k] = 0
     var lp = UnsafePointer[Ledger, MutAnyOrigin](to=ledger)
 
-    # TCB cells: TOTAL tasks + 1 BREAK token at index TOTAL.
-    var cells = stack_allocation[TOTAL + 1, TB]()
+    # TCB cells: TOTAL tasks + 1 BREAK token at index TOTAL.  HEAP-backed
+    # (c_malloc), not stack_allocation: a (TOTAL+1)-element array of
+    # TaskControlBlock[IntResult] (136 bytes each -> ~163KB) trips the same
+    # b2 stack_allocation compiler bug already documented below for driver
+    # B's NB-sized array (oversized-array elision) -- except here it
+    # manifests as a hard SIGSEGV instead of silently-stale state, since the
+    # A2 owner_worker/owner_runtime/early/claim_epoch fields grew the TCB
+    # past whatever threshold made the smaller pre-merge struct survive on
+    # the stack.  Heap cells are the t27/driver-B-proven allocation shape.
+    var cells = c_malloc((TOTAL + 1) * TCB_STRIDE)
     var cellp = UnsafePointer[TB, MutAnyOrigin](unsafe_from_address=Int(cells))
     for k in range(TOTAL):
         (cellp + k)[0] = TB.create()
@@ -566,6 +595,9 @@ def main() raises:
     if rt.skipped() != 1:
         failures.append("driver A: expected exactly 1 skipped stale BREAK "
                         + "record, got " + String(rt.skipped()))
+    # driver A's heap-backed TCB pool: freed once threads have joined and
+    # every check above has read it.
+    c_free(cells)
 
     # ---- Driver B: deterministic backpressure (fresh runtime) --------------
     var rt_b = create()
@@ -585,7 +617,7 @@ def main() raises:
     # transitions on the oversized stack array (verified: states read back
     # NEW).  Heap cells are the t27-proven allocation shape.
     var cells_b = UnsafePointer[TB, MutAnyOrigin](
-        unsafe_from_address=Int(c_malloc(NB * 128))
+        unsafe_from_address=Int(c_malloc(NB * TCB_STRIDE))
     )
     var cellp_b = cells_b
     for k in range(NB):
