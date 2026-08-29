@@ -40,7 +40,7 @@ from mojito_async.runtime.runtime import Runtime, create
 from mojito_async.runtime.scheduler import scheduler_loop
 from mojito_async.runtime.park import park_current, unpark_current
 from mojito_async.runtime.task_control_block import TaskControlBlock
-from mojito_async.scope import CancelHook, Scope, make_scope
+from mojito_async.scope import Scope, make_scope
 from mojito_async.task import JoinHandle, claim_running, execute, spawn
 
 
@@ -56,17 +56,6 @@ def _handle(tcb_addr: Int, tid: Int) -> JoinHandle[IntResult]:
     return JoinHandle[IntResult](
         UnsafePointer[TB, MutAnyOrigin](unsafe_from_address=tcb_addr), tid
     )
-
-
-# Stub cancellation hook for the Scope (A1.1 injects the failure policy;
-# real tree propagation is a later lane).
-struct NoopCancel(CancelHook):
-    def __init__(out self):
-        pass
-
-    def request_cancel(mut self, scope_handle: Int, child_handle: Int) raises:
-        pass
-
 
 # ---------------------------------------------------------------------------
 # Scene (pointer-backed; b2 by-value params share the pointees):
@@ -175,9 +164,8 @@ def main() raises:
     var rt = create()
     var order = List[Int]()
     var order_ptr = UnsafePointer[List[Int], MutAnyOrigin](to=order)
-    var hook = NoopCancel()
-    var scope = make_scope[IntResult, NoopCancel](hook, 77, order_ptr, False)
-    var sp = UnsafePointer[Scope[IntResult, NoopCancel], MutAnyOrigin](to=scope)
+    var scope = make_scope(77, order_ptr, False)
+    var sp = UnsafePointer[Scope, MutAnyOrigin](to=scope)
 
     # Stable flag cells + per-child token pointers (fully preloaded first).
     var flags = List[CancelFlag]()
@@ -219,7 +207,7 @@ def main() raises:
     for i in range(NA):
         var h = spawn(rt, UnsafePointer[TB, MutAnyOrigin](to=cells[i]), 0)
         handles.append(h)
-        _ = sp[].register(UnsafePointer[TB, MutAnyOrigin](to=cells[i]), h.id())
+        _ = sp[].register[IntResult](UnsafePointer[TB, MutAnyOrigin](to=cells[i]), h.id(), 0)
         buf[16 + h.id()] = i  # tid -> child index
     scene.owners = UnsafePointer[List[JoinHandle[IntResult]], MutAnyOrigin](
         to=handles
@@ -264,7 +252,7 @@ def main() raises:
             red("A: child " + String(i) + " not COMPLETED")
 
     # ---- scope close: join-integrated consume; no orphaned results ----------
-    sp[].close(rt)
+    sp[].close_typed[IntResult](rt)
     if sp[].is_open():
         red("A: scope did not close")
     if sp[].live_child_count() != 0:
@@ -334,9 +322,8 @@ def main() raises:
 
     var order2 = List[Int]()
     var order_ptr2 = UnsafePointer[List[Int], MutAnyOrigin](to=order2)
-    var hook2 = NoopCancel()
-    var scope2 = make_scope[IntResult, NoopCancel](hook2, 88, order_ptr2, False)
-    var sp2 = UnsafePointer[Scope[IntResult, NoopCancel], MutAnyOrigin](to=scope2)
+    var scope2 = make_scope(88, order_ptr2, False)
+    var sp2 = UnsafePointer[Scope, MutAnyOrigin](to=scope2)
 
     var cells2 = List[TB]()
     for _ in range(NB):
@@ -345,7 +332,7 @@ def main() raises:
     for i in range(NB):
         var h = spawn(rt2, UnsafePointer[TB, MutAnyOrigin](to=cells2[i]), 0)
         handles2.append(h)
-        _ = sp2[].register(UnsafePointer[TB, MutAnyOrigin](to=cells2[i]), h.id())
+        _ = sp2[].register[IntResult](UnsafePointer[TB, MutAnyOrigin](to=cells2[i]), h.id(), 0)
         buf2[16 + h.id()] = i
     scene2.owners = UnsafePointer[List[JoinHandle[IntResult]], MutAnyOrigin](
         to=handles2
@@ -364,7 +351,7 @@ def main() raises:
             liveB += 1
     if liveB != 0:
         red("B: " + String(liveB) + " live children")
-    sp2[].close(rt2)
+    sp2[].close_typed[IntResult](rt2)
     var orphanedB = 0
     for i in range(NB):
         if cells2[i].has_result_pending():
