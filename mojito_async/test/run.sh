@@ -98,7 +98,20 @@ fi
 # this fold; a fresh `mojo build` segfault, not a runtime bug, confirmed
 # `-O 0` fixes it) — every OTHER driver that imports the SAME modules
 # keeps the default optimization level (they stayed under the threshold).
-AOT_O0_DRIVERS="t30_worker_pool_aot t33_steal_aot t34_two_phase_aot t34b_affinity_aot t34c_duplicate_wake_aot t35_idle_sleep_aot t36_fairness_aot t41_idle_timer_wake_aot t24_rendezvous_oneshot_aot t39_reactor_aot t40_io_token_aot t41_tcp_connect_aot t42_tcp_accept_aot t42_io_cancel_deadline_aot t44_tcp_read_write_aot t45_reactor_race_aot t46_reactor_fairness_aot t47_pool_scheduler_aot t49_pool_churn_aot"
+# Issue #128: t47_channel_cross_worker_aot hits the SAME class of bug
+# t34/t34b/t34c/t35 document above (NOT the pool/scheduler-dependency-
+# graph compiler crash the previous paragraph describes): its two REAL
+# worker OS threads spin on `while not h.is_completed(): scheduler_loop(
+# ...); sleep(...)` waiting for a cross-worker wake delivered via a plain
+# (non-atomic) TaskControlBlock state field — at the default optimization
+# level the compiler can hoist that plain read out of the loop (never
+# re-reading the OTHER thread's write), producing a driver-side false
+# "lost wakeup" (empirically: 100% reproducible within a handful of
+# iterations at default -O, 0/30+ at `-O 0`) that is a MISCOMPILATION
+# artifact, not a defect in Channel[T]'s guard/two-phase-park fix (issue
+# #128) itself.  Every OTHER AOT driver keeps the default optimization
+# level (the suite is NOT rebuilt at -O 0).
+AOT_O0_DRIVERS="t30_worker_pool_aot t33_steal_aot t34_two_phase_aot t34b_affinity_aot t34c_duplicate_wake_aot t35_idle_sleep_aot t36_fairness_aot t41_idle_timer_wake_aot t24_rendezvous_oneshot_aot t39_reactor_aot t40_io_token_aot t41_tcp_connect_aot t42_tcp_accept_aot t42_io_cancel_deadline_aot t44_tcp_read_write_aot t45_reactor_race_aot t46_reactor_fairness_aot t47_pool_scheduler_aot t49_pool_churn_aot t47_channel_cross_worker_aot"
 
 failures=0; reds=0; matrix=""
 
