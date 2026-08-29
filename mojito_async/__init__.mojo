@@ -17,7 +17,7 @@ from mojito_async.cancellation import (
 from mojito_async.runtime.checkpoint import checkpoint
 from mojito_async.runtime.runtime import Runtime, create, run
 from mojito_async.runtime.scheduler import yield_now
-from mojito_async.scope import Scope
+from mojito_async.scope import Scope, with_scope
 from mojito_async.task import JoinHandle, spawn
 from mojito_async.time.deadline import Deadline
 from mojito_async.time.sleep import sleep
