@@ -859,25 +859,27 @@ def make_scope(
     return Scope(handle, _opt_log(order_log, has_log), no_parent)
 
 
-def make_nested_scope(
-    handle: Int,
-    parent: UnsafePointer[Scope, MutAnyOrigin],
-    order_log: UnsafePointer[List[Int], MutAnyOrigin],
-    has_log: Bool,
-    out self: Scope,
+def validate_nest(
+    parent: UnsafePointer[Scope, MutAnyOrigin], handle: Int
 ) raises:
-    """Nested scope: registers an open subscope of `parent`, so the parent
-    cannot close until this scope closes (inner-before-outer).
-
-    OUT-PARAM factory (issue #54): the child scope is constructed IN PLACE at
-    the caller's final binding (`var s = make_nested_scope(...)`), and the
-    child's FINAL address is registered into the parent's cancellation-tree
-    registry (`_child_scope_ids` / `_child_scope_ptrs`).  A return-by-value
-    factory would register a temporary's address that dangles after the move
-    (b2 move semantics), so the tree walk would walk garbage.
-
-    Refuses a closed parent (existing rule), a CANCELLED parent (issue #54),
-    or a duplicate child-scope handle."""
+    """Shared pre-construction validation for nesting a child scope
+    (handle `handle`) under `parent`: refuses a closed parent (existing
+    rule), a CANCELLED parent (issue #54), or a duplicate child-scope
+    handle.  Factored out of `make_nested_scope` (A6.1, issue #84): a
+    caller that embeds its own Scope field (`mojito_async.time.timeout_
+    scope.TimeoutScope`) needs the IDENTICAL validation WITHOUT routing
+    construction through `make_nested_scope`'s own out-param — assigning
+    the result of ONE out-param factory to a FIELD of ANOTHER out-param
+    (`self._scope = make_nested_scope(...)` inside a raising `__init__`)
+    mis-places the embedded Scope under the b2 compiler (verified this
+    session: the address `make_nested_scope` captures for the parent's
+    cancellation-tree registry is the pre-move TEMPORARY's, not the
+    field's final address — a later cancel-tree descent through that
+    entry dereferences dangling memory).  Callers with an embedded Scope
+    field construct it DIRECTLY (`self._scope = Scope(...)`, safe: `Scope.
+    __init__` captures no self-pointer) and call `attach_child_scope`
+    below only AFTER the field has settled at its own out-param's stable
+    final address."""
     if not parent[].is_open():
         var err = ChildrenStillLive(
             "ChildrenStillLive: parent scope "
@@ -900,14 +902,51 @@ def make_nested_scope(
             + String(handle)
         )
         raise Error(err.message)
+
+
+def attach_child_scope(
+    parent: UnsafePointer[Scope, MutAnyOrigin],
+    handle: Int,
+    child_ptr: UnsafePointer[Scope, MutAnyOrigin],
+):
+    """Register `child_ptr` — a child Scope's OWN FINAL, stable address —
+    as a direct child in `parent`'s cancellation tree (issue #54 edge).
+    Factored out of `make_nested_scope` (issue #84) so a caller embedding
+    its own Scope field (TimeoutScope) can register it AFTER constructing
+    it directly, instead of chaining through make_nested_scope's
+    out-param (see `validate_nest` above for why the chain mis-places)."""
+    parent[]._child_scope_ids.append(handle)
+    parent[]._child_scope_ptrs.append(child_ptr)
+
+
+def make_nested_scope(
+    handle: Int,
+    parent: UnsafePointer[Scope, MutAnyOrigin],
+    order_log: UnsafePointer[List[Int], MutAnyOrigin],
+    has_log: Bool,
+    out self: Scope,
+) raises:
+    """Nested scope: registers an open subscope of `parent`, so the parent
+    cannot close until this scope closes (inner-before-outer).
+
+    OUT-PARAM factory (issue #54): the child scope is constructed IN PLACE at
+    the caller's final binding (`var s = make_nested_scope(...)`), and the
+    child's FINAL address is registered into the parent's cancellation-tree
+    registry (`_child_scope_ids` / `_child_scope_ptrs`).  A return-by-value
+    factory would register a temporary's address that dangles after the move
+    (b2 move semantics), so the tree walk would walk garbage.
+
+    Refuses a closed parent (existing rule), a CANCELLED parent (issue #54),
+    or a duplicate child-scope handle (`validate_nest`, issue #84 shared
+    helper)."""
+    validate_nest(parent, handle)
     var with_log = _opt_log(order_log, has_log)
     var with_parent = Optional[UnsafePointer[Scope, MutAnyOrigin]](parent)
     self = Scope(handle, with_log, with_parent)
     # register the child scope (handle + FINAL pointer) into the parent's
     # cancellation-tree registry (issue #54).
-    parent[]._child_scope_ids.append(handle)
-    parent[]._child_scope_ptrs.append(
-        UnsafePointer[Scope, MutAnyOrigin](to=self)
+    attach_child_scope(
+        parent, handle, UnsafePointer[Scope, MutAnyOrigin](to=self)
     )
 
 
