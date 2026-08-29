@@ -1,16 +1,20 @@
 # mojito_async/channel/select.mojo
 #
 # A5.4 (issue #92) multi-wait select primitive + A5.5 (issue #93) close/
-# select behavior and try-scan fairness (spec §42, Phase A5).
+# select behavior and try-scan fairness + A5.3 (issue #91) deadline/timeout
+# integration (spec §42, Phase A5).
 #
-# select() waits on several channel recv/send operations (and a forward-
-# compatible deadline branch — the actual timer wake is A6/#91, out of
-# scope here) and resumes on exactly ONE winner; the losing branches are
-# logically cancelled and the whole scheme composes with the C6 generation-
-# claim / park kernel unchanged (EPIC #4, #56/#58): select never invents a
-# second park/wake mechanism, it only fans ONE task's WaitRecord out across
-# several channels' existing FIFO wait queues and collapses back to one via
-# unregister_* once a winner is claimed.
+# select() waits on several channel recv/send operations and a real
+# timer-integrated deadline branch (issue #91 — `deadline_branch(heap,
+# clock, deadline)`/`timeout_branch(heap, clock, duration)`, layered on
+# the #92 bare ticks-only descriptor) and resumes on exactly ONE winner;
+# the losing branches are logically cancelled and the whole scheme
+# composes with the C6 generation-claim / park kernel unchanged (EPIC #4,
+# #56/#58): select never invents a second park/wake mechanism, it only
+# fans ONE task's WaitRecord out across several channels' existing FIFO
+# wait queues (plus, for #91, the A1.4 timer heap's own per-id generation
+# slot) and collapses back to one via unregister_*/cancel_token once a
+# winner is claimed.
 #
 # ---------------------------------------------------------------------------
 # Erasure strategy decision (issue #92 deliverable; mirrors #42's ADR-015)
@@ -85,6 +89,44 @@
 #      discipline in park.mojo/#56/#58: the loser is gone from the wait
 #      queue entirely, not merely generation-stale).
 #
+# ---------------------------------------------------------------------------
+# #91 timer wiring — deadline/timeout as a REAL select branch
+# ---------------------------------------------------------------------------
+#
+#   `deadline_branch(heap, clock, deadline)` / `timeout_branch(heap, clock,
+#   duration)` layer a caller-owned `time.timer_heap.TimerHeap` address onto
+#   the #92 DEADLINE descriptor (`SelectBranch.heap_addr`) so `select()` can
+#   arm/cancel a REAL wake instead of only comparing against a caller-
+#   supplied `now_ticks` (the #92 fast-path-only behavior, unchanged for the
+#   bare `deadline_branch(deadline_ticks)` form).
+#     - ARM-BEFORE-PARK: when a DEADLINE branch is genuinely BLOCKED (its
+#       `now_ticks` hasn't reached `deadline_ticks` yet), `select()` arms
+#       the heap for THIS task (`heap.arm(h.id(), Int(h.tcb()),
+#       deadline_ticks)` — the exact call `time/sleep.mojo#sleep_current`
+#       uses) BEFORE registering the other channel branches and parking, so
+#       an already-due deadline is never missed (mirrors the sleep lane's
+#       proven arm-before-park order, #36).  An already-due deadline is
+#       caught by the ordinary `classify_branch` fast path and never touches
+#       the heap at all — `select_fast` never arms or cancels a timer.
+#     - CANCEL SYMMETRY: `SelectState` carries the ONE armed timer's
+#       generation (`_timer_armed`/`_timer_gen`) across the park/resume
+#       boundary.  A channel-branch winner calls `_cancel_armed_timer` to
+#       drop the still-pending heap entry (`heap.cancel_token`) so the heap
+#       ends empty; a DEADLINE winner needs no extra cancel step — the
+#       timer service (`time/timer_service.service_timers`) already popped
+#       its own entry before waking this task — and `_unregister_others`
+#       (unchanged) drops every losing channel registration exactly as it
+#       already does for any other winner kind.
+#     - ONE timer per task: `heap.arm` is keyed by `h.id()`, matching every
+#       other timer/sleep caller in this codebase; a select cycle carries
+#       at most one live DEADLINE branch's arm at a time (the natural
+#       reading of "a select call's timeout").
+#     - Exactly-at ties resolve exactly like any other #93 rescan tie: the
+#       first READY_DATA branch in scan order wins (registration-order
+#       determinism), so a channel branch and an elapsed deadline becoming
+#       ready in the SAME rescan still produce exactly one winner.
+#
+#
 # Mojo 1.0.0b2 workarounds: def-only, module factories (no static methods);
 # SelectBranch/SelectState/SelectOutcome are pure DATA, no function-typed
 # fields; dispatch on `kind` is a plain Int switch throughout (the repo-wide
@@ -94,7 +136,10 @@ from mojito_async.channel.channel import Channel
 from mojito_async.runtime.runtime import Runtime
 from mojito_async.runtime.task_control_block import ResultValue
 from mojito_async.runtime.park import park_current
-from mojito_async.task import JoinHandle
+from mojito_async.task import JoinHandle, SuspendReason
+from mojito_async.time.clock import MonotonicClock
+from mojito_async.time.deadline import Deadline, Duration
+from mojito_async.time.timer_heap import TimerHeap
 
 
 # ---------------------------------------------------------------------------
@@ -116,19 +161,31 @@ struct SelectBranch(ImplicitlyCopyable, ImplicitlyDeletable, Movable):
     # send (0 otherwise; DEADLINE never touches it).
     var item_addr: Int
     # DEADLINE only: the deadline tick value compared against a caller-
-    # supplied `now_ticks` (0 otherwise; RECV/SEND never touch it).  No
-    # timer/reactor exists yet (A6/#84-88, A7/#75-83 — not this wave), so a
-    # DEADLINE branch with no `now_ticks` context simply never classifies
-    # READY; it exists so #91's follow-on can wire a real clock without
-    # changing this descriptor shape.
+    # supplied `now_ticks` (0 otherwise; RECV/SEND never touch it).  A
+    # bare `deadline_branch(deadline_ticks)` (#92 descriptor) never
+    # classifies READY on its own until `now_ticks` says so; the real
+    # timer-integrated factories below (#91) additionally arm a heap.
     var deadline_ticks: Int
+    # DEADLINE only (issue #91): address of the caller-owned TimerHeap used
+    # to ARM a real wake when this branch is genuinely BLOCKED at park time
+    # and to CANCEL it when a different branch wins (0 for RECV/SEND, and
+    # for the bare #92 ticks-only descriptor which has no heap to arm).
+    var heap_addr: Int
     var kind: Int
 
-    def __init__(out self, kind: Int, chan_addr: Int, item_addr: Int, deadline_ticks: Int):
+    def __init__(
+        out self,
+        kind: Int,
+        chan_addr: Int,
+        item_addr: Int,
+        deadline_ticks: Int,
+        heap_addr: Int = 0,
+    ):
         self.kind = kind
         self.chan_addr = chan_addr
         self.item_addr = item_addr
         self.deadline_ticks = deadline_ticks
+        self.heap_addr = heap_addr
 
 
 def recv_branch[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable](
@@ -151,6 +208,37 @@ def deadline_branch(deadline_ticks: Int) -> SelectBranch:
     """DEADLINE branch (issue #92 descriptor; real timer wiring is #91).
     Selectable once a caller-supplied `now_ticks >= deadline_ticks`."""
     return SelectBranch(SelectBranch.DEADLINE, 0, 0, deadline_ticks)
+
+
+def deadline_branch(
+    heap: UnsafePointer[TimerHeap, MutAnyOrigin],
+    clock: MonotonicClock,
+    deadline: Deadline,
+) -> SelectBranch:
+    """Real timer-integrated DEADLINE branch (issue #91): the #92 bare
+    descriptor carries a tick value nobody arms; this overload additionally
+    stores `heap`'s address so `select()` can ARM a genuine timer wake when
+    the branch is BLOCKED at park time (see the #91 section above) and
+    CANCEL it if a different branch wins.  `clock` is accepted for call-
+    site symmetry with `timeout_branch` and with `time/sleep.mojo`'s
+    `sleep_until_current(rt, h, heap, clock, deadline)` — an ABSOLUTE
+    deadline needs no `now` reading to resolve into ticks, so it is
+    otherwise unused here."""
+    var ticks = Int(UInt64(deadline.at_ms()) * 1000000)
+    return SelectBranch(SelectBranch.DEADLINE, 0, 0, ticks, Int(heap))
+
+
+def timeout_branch(
+    heap: UnsafePointer[TimerHeap, MutAnyOrigin],
+    clock: MonotonicClock,
+    duration: Duration,
+) -> SelectBranch:
+    """Real timer-integrated DEADLINE branch from a RELATIVE duration
+    (issue #91): resolves `clock.now() + duration.ticks()` into an
+    absolute deadline at construction time — the exact convention
+    `time/sleep.mojo#sleep_current` uses for `sleep(duration)`."""
+    var ticks = Int(clock.now() + duration.ticks())
+    return SelectBranch(SelectBranch.DEADLINE, 0, 0, ticks, Int(heap))
 
 
 # ---------------------------------------------------------------------------
@@ -231,17 +319,40 @@ struct SelectState(ImplicitlyCopyable, ImplicitlyDeletable, Movable):
 
     var winner: Int
     var _rescan_cursor: Int
+    # Timer slot (issue #91): tracks whether THIS select cycle armed a real
+    # heap timer for a DEADLINE branch that was genuinely BLOCKED at park
+    # time, and the generation token needed to cancel it (`heap.cancel_
+    # token(task_id, gen)`) if a different branch wins first.  Persists
+    # across the park -> resume boundary on the SAME caller-owned
+    # SelectState the whole select cycle threads through (mirrors how
+    # `winner`/`_rescan_cursor` already persist that way).
+    var _timer_armed: Bool
+    var _timer_gen: Int
+    var _timer_deadline: UInt64
 
     def __init__(out self):
         self.winner = -1
         self._rescan_cursor = 0
+        self._timer_armed = False
+        self._timer_gen = 0
+        self._timer_deadline = 0
 
     def cursor(self) -> Int:
         return self._rescan_cursor
 
+    def timer_armed(self) -> Bool:
+        """True while a real heap timer is still pending for this select
+        cycle (issue #91 diagnostic/test accessor)."""
+        return self._timer_armed
+
     def reset(mut self):
         """Clear the winner cell for a fresh select cycle (the cursor is
-        NOT reset — fairness rotation is meant to persist across cycles)."""
+        NOT reset — fairness rotation is meant to persist across cycles).
+        A still-armed timer is left untouched — the code paths that resolve
+        a select cycle (`select`/`select_fast`'s claim step, issue #91)
+        always consume `_timer_armed` themselves before a caller could
+        reasonably call reset(); reset() is not a substitute for a real
+        winner claim."""
         self.winner = -1
 
 
@@ -395,6 +506,30 @@ def _unregister_others[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable](
             )[].unregister_sender(task_id)
 
 
+def _cancel_armed_timer(
+    branches: List[SelectBranch], mut state: SelectState, task_id: Int
+) raises:
+    """Timer/data cancellation symmetry (issue #91): once ANY branch is
+    claimed, drop a still-armed deadline timer from the heap so a channel
+    winner never leaves a stale entry behind — the reverse direction (a
+    deadline winner leaving channel registrations behind) is already
+    covered by `_unregister_others`.  No-op when no timer was armed this
+    cycle, or when the DEADLINE branch itself won and the timer service
+    already popped its own entry (`cancel_token` on a missing entry is a
+    documented no-op, `time/timer_heap.mojo`)."""
+    if not state._timer_armed:
+        return
+    for i in range(len(branches)):
+        var b = branches[i]
+        if b.kind == SelectBranch.DEADLINE and b.heap_addr != 0:
+            var heap = UnsafePointer[TimerHeap, MutAnyOrigin](
+                unsafe_from_address=b.heap_addr
+            )
+            _ = heap[].cancel_token(task_id, state._timer_gen)
+            state._timer_armed = False
+            return
+
+
 # ---------------------------------------------------------------------------
 # select_fast — non-parking try-scan (issue #92/#93)
 # ---------------------------------------------------------------------------
@@ -418,6 +553,7 @@ def select_fast[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable, R: Result
         return SelectOutcome[T]()
     var out = _claim_at[T](branches, idx)
     _unregister_others[T](branches, h.id(), idx)
+    _cancel_armed_timer(branches, state, h.id())
     state.winner = idx
     return out^
 
@@ -459,6 +595,7 @@ def select[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable, R: ResultValue
     if idx != -1:
         var out = _claim_at[T](branches, idx)
         _unregister_others[T](branches, h.id(), idx)
+        _cancel_armed_timer(branches, state, h.id())
         state.winner = idx
         return out^
     var any_blocked = False
@@ -475,14 +612,31 @@ def select[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable, R: ResultValue
                 UnsafePointer[Channel[T], MutAnyOrigin](
                     unsafe_from_address=b.chan_addr
                 )[].register_sender(h)
-            # DEADLINE BLOCKED: no wait queue to register into yet (#91/A6
-            # timer wiring is out of scope here); the branch simply cannot
-            # wake this task on its own until that lands.
+            elif b.kind == SelectBranch.DEADLINE and b.heap_addr != 0:
+                # Real timer-integrated DEADLINE branch (issue #91): arm
+                # the caller's heap so the timer service (time/
+                # timer_service.service_timers) can wake THIS task when no
+                # channel branch becomes ready first — the exact arm call
+                # time/sleep.mojo#sleep_current uses.  A bare #92 ticks-
+                # only descriptor (heap_addr == 0) still cannot wake on its
+                # own; unchanged from #92.
+                var heap = UnsafePointer[TimerHeap, MutAnyOrigin](
+                    unsafe_from_address=b.heap_addr
+                )
+                var gen = heap[].arm(
+                    h.id(), Int(h.tcb()), UInt64(b.deadline_ticks)
+                )
+                state._timer_armed = True
+                state._timer_gen = gen
+                state._timer_deadline = UInt64(b.deadline_ticks)
     if not any_blocked:
         raise Error(
             "SelectError: no branch is ready, closed, or blockable "
             "(select would park forever)"
         )
     state.winner = -1
-    park_current(rt, h)
+    if state._timer_armed:
+        park_current(rt, h, SuspendReason.TIMER)
+    else:
+        park_current(rt, h)
     return SelectOutcome[T]()
