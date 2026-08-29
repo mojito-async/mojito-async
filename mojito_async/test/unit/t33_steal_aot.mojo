@@ -417,7 +417,7 @@ def seed_tasks(
     for k in range(count):
         var tid = first + k
         seed_cell(sc, tid)
-        wp[]._local.push_back(TaskRecord(sc[].tcb_addrs[tid], tid))
+        wp[].local_queue()[].push_back(TaskRecord(sc[].tcb_addrs[tid], tid))
 
 
 def mark_started_reenqueued(sc: UnsafePointer[Scene, MutAnyOrigin], tid: Int) raises:
@@ -578,11 +578,11 @@ def _scenario_migration(
         seed_cell(sc, k + 8)
     seed_cell(sc, STARTED)
     for k in range(6):
-        w1p[]._local.push_back(TaskRecord(sc[].tcb_addrs[k + 1], k + 1))
+        w1p[].local_queue()[].push_back(TaskRecord(sc[].tcb_addrs[k + 1], k + 1))
     for k in range(5):
-        w1p[]._local.push_back(TaskRecord(sc[].tcb_addrs[k + 8], k + 8))
+        w1p[].local_queue()[].push_back(TaskRecord(sc[].tcb_addrs[k + 8], k + 8))
     mark_started_reenqueued(sc, STARTED)
-    w1p[]._local.push_back(TaskRecord(sc[].tcb_addrs[STARTED], STARTED))
+    w1p[].local_queue()[].push_back(TaskRecord(sc[].tcb_addrs[STARTED], STARTED))
     run_scenario(failures, sc)
 
 
