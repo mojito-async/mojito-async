@@ -51,7 +51,7 @@ from mojito_async.runtime.task_control_block import ResultValue, TaskControlBloc
 from std.atomic import Atomic
 from mojito_async.runtime.inject_queue import InjectQueue
 from mojito_async.integration.sys import BytePtr
-from mojito_async.runtime.idle import announce_work
+from mojito_async.runtime.idle import announce_work, wake_one as idle_wake_one
 
 
 # ---------------------------------------------------------------------------
@@ -148,17 +148,23 @@ struct Runtime:
     # failed probe (empty deque or a STARTED record returned to its owner)
     # bumps nothing — no fake counters.
     var _steal_total: Int
-# E6/M2 (PR #106/#107 folds; issue #112) — the idle-accounting block for the
-    # producer-side wake budget (runtime/idle.mojo).  OPTIONAL pointer
-    # field: the pool allocates the block and arms each worker runtime's
-    # cell via arm_acct() once the E6 NativeEvent idle path exists; until
-    # then the field carries the address-1 SENTINEL and every read is
-    # guarded exactly like the acct readers' pattern (`_acct_guarded`,
-    # idle.mojo), so a cloned/moved Runtime (worker cells are rebuilt per
-    # start) never announces against a sentinel.  The ANNOUNCE side is
-# wired in enqueue_global per ACCEPTED record and enqueue_local/
-    # push_remote; the SIGNAL (wake_one) is #112-OWNED.
+    # E6/M2/#112 (PR #106/#107 folds; issue #112 item 2) — the idle-
+    # accounting block + the pool NativeEvent handle for the producer-side
+    # wake budget (runtime/idle.mojo).  OPTIONAL fields: the pool allocates
+    # the block/event and arms each worker runtime's cell via arm_acct()/
+    # arm_event() once the E6 NativeEvent idle path exists (worker_pool.mojo
+    # _workers_reinit); until then `_acct` carries the address-1 SENTINEL
+    # and `_event` carries 0, and every read/signal is guarded exactly like
+    # the acct readers'/idle.wake_one's pattern, so a cloned/moved Runtime
+    # (worker cells are rebuilt per start) never announces or signals
+    # against a sentinel.  ANNOUNCE + SIGNAL are both wired in
+    # enqueue_global (per accepted record) and enqueue_local/push_remote —
+    # item 2's wake-path fix: before this fold only announce_work fired
+    # (M2-partial), so an idle-parked owner could stall up to the full
+    # IDLE_PARK_SLICE_NS backstop (~2s) instead of waking within the
+    # event's latency.
     var _acct: BytePtr
+    var _event: Int
     # A2.7 (issue #73) — fairness counters (spec §21/§67/§71): work-class
     # slice accounting + budget/service/starvation observability.  The
     # starve-watch and budget state LIVE in the fair loop (scheduler.mojo);
@@ -202,6 +208,7 @@ struct Runtime:
         self._inject = InjectQueue(Self.INJECT_CAPACITY)
         self._steal_total = 0
         self._acct = BytePtr(unsafe_from_address=1)
+        self._event = 0
         self._slices_local = 0
         self._slices_remote = 0
         self._slices_inject = 0
@@ -265,12 +272,13 @@ struct Runtime:
             raise Error("runtime.enqueue_local: runtime is shut down")
         self._local.push_back(TaskRecord(tcb_addr, task_id))
         self._enqueued += 1
-        # E6/M2 producer-side wake budget: announce the accepted LOCAL unit
-        # into the idle acct when the pool armed one (optional pointer
-        # field; address-1 sentinel; guarded like the acct readers).
-        self._announce_work()
-        # #112-OWNED: wake_one call — the wake signal for this announced
-        # local unit (the E6 lane bounds the budget, acct_parked > 0).
+        # E6/M2/#112 producer-side wake budget: announce the accepted LOCAL
+        # unit into the idle acct when the pool armed one, then SIGNAL the
+        # pool event (issue #112 item 2 — before this fold only the
+        # announce fired; an idle-parked owner could stall up to the full
+        # IDLE_PARK_SLICE_NS backstop instead of waking within the event's
+        # latency).
+        self._announce_and_wake()
 
     def push_remote(mut self, tcb_addr: Int, task_id: Int) raises:
         """Deliver a wake to THIS worker's remote-ready queue (STARTED-fiber
@@ -281,14 +289,14 @@ struct Runtime:
             raise Error("runtime.push_remote: runtime is shut down")
         self._remote.push(TaskRecord(tcb_addr, task_id))
         self._enqueued += 1
-        # E6/M2 producer-side wake budget: a REMOTE wake is the classic
-        # cross-worker producer — announce the accepted unit (the woken
-        # owner may be an idle-parked sleeper).
-        self._announce_work()
-        # #112-OWNED: wake_one call — the wake signal for this announced
-        # remote unit (the E6 lane bounds the budget, acct_parked > 0).
+        # E6/M2/#112 producer-side wake budget: a REMOTE wake is the
+        # classic cross-worker producer — announce the accepted unit AND
+        # signal the pool event (the woken owner may be an idle-parked
+        # sleeper; issue #112 item 2 closes the wake-path gap this exact
+        # call site named).
+        self._announce_and_wake()
 
-    # --- E6/M2 idle-acct seam (PR #106/#107 folds; issue #112) ------------
+    # --- E6/M2/#112 idle-acct seam (PR #106/#107 folds; issue #112) -------
 
     def arm_acct(mut self, acct: BytePtr):
         """Pool-owned (the E6 lane calls this per worker cell once the
@@ -299,20 +307,40 @@ struct Runtime:
         if Int(acct) > 1:
             self._acct = acct
 
+    def arm_event(mut self, event: Int):
+        """Pool-owned (issue #112 item 2, paired with arm_acct): arm this
+        runtime's pool NativeEvent handle so the wake paths below can
+        SIGNAL an idle-parked owner, not just announce work for it.  `0`
+        (the NULL-CAPABLE raw-handle convention, vendor/mojito_sys.mojo
+        header) is refused/left unarmed — idle.wake_one's own guard treats
+        0 identically, so this is belt-and-suspenders against a Runtime
+        that is armed with an acct block but never wired to a real pool
+        event (e.g. a caller-owned acct block in a unit test)."""
+        if event != 0:
+            self._event = event
+
     def pool_acct(mut self) -> BytePtr:
         """This runtime's armed idle-accounting block; the address-1
         sentinel while unarmed."""
         return self._acct
 
-    def _announce_work(mut self):
-        """E6/M2 producer-side wake budget: announce ONE accepted runnable
-        record into the idle acct when the pool armed one.  The acct
-        pointer is an OPTIONAL pointer field (default = the address-1
-        sentinel) and every read is guarded exactly like the acct readers'
-        pattern; an unarmed runtime announces nothing.  The SIGNAL —
-        wake_one — lands in #112: this fold only wires the announce."""
+    def pool_event(mut self) -> Int:
+        """This runtime's armed pool NativeEvent handle; 0 while unarmed."""
+        return self._event
+
+    def _announce_and_wake(mut self):
+        """E6/M2/#112 producer-side wake budget: announce ONE accepted
+        runnable record into the idle acct when the pool armed one, THEN
+        signal the pool event via idle.wake_one (item 2: the SIGNAL half —
+        idle.wake_one's own guard fires the OS-level signal only when a
+        worker is actually parked AND the event is armed, so an unarmed
+        Runtime, or one with no parked sleeper, announces/signals nothing).
+        Both fields are OPTIONAL (default = the address-1 sentinel / 0) and
+        every read is guarded exactly like the acct readers' pattern; an
+        unarmed runtime announces and signals nothing."""
         if Int(self._acct) > 1:
             announce_work(self._acct, 1)
+            idle_wake_one(self._acct, self._event)
 
     def pop_local(mut self) raises -> TaskRecord:
         """Dequeue the next LOCAL record (owner LIFO end); raises on an
@@ -404,14 +432,14 @@ struct Runtime:
             # is counted inside the queue's own lock (accepted()); the local
             # `_enqueued` counter stays untouched here.
             self._inject.push(TaskRecord(tcb_addr, task_id))
-            # E6/M2 producer-side wake budget (PR #106 fold): announce PER
-            # ACCEPTED RECORD — a push that raised at capacity announces
-            # NOTHING, so the bounded wake budget is never over-spent (a
-            # rejected unit produces no wake entitlement).  wake_one is
-            # #112-OWNED: this fold only wires the announce.
-            self._announce_work()
-            # #112-OWNED: wake_one call — bounded wake budget: at most ONE
-            # signal per accepted record, fired only when acct_parked > 0.
+            # E6/M2/#112 producer-side wake budget: announce PER ACCEPTED
+            # RECORD — a push that raised at capacity announces NOTHING,
+            # so the bounded wake budget is never over-spent (a rejected
+            # unit produces no wake entitlement) — THEN signal the pool
+            # event (item 2): at most ONE signal per accepted record,
+            # fired only when idle.wake_one's own guard finds a parked
+            # sleeper.
+            self._announce_and_wake()
         else:
             # enqueue_local(W): E2/#68's per-worker deque lane — the record
             # lands on THIS worker's LOCAL deque (owner push_back, LIFO
@@ -421,13 +449,11 @@ struct Runtime:
             # consumed: #68's LocalDeque replaced the A1 `_ready` FIFO]
             self._local.push_back(TaskRecord(tcb_addr, task_id))
             self._enqueued += 1
-            # E6/M2 producer-side wake budget: announce the accepted LOCAL
-            # unit (optional pointer field; address-1 sentinel; guarded
-            # like the acct readers).
-            self._announce_work()
-            # #112-OWNED: wake_one call — the wake signal for this
-            # announced local unit (the E6 lane bounds the budget,
-            # acct_parked > 0).
+            # E6/M2/#112 producer-side wake budget: announce the accepted
+            # LOCAL unit AND signal the pool event (item 2 — the wake
+            # signal for this announced local unit; idle.wake_one bounds
+            # the budget on acct_parked > 0).
+            self._announce_and_wake()
 
     def inject_queue(mut self) -> UnsafePointer[InjectQueue, MutAnyOrigin]:
         """The shared injection queue (drain seam for scheduler_loop)."""

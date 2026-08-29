@@ -68,7 +68,7 @@ from mojito_async.fiber.fiber import Fiber, FiberFrame, make_fiber
 from mojito_async.runtime.runtime import Runtime
 from mojito_async.runtime.task_control_block import ResultValue, TaskControlBlock
 from mojito_async.runtime.join_handle import JoinHandle, SuspendReason
-from mojito_async.runtime.park import park_current, unpark_current
+from mojito_async.runtime.park import park_commit, park_prepare, park_validate, unpark_current
 from mojito_async.runtime.scheduler import yield_now
 
 
@@ -269,8 +269,9 @@ def seam_park_switch(fr: UnsafePointer[FiberFrame, MutAnyOrigin]):
 # ---------------------------------------------------------------------------
 # The FRAME already migrated (seam_park_switch + seam_drive); these close
 # the STATE half through the #39 single-source park/wake kernel
-# (park_current / unpark_current) and scheduler.yield_early's early-wake
-# edge.  Generic-parameter functions here perform NO extern calls.
+# (park_prepare/park_validate/park_commit / unpark_current) and
+# scheduler.yield_early's early-wake edge.  Generic-parameter functions
+# here perform NO extern calls.
 
 def fiber_suspend_current[R: ResultValue](
     mut rt: Runtime,
@@ -279,11 +280,34 @@ def fiber_suspend_current[R: ResultValue](
 ) raises:
     """A1.5 `_suspend_current` (spec §60): the state commit of a fiber park.
 
-    After seam_park_switch, commit RUNNING -> PARKING -> WAITING over the
-    #39 kernel, stamping the wait REASON and claiming a fresh wait epoch
-    (generation is bumped).  The worker is free for other RUNNABLE records;
-    only a later wake re-enters this fiber at its exact saved frame."""
-    park_current(rt, h, reason)
+    TWO-PHASE (#112 item 3, migrated from single-phase `park_current`):
+    after seam_park_switch (the frame has ALREADY physically left this
+    worker's native context), commit through park_prepare/park_validate/
+    park_commit — PARKING -> WAITING (reason stamped, fresh wait epoch)
+    normally, OR PARKING -> RUNNABLE in the early-wake case below.  A
+    single-phase commit here would silently drop a cross-worker wake that
+    lands in the PARKING window (e.g. a fiber parked mid-channel-recv or
+    mid-timer-sleep, both now two-phase consumers themselves) — the exact
+    A4.1/issue #55 class of bug, just on the fiber-seam consumer instead
+    of Mutex.
+
+    Early-wake window: unlike mutex/semaphore's claim_running (continue
+    synchronously in the SAME call — their frame never left the worker),
+    a fiber's frame has ALREADY left via seam_park_switch, so there is no
+    more code to run in THIS dispatch.  A validate hit therefore commits
+    PARKING -> RUNNABLE (no WAITING, no epoch bump — Q6: the record was
+    never dequeued in the first place) and RE-ENQUEUES onto this (owner)
+    worker's remote-ready queue — exactly the delivery unpark_current's
+    own claimed-wake path already uses (spec §19.2: a started fiber is
+    never local/stealable) — so a LATER scheduler slice re-enters the
+    fiber at its exact seam_park_switch return point.  The worker is free
+    for other RUNNABLE records either way."""
+    park_prepare(h)
+    if park_validate(h):
+        park_commit(h)
+        rt.push_remote(Int(h.tcb()), h.id())
+        return
+    park_commit(h, reason)
 
 
 def fiber_yield_now[R: ResultValue](mut rt: Runtime, h: JoinHandle[R]) raises:

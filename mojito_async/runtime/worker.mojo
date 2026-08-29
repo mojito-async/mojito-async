@@ -92,8 +92,17 @@ struct Worker:
     var _started: Bool
     var _tls_current_worker: NativeTlsKey
 
-    # --- E2-OWNED (issue #68): local runnable deque ---
-    var _local: LocalDeque
+    # #112 (item 1 fix): NO separate `_local` field here — the worker's
+    # runnable deque is `self._runtime`'s embedded LocalDeque (the ONE
+    # instance `task.spawn`/`Runtime.enqueue_local` actually push onto,
+    # reached via `local_queue()` below).  Before this fold Worker carried
+    # its OWN, permanently-empty LocalDeque here: pop_local/request_steal
+    # read THIS field while every real spawn (spawn()/enqueue_local())
+    # pushed onto the Runtime's SEPARATE copy, so E4 stealing was
+    # structurally DEAD in the real pool regardless of peer wiring (only
+    # t33_steal_aot's raw-poked scenario, which wrote directly to this
+    # dead field, ever exercised the probe).  t33 now seeds through
+    # `local_queue()[].push_back(...)` like every other caller.
     # --- E1-OWNED (issue #67): pool identity + peers ---
     var _index: Int
     var _peers: UnsafePointer[UnsafePointer[Worker, MutAnyOrigin], MutUntrackedOrigin]
@@ -110,7 +119,6 @@ struct Worker:
         self._thread = make_native_thread()
         self._started = False
         self._tls_current_worker = NativeTlsKey()
-        self._local = LocalDeque()
         self._index = 0
         self._peers = UnsafePointer[
             UnsafePointer[Worker, MutAnyOrigin], MutUntrackedOrigin
@@ -126,7 +134,6 @@ struct Worker:
         self._thread = make_native_thread()
         self._started = False
         self._tls_current_worker = NativeTlsKey()
-        self._local = LocalDeque()
         self._index = 0
         self._peers = UnsafePointer[
             UnsafePointer[Worker, MutAnyOrigin], MutUntrackedOrigin
@@ -144,9 +151,9 @@ struct Worker:
         the loop and adds the remote-ready queue).  Included here because
         the E4 steal probe sits exactly after local/remote/inject in the
         §21 order.  None when the deque is empty."""
-        if self._local.is_empty():
+        if self._runtime.local_queue()[].is_empty():
             return Optional[TaskRecord]()
-        return Optional[TaskRecord](self._local.pop_back())
+        return Optional[TaskRecord](self._runtime.local_queue()[].pop_back())
 
     def request_steal[R: ResultValue = Nil](
         mut self, target: Int
@@ -173,9 +180,10 @@ struct Worker:
         if target < 0 or target >= self._n_workers or target == self._index:
             return Optional[TaskRecord]()
         var peer = self._peers[target]
-        if peer[]._local.is_empty():
+        var peer_deque = peer[]._runtime.local_queue()
+        if peer_deque[].is_empty():
             return Optional[TaskRecord]()
-        var r = peer[]._local.steal_front()
+        var r = peer_deque[].steal_front()
         var checker = UnsafePointer[TaskControlBlock[R], MutAnyOrigin](
             unsafe_from_address=r.tcb_addr
         )
@@ -183,7 +191,7 @@ struct Worker:
             # Started task — return it to the OWNER's deque (it re-runs
             # there; nothing is lost or duplicated) and report the probe as
             # failed so the caller picks another peer.
-            peer[]._local.push_back(r)
+            peer_deque[].push_back(r)
             return Optional[TaskRecord]()
         self._runtime.note_steal()
         return Optional[TaskRecord](r)
@@ -271,9 +279,42 @@ struct Worker:
     def set_pool_idle(mut self, event: Int, acct: BytePtr):
         """Pool-owned (A2.6): bind this worker's reference to the SHARED
         pool idle state — the NativeEvent handle + the lock-free accounting
-        block.  Set during worker reinit so the worker loop can park."""
+        block.  Set during worker reinit so the worker loop can park.
+
+        #112 (item 2 fix): ALSO arms the EMBEDDED Runtime's own (acct,
+        event) pair (arm_acct/arm_event, runtime.mojo) — before this fold
+        the Worker's own _event/_acct fields were bound here but the
+        Runtime's wake paths (enqueue_local/push_remote/enqueue_global)
+        read a NEVER-armed Runtime._acct (the address-1 sentinel), so a
+        pooled worker's own runnable-queue wake paths announced and
+        signaled NOTHING — the M2/M7 wake budget was structurally dead in
+        the real pool, exercised only by tests that armed a Runtime by
+        hand (t31/t32)."""
         self._event = event
         self._acct = acct
+        self._runtime.arm_acct(acct)
+        self._runtime.arm_event(event)
+
+    def set_peers(
+        mut self,
+        index: Int,
+        peers: UnsafePointer[UnsafePointer[Worker, MutAnyOrigin], MutUntrackedOrigin],
+        n_workers: Int,
+    ):
+        """Pool-owned (issue #112 item 1): wire this worker's pool identity
+        (0-based `index`, matching worker_at(i)'s addressing) and the peer
+        registry E4's try_steal_unstarted probe walks (issue #70).  Before
+        this fold worker_pool.mojo never called this — every pooled
+        Worker kept the `__init__` defaults (_n_workers == 0), so
+        try_steal_unstarted's `if self._n_workers <= 1: return None` guard
+        made stealing structurally DEAD in the real pool (only
+        test-driver-poked _index/_peers/_n_workers, e.g. t33, ever
+        exercised the probe).  `peers` is the pool's ONE shared pointer
+        array (peers[i] == worker_at(i) for every i, including `index`
+        itself; request_steal already skips target == self._index)."""
+        self._index = index
+        self._peers = peers
+        self._n_workers = n_workers
 
     def pool_acct(mut self) -> BytePtr:
         """The pool's idle-accounting block this worker reports into.  (The
