@@ -31,4 +31,5 @@ from mojito_async.channel.select import (
     select,
     select_fast,
     send_branch,
+    timeout_branch,
 )
