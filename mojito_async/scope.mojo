@@ -140,6 +140,26 @@ struct ScopeCancelled:
     def __init__(out self, msg: String):
         self.message = msg
 
+# CancelHook — injected cancellation callback (failure-policy seam, #64)
+# ---------------------------------------------------------------------------
+#
+# Retired as a Scope TYPE PARAMETER by the #42 non-generic conversion (issue
+# #61) — request_cancel_all() above now drives sibling cancellation directly
+# through the erased TCB_Prefix for the with_scope root ergonomic.  The
+# A3.5 failure policy (issue #64) still wants a COOPERATIVE, flag-observable
+# cancellation signal (the shipped mojito_async.cancellation_adapter
+# CancelFlagHook) at the moment a primary error is RECORDED, so the trait
+# survives as a PER-CALL generic constraint on record_failure[H] below —
+# the same pattern #61 already uses for register[T]/spawn[T]/lookup[T]: the
+# STRUCT stays non-generic; only the method is parametrically polymorphic
+# over the caller-supplied hook.
+
+trait CancelHook(ImplicitlyCopyable, Movable, ImplicitlyDeletable):
+    """Injection point for the sibling cancellation policy (spec A0-T14)."""
+
+    def request_cancel(mut self, scope_handle: Int, child_handle: Int) raises:
+        ...
+
 
 # ---------------------------------------------------------------------------
 # ScopeChild is defined in runtime/task_control_block.mojo (re-exported here
@@ -202,7 +222,15 @@ struct Scope(Movable, ImplicitlyDeletable):
     # Direct child scopes (handle + final pointer), the §29.1 tree walk.
     var _child_scope_ids: List[Int]
     var _child_scope_ptrs: List[UnsafePointer[Scope, MutAnyOrigin]]
-
+    # Failure record (issue #64): first-RECORDED failure is the primary
+    # (handle + message); later failures are suppressed.  `_failed` counts
+    # EVERY recorded failure (no error is lost); `_raised` marks the primary
+    # consumed-on-raise (exactly-once).
+    var _primary_handle: Int
+    var _primary_msg: String
+    var _suppressed: Int
+    var _failed: Int
+    var _raised: Bool
     def __init__(
         out self,
         handle: Int,
@@ -218,7 +246,11 @@ struct Scope(Movable, ImplicitlyDeletable):
         self._cancelled = False
         self._child_scope_ids = List[Int]()
         self._child_scope_ptrs = List[UnsafePointer[Scope, MutAnyOrigin]]()
-        if self._parent:
+        self._primary_handle = 0
+        self._primary_msg = ""
+        self._suppressed = 0
+        self._failed = 0
+        self._raised = False        if self._parent:
             self._parent.value()[]._open_subscopes += 1
 
     # --- queries -----------------------------------------------------------
@@ -254,7 +286,19 @@ struct Scope(Movable, ImplicitlyDeletable):
             if self._child_scope_ids[i] == child_scope_handle:
                 return True
         return False
+    # --- failure-policy queries (issue #64) --------------------------------
 
+    def has_primary_error(self) -> Bool:
+        """True while a primary error is recorded and not yet raised."""
+        return self._failed > 0 and not self._raised
+
+    def failed_count(self) -> Int:
+        """Total RECORDED failures (primary + suppressed): no error is lost."""
+        return self._failed
+
+    def suppressed_count(self) -> Int:
+        """Failures recorded after the primary (kept observable)."""
+        return self._suppressed
     def has_live_unfinished(self) -> Bool:
         """True when a registered child is not yet COMPLETED (genuinely live;
         the close() join would have nothing to consume).  Erased read: the
@@ -546,7 +590,49 @@ struct Scope(Movable, ImplicitlyDeletable):
         except Error:
             self.drop_children()
         raise Error(msg)
+    # --- failure policy (issue #64: record primary, cancel siblings via a
+    # per-call CancelHook, raise once at the boundary) ----------------------
 
+    def record_failure[H: CancelHook](
+        mut self, child_handle: Int, msg: String, mut hook: H
+    ) raises:
+        """Record a child failure under the first-error failure policy.
+
+        FIRST-RECORDED wins (documented ordering: first-RECORDED, not
+        first-finished): the first record_failure becomes the PRIMARY error
+        and cancels every sibling through the caller-supplied CancelHook —
+        the cancel-tree #54-ready COOPERATIVE seam, distinct from the
+        best-effort erased request_cancel_all() above — once, in registry
+        order, skipping the failed child itself.  Later failures are
+        recorded-but-not-primary (suppressed) and never re-cancel siblings;
+        `failed_count` totals every record so no error is lost.  Refuses an
+        unknown child."""
+        if not self.is_registered(child_handle):
+            var err = ChildrenStillLive(
+                "UnknownChild: record_failure of unknown child "
+                + String(child_handle)
+                + " from scope "
+                + String(self._handle)
+            )
+            raise Error(err.message)
+        if self._failed == 0:
+            self._primary_handle = child_handle
+            self._primary_msg = msg
+            for i in range(len(self._children)):
+                var sid = self._children[i].id
+                if sid != child_handle:
+                    hook.request_cancel(self._handle, sid)
+        else:
+            self._suppressed += 1
+        self._failed += 1
+
+    def raise_primary(mut self) raises:
+        """Deferred raise surface (first_error-style): raise the recorded
+        primary error exactly once.  No-op when no primary is recorded or it
+        was already consumed by an earlier raise/close."""
+        if self._failed > 0 and not self._raised:
+            self._raised = True
+            raise Error(self._primary_msg)
     # --- containment -------------------------------------------------------
 
     def drop_children(mut self):
@@ -606,9 +692,14 @@ struct Scope(Movable, ImplicitlyDeletable):
         NEVER consumes results: callers reap typed results through their
         JoinHandles (or use close_typed[T] on homogeneous scopes for the
         join-integrated typed reap).  `rt` is RESERVED for the engine-driven
-        join of a later lane."""
+        join of a later lane.
+
+        Phase 3 (issue #64): after closing, raise the recorded primary error
+        exactly once (raise_primary — consumed on raise); a later close then
+        refuses with DoubleClose instead of re-raising it."""
         self._validate_exit()
         self._close_bookkeeping()
+        self.raise_primary()
 
     def close_typed[T: ScopeChild](mut self, mut rt: Runtime) raises:
         """TYPED join-integrated close for HOMOGENEOUS scopes (#42 pt 4):
@@ -616,7 +707,10 @@ struct Scope(Movable, ImplicitlyDeletable):
         T.TAG — ANY mismatch raises ScopeTagMismatch BEFORE anything is
         consumed (the #42 negative test) — then consume-once take_result of
         each settled child through the typed boundary.  The scope is the
-        final joiner for children never individually reaped."""
+        final joiner for children never individually reaped.
+
+        Phase 3 (issue #64): after closing, raise the recorded primary error
+        exactly once (raise_primary — consumed on raise)."""
         self._validate_exit()
         for i in range(len(self._children)):
             if self._children[i].tag != T.TAG:
@@ -642,6 +736,7 @@ struct Scope(Movable, ImplicitlyDeletable):
                 )
                 _ = tc[].take_result()
         self._close_bookkeeping()
+        self.raise_primary()
 
     def _subscope_closed(mut self, child_handle: Int):
         """A direct child scope closed: decrement the open-subscope counter

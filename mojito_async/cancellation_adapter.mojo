@@ -46,6 +46,7 @@
 # builtin `Error` raises.
 
 from mojito_async.cancellation import CancelFlag
+from mojito_async.scope import CancelHook
 
 
 # ---------------------------------------------------------------------------
@@ -225,7 +226,7 @@ struct CancelFlagRegistry(Movable, ImplicitlyDeletable):
 # decoupled from Scope; see module header)
 # ---------------------------------------------------------------------------
 
-struct CancelFlagHook(Movable, ImplicitlyDeletable):
+struct CancelFlagHook(CancelHook, ImplicitlyCopyable, Movable, ImplicitlyDeletable):
     """Resolves (scope, child) handles to the registered child flag and
     requests it (cancelling that child, and — through the child's parent
     link — propagating downward into the child's own descendants).  Refuses
