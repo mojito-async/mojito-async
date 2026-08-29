@@ -60,10 +60,15 @@ fi
 # RWLock/Barrier/Condvar) is compiled alongside it; `-O 0` compiles in
 # seconds and the driver passes every scenario (RENAMED to `_aot.mojo` so
 # it goes through this O0-capable loop instead of the plain JIT unit-test
-# loop above, which has no optimization-level override).  Every OTHER AOT
-# driver keeps the default optimization level (the suite is NOT rebuilt at
-# -O 0).
-AOT_O0_DRIVERS="t34_two_phase_aot t34b_affinity_aot t34c_duplicate_wake_aot t35_idle_sleep_aot t24_rendezvous_oneshot_aot"
+# loop above, which has no optimization-level override).  A7.1/A7.2 (issue
+# #75/#76): t39_reactor_aot and t40_io_token_aot's large single-`main()`
+# drivers (real Reactor + real kqueue fds + a multi-iteration cancellation
+# battery) hit the SAME default-optimization compiler crash as
+# t24_rendezvous_oneshot above once compiled alongside the reactor
+# package's own dependency graph; `-O 0` compiles cleanly and every
+# scenario passes.  Every OTHER AOT driver keeps the default optimization
+# level (the suite is NOT rebuilt at -O 0).
+AOT_O0_DRIVERS="t34_two_phase_aot t34b_affinity_aot t34c_duplicate_wake_aot t35_idle_sleep_aot t24_rendezvous_oneshot_aot t39_reactor_aot t40_io_token_aot"
 
 failures=0; reds=0; matrix=""
 
