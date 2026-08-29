@@ -21,23 +21,13 @@ from mojito_async.integration.sys import BytePtr, IntResult
 from mojito_async.runtime.runtime import Runtime, create
 from mojito_async.runtime.scheduler import scheduler_loop
 from mojito_async.runtime.task_control_block import TaskControlBlock
-from mojito_async.scope import CancelHook, Scope, make_scope
+from mojito_async.scope import Scope, make_scope
 from mojito_async.task import JoinHandle, execute, spawn
 
 
 def red(what: String) raises -> None:
     print("T17 scheduler compose: RED (" + what + ")")
     raise Error(what)
-
-
-# --- stub cancellation hook -------------------------------------------------
-
-struct NoopCancel(CancelHook):
-    def __init__(out self):
-        pass
-
-    def request_cancel(mut self, scope_handle: Int, child_handle: Int) raises:
-        pass
 
 
 comptime TB = TaskControlBlock[IntResult]
@@ -117,9 +107,8 @@ def main() raises:
     # scope owns the three children
     var order = List[Int]()
     var order_ptr = UnsafePointer[List[Int], MutAnyOrigin](to=order)
-    var hook = NoopCancel()
-    var s = make_scope[IntResult, NoopCancel](hook, 17, order_ptr, False)
-    var sp = UnsafePointer[Scope[IntResult, NoopCancel], MutAnyOrigin](to=s)
+    var s = make_scope(17, order_ptr, False)
+    var sp = UnsafePointer[Scope, MutAnyOrigin](to=s)
 
     var t1 = TB.create()
     var t2 = TB.create()
@@ -127,9 +116,9 @@ def main() raises:
     var h1 = spawn(rt, UnsafePointer[TB, MutAnyOrigin](to=t1), 0)
     var h2 = spawn(rt, UnsafePointer[TB, MutAnyOrigin](to=t2), 0)
     var h3 = spawn(rt, UnsafePointer[TB, MutAnyOrigin](to=t3), 0)
-    _ = sp[].register(UnsafePointer[TB, MutAnyOrigin](to=t1), h1.id())
-    _ = sp[].register(UnsafePointer[TB, MutAnyOrigin](to=t2), h2.id())
-    _ = sp[].register(UnsafePointer[TB, MutAnyOrigin](to=t3), h3.id())
+    _ = sp[].register[IntResult](UnsafePointer[TB, MutAnyOrigin](to=t1), h1.id(), 0)
+    _ = sp[].register[IntResult](UnsafePointer[TB, MutAnyOrigin](to=t2), h2.id(), 0)
+    _ = sp[].register[IntResult](UnsafePointer[TB, MutAnyOrigin](to=t3), h3.id(), 0)
     buf[2] = h1.id()
     buf[3] = h2.id()
     buf[4] = h3.id()
@@ -148,7 +137,7 @@ def main() raises:
         red("runnable queue not quiet after drive")
 
     # join-integrated close: joins settled children, consumes their results.
-    sp[].close(rt)
+    sp[].close_typed[IntResult](rt)
     if sp[].is_open():
         red("scope still open after close")
     if sp[].live_child_count() != 0:

@@ -35,3 +35,17 @@ from mojito_async.channel.unbounded import (
     make_unbounded_receiver,
     make_unbounded_sender,
 )
+from mojito_async.channel.select import (
+    SelectBranch,
+    SelectOutcome,
+    SelectState,
+    branch_ready,
+    classify_branch,
+    deadline_branch,
+    recv_branch,
+    rescan,
+    select,
+    select_fast,
+    send_branch,
+    timeout_branch,
+)
