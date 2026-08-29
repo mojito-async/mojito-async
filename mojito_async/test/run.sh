@@ -52,10 +52,18 @@ fi
 # -O 0 — a higher optimization level can hoist the plain handshake reads and
 # deadlock or desynchronize the driver.  A2.6 t35 (PR #110, issue #72): the
 # wake-burst probe trips a 1.0.0b2 codegen SEGV at -O 3, so it also builds
-# at -O 0 (the unoptimized build lowers the burst loop cleanly).  Every
-# OTHER AOT driver keeps the default optimization level (the suite is NOT
-# rebuilt at -O 0).
-AOT_O0_DRIVERS="t34_two_phase_aot t34b_affinity_aot t34c_duplicate_wake_aot t35_idle_sleep_aot"
+# at -O 0 (the unoptimized build lowers the burst loop cleanly).  A5.1 (A5
+# batch review, issue #89): t24_rendezvous_oneshot's large single-`main()`
+# acceptance driver hangs the b2 compiler itself (not a runtime deadlock —
+# `mojo build` never returns) at the default optimization level once the
+# full A3+A4-grown dependency graph (Scope, the two-phase park kernel,
+# RWLock/Barrier/Condvar) is compiled alongside it; `-O 0` compiles in
+# seconds and the driver passes every scenario (RENAMED to `_aot.mojo` so
+# it goes through this O0-capable loop instead of the plain JIT unit-test
+# loop above, which has no optimization-level override).  Every OTHER AOT
+# driver keeps the default optimization level (the suite is NOT rebuilt at
+# -O 0).
+AOT_O0_DRIVERS="t34_two_phase_aot t34b_affinity_aot t34c_duplicate_wake_aot t35_idle_sleep_aot t24_rendezvous_oneshot_aot"
 
 failures=0; reds=0; matrix=""
 
