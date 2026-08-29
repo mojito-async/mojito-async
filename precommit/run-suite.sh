@@ -52,3 +52,17 @@ if [ ! -x "$TIMERBENCHSH" ]; then
     exit 3
 fi
 "$TIMERBENCHSH" || exit 1
+# --- A7.8 echo bench (issue #82) — same gate discipline -------------------
+ECHOBENCHSH="bench/run_echo.sh"
+if [ ! -x "$ECHOBENCHSH" ]; then
+    echo "precommit/run-suite.sh: $ECHOBENCHSH missing; bench coverage LOST."
+    exit 3
+fi
+"$ECHOBENCHSH" || exit 1
+# --- A7.9 fairness bench (issue #83) — same gate discipline ---------------
+FAIRNESSBENCHSH="bench/run_fairness.sh"
+if [ ! -x "$FAIRNESSBENCHSH" ]; then
+    echo "precommit/run-suite.sh: $FAIRNESSBENCHSH missing; bench coverage LOST."
+    exit 3
+fi
+"$FAIRNESSBENCHSH" || exit 1
