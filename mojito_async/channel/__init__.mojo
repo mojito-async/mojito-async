@@ -1,11 +1,19 @@
 # mojito_async/channel/__init__.mojo
 #
-# A1.3 channel (issue #35) — public channel surface.
+# A1.3 channel (issue #35) / A5.2 unbounded channel (issue #90) — public
+# channel surface.
 #
 # Spec §39-41: bounded Channel[T] with Sender/Receiver split, ring buffer +
 # sender/receiver wait queues + closed flags; send/recv may park, try_send/
 # try_recv never block; close-last-sender drains receivers, close-last-receiver
-# wakes blocked senders and fails subsequent sends.
+# wakes blocked senders and fails subsequent sends.  UnboundedChannel[T]
+# mirrors this model with no capacity bound: a sender never blocks, only a
+# receiver waits on an empty channel.  Its Sender/Receiver handles are
+# aliased to UnboundedSender/UnboundedReceiver here — the bounded and
+# unbounded modules each define their own `Sender`/`Receiver` struct, and a
+# bare re-export of both under the same name is ambiguous (Mojo rejects it
+# at import time), so the unbounded pair is re-exported under distinct
+# public names.
 #
 # Lower-level pieces (WaitRecord, the park/wake seam) live in
 # mojito_async.channel.channel; this module re-exports the public names so
@@ -18,6 +26,14 @@ from mojito_async.channel.channel import (
     make_channel,
     make_receiver,
     make_sender,
+)
+from mojito_async.channel.unbounded import (
+    UnboundedChannel,
+    Receiver as UnboundedReceiver,
+    Sender as UnboundedSender,
+    make_unbounded,
+    make_unbounded_receiver,
+    make_unbounded_sender,
 )
 from mojito_async.channel.select import (
     SelectBranch,
