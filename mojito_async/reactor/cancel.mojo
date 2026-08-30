@@ -220,6 +220,13 @@ def service_io_deadlines[R: ResultValue](
     service_io in the same tick (see test/unit/t42_io_cancel_deadline.mojo
     for the composition), exactly like drive_step composes scheduler_loop
     + service_timers today."""
+    # woke is a best-effort diagnostic counter: both the was_waiting read
+    # and the post-unpark state check are outside any guard, so under
+    # concurrent execution (EPIC #2's M:N) the count can undercount tasks
+    # that actually transitioned PARKING→RUNNABLE via the early-wake latch.
+    # Correctness does not depend on the count; it is consumed only by
+    # drive_step for telemetry.  The service_timers / service_io_deadlines
+    # caller must not gate a safety property on the return value.
     var woke = 0
     while heap.has_due(now):
         var e = heap.pop_min()
