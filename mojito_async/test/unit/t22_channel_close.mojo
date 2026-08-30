@@ -25,6 +25,8 @@ from std.memory import stack_allocation
 from mojito_async.channel import (
     Channel,
     Receiver,
+    RecvOutcome,
+    SendOutcome,
     Sender,
     make_channel,
     make_receiver,
@@ -136,14 +138,14 @@ def receiver_slice(
 ) raises:
     claim_running(h)
     var v = sc[].rx.recv(rt, h)
-    if h.state() == TaskControlBlock.WAITING:
+    if v.is_parked():
         rec(sc, EV_R_PARK)
         if phase_slot == S_R1_PHASE:
             sc[].r1_phase[] = 1
         else:
             sc[].r2_phase[] = 1
         return
-    if v:
+    if v.is_value():
         rec(sc, EV_R_RECV)
         _complete(h, v.value())
         rec(sc, EV_R_DONE)
@@ -161,15 +163,15 @@ def producer_slice(
     if sc[].p_phase[] == 0:
         sc[].p_phase[] = 1
     try:
-        sc[].tx.send(rt, h, 77)
+        var outcome = sc[].tx.send(rt, h, 77)
+        if outcome.is_parked():
+            rec(sc, EV_P_PARK)
+            return
     except e:
         sc[].raised[] = 1
         rec(sc, EV_P_RAISED)
         _complete(h, -1)
         rec(sc, EV_P_DONE)
-        return
-    if h.state() == TaskControlBlock.WAITING:
-        rec(sc, EV_P_PARK)
         return
     rec(sc, EV_P_SENT)
     _complete(h, 77)
