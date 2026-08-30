@@ -23,11 +23,12 @@
 # cell's OS reservation.  Issue #145 Bug 2 closed the ABA hole: Fiber.destroy()
 # no longer calls ms_stack_free for pool-acquired cells (_is_pooled flag);
 # pool.retire() / drain() are the only callers of ms_stack_free for pool cells.
-# Consequently the pool's STATE array (_state[idx]) is the single source of
-# truth for cell liveness: a CACHED cell's reservation is guaranteed live
-# (never freed between release() and acquire()) without any ms_stack_is_live
-# probe.  The ABA hole is eliminated: the C registry address-based probe
-# (ms_stack_is_live) is no longer used in the pool's hot paths.
+# The pool's STATE array is the single source of truth for cell liveness.
+# acquire()'s warm path retains a defensive ms_stack_is_live probe to
+# cold-reallocate rather than hand out a dangling base in the abnormal case
+# where a caller bypasses the invariant; release() does NOT add this probe
+# because the dead-list in ms_stack_is_live causes false negatives when the
+# OS reuses a recently-freed address for a fresh allocation.
 # Reuse gate (spec §15 "never recycle until unquestionably complete"): a
 # cache entry is handed to a NEW caller only after an explicit release(),
 # which the caller performs once the owning fiber/task is TERMINAL.  The
@@ -65,6 +66,7 @@ from mojito_async.vendor.mojito_sys import (
     ms_page_size,
     ms_stack_alloc,
     ms_stack_free,
+    ms_stack_is_live,
     ms_stack_total_size,
 )
 
@@ -226,18 +228,22 @@ struct StackCache(Movable, ImplicitlyDeletable):
     # acquired).
     def acquire(mut self) raises -> UnsafePointer[NativeStack, MutAnyOrigin]:
         if self._cached > 0:
-            # Warm hit: pop the head cell.  The pool is the sole OS owner of
-            # each cell (issue #145 Bug 2: Fiber.destroy() skips stack_free
-            # for pool cells, so the reservation is guaranteed live).  The
-            # pool's STATE array is the source of truth; no ms_stack_is_live
-            # probe is needed.
+            # Warm hit: pop the head cell.  Under normal operation, the pool
+            # is the sole OS owner of each cell (issue #145 Bug 2) so the
+            # reservation is guaranteed live.  Defensive probe: if an external
+            # call freed the cell's reservation underneath us, cold-allocate a
+            # fresh stack rather than hand out a dangling base (T6, t27).
             var idx = self._head
             self._head = self._next[idx]
             self._next[idx] = NO_NEXT
-            self._state[idx] = STATE_LIVE
+            if ms_stack_is_live(self._cells[idx].base) != 0:
+                self._state[idx] = STATE_LIVE
+                self._cached -= 1
+                self._live += 1
+                return self._cells + idx
+            # Stale cached cell: mark FREE, fall through to cold-allocate.
+            self._state[idx] = STATE_FREE
             self._cached -= 1
-            self._live += 1
-            return self._cells + idx
 
         # Cold: is the pool at capacity (all cells live or cached)?
         if self._live + self._cached >= self._capacity:
@@ -269,13 +275,15 @@ struct StackCache(Movable, ImplicitlyDeletable):
 
     # Reuse gate: returns `cell` (must be a LIVE cell this pool handed out)
     # to the free set.  The caller attests the owning fiber/task reached
-    # TERMINAL before invoking this; the pool enforces that the cell is in
-    # fact live (never double-release, never release-of-unknown).
-    #
-    # Issue #145 Bug 2: no ms_stack_is_live probe here.  Pool cells are
-    # never freed by Fiber.destroy() (_is_pooled flag); the STATE_LIVE check
-    # below is sufficient — the reservation is guaranteed to still be in the
-    # C registry.
+    # TERMINAL before invoking this; the pool enforces the cell is STATE_LIVE
+    # (never double-release, never release-of-unknown).  The STATE gate is
+    # sufficient: issue #145 Bug 2 ensures pool cells are never freed
+    # externally (Fiber.destroy skips ms_stack_free for pooled cells), so
+    # the reservation is guaranteed live when release() is called.  An
+    # ms_stack_is_live probe is NOT added here: the dead-list in
+    # ms_stack_is_live causes false negatives when the OS reuses a recently-
+    # freed address for a fresh pool in a different StackCache instance,
+    # making the check unreliable in multi-pool scenarios (t27 scenario B).
     def release(mut self, cell: UnsafePointer[NativeStack, MutAnyOrigin]) raises:
         var idx = self._index_of(cell)
         if idx < 0:
