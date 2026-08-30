@@ -6,14 +6,23 @@
 # mojito_async/vendor/mojito-sys are picked up automatically by the
 # wildcards below without editing this file.
 #
-# Two vendored source trees (byte-identical substrate, same basenames):
+# Two vendored source trees, same basenames for their shared substrate:
 #   - SPIKE  spike/colorless_runtime/vendor/mojito-sys   (A0 spike harness)
 #   - PROD   mojito_async/vendor/mojito-sys              (A1 production, #49)
-# The substrate is byte-identical, so the dylib is built from the PROD tree
-# (authoritative production copy); the spike harness and A1 suite both link
-# the same libmojito_spike.dylib.  Objects are kept in build/prod/ (the
-# spike objects are still produced by pattern rules, but NOT linked, to avoid
-# duplicate identical symbols).
+# PROD is authoritative: the dylib is built from PROD only (OBJS below),
+# and the spike harness's own Mojo bindings (mojito_spike.mojo) resolve
+# their externs against that same PROD-built libmojito_spike.dylib at link
+# time — SPIKE's own *.c/*.S are never compiled by any target here (the
+# $(BUILD)/spike/%.o pattern rules below exist but nothing depends on
+# them; #180). Objects are kept in build/prod/.
+#
+# The two trees are NOT asserted byte-identical (that claim used to stand
+# here unchecked, and had been false since #101 landed on PROD without a
+# matching re-vendor of SPIKE — issue #170 instance 6). What IS checked,
+# in CI and via `make check-vendored`, is that every divergence between
+# them is either absent or explicitly recorded with a content hash in
+# mojito_async/vendor/VENDORED_EXCEPTIONS.tsv (the `spike:<basename>`
+# rows) — see mojito_async/vendor/check-vendored.sh finding [4].
 
 CC      ?= cc
 CFLAGS  ?= -O2 -g -Wall -Wextra

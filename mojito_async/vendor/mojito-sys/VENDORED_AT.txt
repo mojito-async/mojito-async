@@ -8,8 +8,14 @@ Vendored on:       2026-08-28T00:00:00Z (A1.1 productionization, issue #49)
 RE-PINNED on:      2026-08-28 (A2.0 issue #101 — in-repo substrate rework:
                     ms_ctx_t v2 168B -> v3 176B, resume-table/global removal)
 
-FILES (byte-identical between the PROD and SPIKE vendored trees, `diff -r`
-is empty, as the spike harness links this same dylib):
+FILES (same basenames as the SPIKE spike/colorless_runtime/vendor/
+mojito-sys/ tree; the spike harness links this same dylib, built from
+PROD only). NOT asserted byte-identical with SPIKE: this file used to
+claim `diff -r` between the two vendored dirs was empty, which had been
+false since #101 landed here without a matching re-vendor of SPIKE
+(issue #170 instance 6). See mojito_async/vendor/check-vendored.sh
+finding [4] and VENDORED_EXCEPTIONS.tsv's `spike:` rows for exactly which
+files diverge and why:
   include/mojito_spike.h   # ms_ctx_t v3 layout (176 B: x19-x30, d8-d15, sp,
                            #   return_to @168)
   native_stack.c           # ms_stack_alloc/free with PROT_NONE guard page
@@ -35,6 +41,8 @@ DEVIATION FROM FROZEN (issue #101, A2.0 M:N rework) — RECORDED:
   t27_concurrency (40 live fibers, was capped), t27_multithread (two-pthread
   probe, was clobbered), and the spike harness.
 
-The prod and spike vendored copies are byte-identical and both carry this
-rework.  See the aarch64_switch.S header comment for the full ISSUE #101
-rationale, and precommit/known-red.tsv for the RED->GREEN evidence.
+The #101 rework itself landed identically in both the prod and spike
+vendored copies; they have since diverged elsewhere (issue #170 instance
+6 — see the FILES note above, not a re-litigation of #101). See the
+aarch64_switch.S header comment for the full ISSUE #101 rationale, and
+precommit/known-red.tsv for the RED->GREEN evidence.
