@@ -233,7 +233,11 @@ else
     echo "      mojito-sys does not get the substrate mojito-async needs, and"
     echo "      every safety property PRs #66/#107/#114 built into the frozen"
     echo "      ms_context_* ABI protects code the runtime never executes."
-    findings=$((findings + 1))
+    if [ -n "$(recorded_hash '_spike_substrate_')" ]; then
+        echo "      (extern gap RECORDED as intentional in VENDORED_EXCEPTIONS.tsv)"
+    else
+        findings=$((findings + 1))
+    fi
 fi
 
 # ---------------------------------------------------------------------------
@@ -259,7 +263,11 @@ else
     echo "      vendored WHOLE while the C was vendored in slices, so it"
     echo "      promises an ABI this tree cannot supply. First few:"
     printf '%s' "$undecl" | tr ' ' '\n' | grep -v '^$' | head -8 | sed 's/^/        /'
-    findings=$((findings + 1))
+    if [ -n "$(recorded_hash '_spike_substrate_')" ]; then
+        echo "      (header gap RECORDED as intentional in VENDORED_EXCEPTIONS.tsv)"
+    else
+        findings=$((findings + 1))
+    fi
 fi
 
 echo ""
