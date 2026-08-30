@@ -23,7 +23,7 @@
 # Verdict: exit 0 + "PASS"; any RED prints + raises (exit 1).
 from std.memory import stack_allocation
 from mojito_async.cancellation import CancelFlag, CancellationToken, is_cancellation, make_cancel_flag
-from mojito_async.channel import Channel, Receiver, Sender, make_channel
+from mojito_async.channel import Channel, Receiver, RecvOutcome, SendOutcome, Sender, make_channel
 from mojito_async.integration.sys import BytePtr, IntResult
 from mojito_async.runtime.runtime import Runtime, create
 from mojito_async.runtime.scheduler import scheduler_loop
@@ -502,14 +502,18 @@ def chan_send_dispatch(mut rt: Runtime, tcb_addr: Int, tid: Int, ud: BytePtr) ra
     if ph[] == 0:
         ph[] = 1
         try:
-            sc[].tx.send_cancellable(rt, h, 100 + who, sc[].token[])
-            if h.state() != TaskControlBlock.WAITING:
+            var outcome = sc[].tx.send_cancellable(rt, h, 100 + who, sc[].token[])
+            if not outcome.is_parked():
                 red("chan-send: contended send must park")
         except e:
             red("chan-send: unexpected raise on first attempt: " + String(e))
         return 1
     try:
-        sc[].tx.send_cancellable(rt, h, 100 + who, sc[].token[])
+        var outcome2 = sc[].tx.send_cancellable(rt, h, 100 + who, sc[].token[])
+        if outcome2.is_parked():
+            # A second park is legal (e.g. competing sender stole the slot between
+            # the wake and re-entry); return and wait for the next dispatch.
+            return 1
         var i = sc[].norder[]
         sc[].order[i] = who
         sc[].norder[] = i + 1
@@ -613,14 +617,14 @@ def chan_recv_dispatch(mut rt: Runtime, tcb_addr: Int, tid: Int, ud: BytePtr) ra
         ph[] = 1
         try:
             var v = sc[].rx.recv_cancellable(rt, h, sc[].token[])
-            if h.state() != TaskControlBlock.WAITING:
+            if not v.is_parked():
                 red("chan-recv: contended recv must park")
         except e:
             red("chan-recv: unexpected raise on first attempt: " + String(e))
         return 1
     try:
         var v2 = sc[].rx.recv_cancellable(rt, h, sc[].token[])
-        if not v2:
+        if not v2.is_value():
             red("chan-recv: granted re-entry must return a value")
         var i = sc[].norder[]
         sc[].order[i] = who
