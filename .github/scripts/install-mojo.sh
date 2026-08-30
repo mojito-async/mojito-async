@@ -26,6 +26,28 @@ case "$os/$arch" in
     *) echo "install-mojo.sh: no Mojo build published for $os/$arch"; exit 2 ;;
 esac
 
+HOME_DIR="$PREFIX/share/max"
+
+# issue #169: CI caches $PREFIX (actions/cache, keyed on this script's hash +
+# VERSION) to turn the ~4 min download+unpack into a restore. A cache HIT
+# means $PREFIX/bin/mojo already exists; skip straight to the env-export +
+# compile-probe below instead of re-downloading. A version marker file (not
+# just the binary's existence) guards against a stale cache entry surviving
+# a MOJO_VERSION bump: if the marker doesn't match, fall through and
+# re-install exactly as a cold run would.
+marker="$PREFIX/.install-mojo-version"
+if [ -x "$PREFIX/bin/mojo" ] && [ -f "$marker" ] && [ "$(cat "$marker")" = "$VERSION" ]; then
+    echo "install-mojo.sh: cache hit, $PREFIX already has mojo-compiler-$VERSION"
+    skip_install=1
+else
+    skip_install=0
+fi
+
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+
+if [ "$skip_install" != 1 ]; then
+
 # zstd and unzip are the only external tools needed to unpack the payload.
 # Inside a container this runs as root and there is no sudo; on a runner VM
 # there is sudo and we are not root.  Pick whichever applies rather than
@@ -45,8 +67,6 @@ if ! command -v zstd >/dev/null 2>&1; then
     fi
 fi
 
-work=$(mktemp -d)
-trap 'rm -rf "$work"' EXIT
 echo "install-mojo.sh: fetching mojo-compiler-$VERSION from $subdir"
 curl -fsSL -o "$work/mojo.conda" \
     "https://conda.modular.com/max/$subdir/mojo-compiler-$VERSION-release.conda"
@@ -70,7 +90,11 @@ mv "$cfg.rewritten" "$cfg"
 # getting this wrong is silent: `mojo --version` still works, and then every
 # compile fails with "use of unknown declaration 'Int'" and bogus indentation
 # errors, because the driver cannot resolve the stdlib.
-HOME_DIR="$PREFIX/share/max"
+# (HOME_DIR is set above, before the skip_install branch, so the cache-hit
+# path can reuse it too.)
+printf '%s' "$VERSION" > "$marker"
+
+fi  # skip_install
 
 if [ -n "${GITHUB_ENV:-}" ]; then
     echo "MODULAR_HOME=$HOME_DIR" >> "$GITHUB_ENV"
