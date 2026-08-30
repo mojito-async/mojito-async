@@ -264,7 +264,6 @@ struct TCB_Prefix(ImplicitlyCopyable, ImplicitlyDeletable):
             var new_gen = self._generation + Int64(1)
             Atomic[DType.int64].store[ordering=Ordering.RELEASE](
                 UnsafePointer[Int64, MutAnyOrigin](to=self._generation), new_gen)
-            self._generation = new_gen
             self._wait._generation = Int(new_gen)
 
     def transition(mut self, to: Int) raises:
