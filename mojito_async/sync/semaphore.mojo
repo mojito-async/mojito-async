@@ -195,16 +195,27 @@ struct Semaphore:
         self._guard.unlock()
         park_prepare(h)
         if park_validate(h):
-            # A foreign release() already handed off inside the window: the
-            # grant marker is already stamped, this waiter already popped
-            # off the FIFO.  Close the window and re-claim RUNNING — this
-            # call never actually suspended.
+            # Early wake in PREPARE/COMMIT window: may be a GRANT (release()
+            # stamped PERMIT_GRANTED and popped this waiter) OR a CANCEL
+            # (cancel_acquire_wait removed it from the FIFO and latched
+            # readiness without stamping the grant marker).
             _ = park_commit(h)
             claim_running(h)
+            if not self.is_granted(h):
+                # Cancel early-wake: no permit was granted.  Re-enqueue so
+                # the caller re-dispatches and picks up the cancel reason.
+                h.tcb()[].transition(TaskControlBlock.RUNNABLE)
+                rt.enqueue_local(Int(h.tcb()), h.id())
+                return False
             h.tcb()[].wait_node()[].set_next(0)
             return True
         if not park_commit(h):
+            # Early wake landed between validate and commit — same ambiguity.
             claim_running(h)
+            if not self.is_granted(h):
+                h.tcb()[].transition(TaskControlBlock.RUNNABLE)
+                rt.enqueue_local(Int(h.tcb()), h.id())
+                return False
             h.tcb()[].wait_node()[].set_next(0)
             return True
         return False
