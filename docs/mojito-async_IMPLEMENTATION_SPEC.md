@@ -477,7 +477,7 @@ mojito_async/
 │   └── barrier.mojo
 ├── channel/
 │   ├── channel.mojo
-│   ├── bounded.mojo               # not implemented (rendezvous.mojo / oneshot.mojo)
+│   ├── bounded.mojo               # not implemented as a separate file; ring-buffered bounded channel lives in channel.mojo; rendezvous.mojo is zero-capacity (synchronous handoff); oneshot.mojo is single-message
 │   ├── unbounded.mojo
 │   └── select.mojo
 ├── time/
