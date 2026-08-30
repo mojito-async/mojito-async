@@ -220,17 +220,31 @@ struct Mutex[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable]:
         # exactly as documented above.
         park_prepare(h)
         if park_validate(h):
-            # A foreign unlock() already handed off INSIDE the PREPARE/
-            # COMMIT window (A0-T11): the grant marker is already stamped,
-            # this waiter was already popped off the FIFO.  Close the
-            # window (unwinds to RUNNABLE without ever entering WAITING)
-            # and re-claim RUNNING — this call never actually suspended.
+            # An early wake fired in the PREPARE/COMMIT window (A0-T11).
+            # It may be a GRANT (unlock() popped+stamped this waiter) OR a
+            # CANCEL (cancel_lock_wait removed it from the FIFO and called
+            # wake_cancelled, which latches early_readiness without setting
+            # the GRANT marker).  Close the window unconditionally; then
+            # inspect the marker to distinguish the two cases.
             _ = park_commit(h)
             claim_running(h)
+            if not self.holds_grant(h):
+                # Cancel early-wake: no grant was stamped.  Re-enqueue this
+                # task so the caller's dispatcher re-dispatches it; the
+                # re-entry will see the CANCEL reason and raise.
+                h.tcb()[].transition(TaskControlBlock.RUNNABLE)
+                rt.enqueue_local(Int(h.tcb()), h.id())
+                return False
             h.tcb()[].wait_node()[].set_next(0)
             return True
         if not park_commit(h):
+            # Early wake landed between park_validate and park_commit.
+            # Same grant-vs-cancel ambiguity: check the marker.
             claim_running(h)
+            if not self.holds_grant(h):
+                h.tcb()[].transition(TaskControlBlock.RUNNABLE)
+                rt.enqueue_local(Int(h.tcb()), h.id())
+                return False
             h.tcb()[].wait_node()[].set_next(0)
             return True
         return False
