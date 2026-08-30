@@ -98,45 +98,21 @@ fi
 # this fold; a fresh `mojo build` segfault, not a runtime bug, confirmed
 # `-O 0` fixes it) — every OTHER driver that imports the SAME modules
 # keeps the default optimization level (they stayed under the threshold).
-# Issue #128: t47_channel_cross_worker_aot hits the SAME class of bug
-# t34/t34b/t34c/t35 document above (NOT the pool/scheduler-dependency-
-# graph compiler crash the previous paragraph describes): its two REAL
-# worker OS threads spin on `while not h.is_completed(): scheduler_loop(
-# ...); sleep(...)` waiting for a cross-worker wake delivered via a plain
-# (non-atomic) TaskControlBlock state field — at the default optimization
-# level the compiler can hoist that plain read out of the loop (never
-# re-reading the OTHER thread's write), producing a driver-side false
-# "lost wakeup" (empirically: 100% reproducible within a handful of
-# iterations at default -O, 0/30+ at `-O 0`) that is a MISCOMPILATION
-# artifact, not a defect in Channel[T]'s guard/two-phase-park fix (issue
-# #128) itself.  Every OTHER AOT driver keeps the default optimization
-# level (the suite is NOT rebuilt at -O 0).
+# Issue #128: t47_channel_cross_worker_aot hit the LICM-class plain
+# (non-atomic) TaskControlBlock state read in a spin loop (NOT the
+# pool/scheduler-dependency-graph compiler crash the previous paragraph
+# describes).  Issue #143 makes TCB._state an atomic field (acquire/
+# release): the optimizer can no longer hoist the read out of the loop,
+# so the LICM-class -O 0 pin is REMOVED.  The t51_default_o_repeat lane
+# validates t47_channel_cross_worker_aot at the default optimization
+# level on every gate run.
 # Issue #138 (follow-up review of #112/#128): t38_mutex_cross_worker_aot
-# (A4.1, issue #55) drives the SAME `while not h.is_completed():
-# scheduler_loop(...); sleep(...)` outer spin over a plain (non-atomic)
-# TaskControlBlock completion read across its two real worker OS threads
-# as t47_channel_cross_worker_aot above — it was simply never folded into
-# this list when t47 was.  #128's own sandbox observed the identical
-# symptom class on it (~1-in-15-30 runs: a permanently-stuck WAITING task,
-# SPIN_BUDGET watchdog trip, zero progress for the full spin window) at
-# the default optimization level.  Local verification for this fold: the
-# repro methodology was validated against t47 first (still on this list
-# for the identical reason) — under real host contention (concurrent
-# `mojo build`/CPU-load processes, load average ~3-7 on a 10-core host)
-# t47 built at default -O failed 3/30 runs with genuine internal RED
-# verdicts (not external timeouts); the SAME load level and run count
-# produced 0/441 failures for t38 built at default -O on this particular
-# host/toolchain build (Mojo 1.0.0b2, arm64) — this class of bug is a
-# compiler LICM decision that is known to be sensitive to unrelated IR
-# shape (Mutex[Int] call graph vs Channel[T]'s), so a clean local run does
-# not clear the driver; it shares the EXACT vulnerable source pattern
-# already fixed for t34/t34b/t34c/t35/t47 above, so it gets the same `-O 0`
-# treatment defensively, matching the precedent already set for
-# t30/t33/t36 (added to this list purely by risk-class membership, "even
-# though none had individually tripped a miscompile" at addition time).
-# t38 built at -O 0 stayed clean across the same 30-run moderate-load
-# batch.
-AOT_O0_DRIVERS="t30_worker_pool_aot t33_steal_aot t34_two_phase_aot t34b_affinity_aot t34c_duplicate_wake_aot t35_idle_sleep_aot t36_fairness_aot t41_idle_timer_wake_aot t24_rendezvous_oneshot_aot t39_reactor_aot t40_io_token_aot t41_tcp_connect_aot t42_tcp_accept_aot t42_io_cancel_deadline_aot t44_tcp_read_write_aot t45_reactor_race_aot t46_reactor_fairness_aot t47_pool_scheduler_aot t49_pool_churn_aot t47_channel_cross_worker_aot t38_mutex_cross_worker_aot"
+# hit the SAME plain (non-atomic) TaskControlBlock completion read in a
+# spin loop as t47_channel_cross_worker_aot (LICM class).  Issue #143
+# makes TCB._state atomic, closing the LICM vulnerability: the -O 0 pin
+# is REMOVED for this driver.  The t51_default_o_repeat lane validates
+# it at the default optimization level on every gate run.
+AOT_O0_DRIVERS="t30_worker_pool_aot t33_steal_aot t34_two_phase_aot t34b_affinity_aot t34c_duplicate_wake_aot t35_idle_sleep_aot t36_fairness_aot t41_idle_timer_wake_aot t24_rendezvous_oneshot_aot t39_reactor_aot t40_io_token_aot t41_tcp_connect_aot t42_tcp_accept_aot t42_io_cancel_deadline_aot t44_tcp_read_write_aot t45_reactor_race_aot t46_reactor_fairness_aot t47_pool_scheduler_aot t49_pool_churn_aot"
 
 failures=0; reds=0; matrix=""
 
