@@ -332,6 +332,43 @@ int mjs_socket_connect_error(int fd, int *out_err)
     return 0;
 }
 
+/* ---- issue #182 deviation: SO_SNDBUF / SO_RCVBUF -----------------------
+ *
+ * Not part of the frozen s6-socket block either, and layered the same way
+ * as SO_REUSEADDR/SO_ERROR above. Lets a caller shrink a socket's kernel
+ * send/receive buffer to a known-small size instead of relying on the
+ * platform's (auto-tuned, host- and run-to-run-variable) defaults. Added
+ * for t44_tcp_read_write_aot scenario B (issue #182): a 512KB write_all
+ * over loopback is only GUARANTEED to hit EAGAIN/EWOULDBLOCK at least once
+ * when the combined send+receive buffer capacity is deterministically
+ * smaller than the payload; the platform defaults alone were sometimes
+ * large enough to swallow all 512KB in one non-blocking burst, which is
+ * exactly the flake this deviation exists to close off. Same return
+ * contract as every other entry point in this file.
+ */
+
+int mjs_socket_set_sndbuf(int fd, int bytes)
+{
+    if (fd < 0)
+        return -EBADF;
+    if (bytes <= 0)
+        return -EINVAL;
+    if (setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &bytes, sizeof(bytes)) < 0)
+        return -errno;
+    return 0;
+}
+
+int mjs_socket_set_rcvbuf(int fd, int bytes)
+{
+    if (fd < 0)
+        return -EBADF;
+    if (bytes <= 0)
+        return -EINVAL;
+    if (setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &bytes, sizeof(bytes)) < 0)
+        return -errno;
+    return 0;
+}
+
 int mjs_sockaddr_ipv4(const char *dotted, int port, mjs_sockaddr *out)
 {
     if (dotted == NULL || out == NULL)
