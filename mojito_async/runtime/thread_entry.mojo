@@ -128,10 +128,14 @@ def cell_size_gate() raises:
         raise Error("thread_entry: CELL_WORKER too small for the Worker struct")
     if CELL_ENTRY < _entry_cell_stride():
         raise Error("thread_entry: CELL_ENTRY too small for the WorkerEntryCell")
-# Generous (2 s) so idle workers genuinely SLEEP for long stretches; the
-# wake budget + shutdown both signal the event explicitly, so latency stays
-# sub-millisecond regardless.
-comptime IDLE_PARK_SLICE_NS = Int(2_000_000_000)  # 2 s backstop
+# 200 ms slice: workers re-check for work and re-park on each timer fire.
+# Short enough that idle-beat tests can observe park_total grow during a
+# 0.5 s window (issue #150 oracle 2: park_total must increase across an
+# idle beat); long enough to sleep properly rather than busy-poll (5 Hz
+# vs the 5 kHz busy-poll from the unfixed pending leak).  The wake budget
+# and shutdown both signal the event explicitly so latency stays well
+# under this slice regardless.
+comptime IDLE_PARK_SLICE_NS = Int(200_000_000)  # 200 ms park slice
 
 
 # The pool-owned idle accounting block layout (SHARED with runtime/idle.mojo —
@@ -583,14 +587,14 @@ def pool_worker_loop_scheduled[
             if consecutive_faults > 10:
                 raise Error(
                     "worker fault threshold exceeded (10 consecutive): "
-                    + str(e)
+                    + String(e)
                 )
             continue
         consecutive_faults = 0  # reset on each successful dispatch iteration
         var stolen = w[].try_steal_unstarted[R]()
         if stolen:
             var rec = stolen.value()
-            w[].runtime()[].enqueue_local(rec.tcb_addr, rec.task_id)
+            w[].runtime()[].enqueue_local_stolen(rec.tcb_addr, rec.task_id)
             continue
         # E6 idle park — INLINED (see the layer-discipline note above).
         var deadline = monotonic_now_ns() + IDLE_PARK_SLICE_NS
