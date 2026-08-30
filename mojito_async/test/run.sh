@@ -121,7 +121,14 @@ fi
 # hoists those loads (LICM class; the t50 driver note documents this).
 # Pin removed when #143 fixes the driver cells or the upstream compiler
 # closes the LICM gap.
-AOT_O0_DRIVERS="t50_park_commit_window_aot t30_worker_pool_aot t33_steal_aot t34_two_phase_aot t34b_affinity_aot t34c_duplicate_wake_aot t35_idle_sleep_aot t36_fairness_aot t41_idle_timer_wake_aot t24_rendezvous_oneshot_aot t39_reactor_aot t40_io_token_aot t41_tcp_connect_aot t42_tcp_accept_aot t42_io_cancel_deadline_aot t44_tcp_read_write_aot t45_reactor_race_aot t46_reactor_fairness_aot t47_pool_scheduler_aot t49_pool_churn_aot t47_channel_cross_worker_aot t38_mutex_cross_worker_aot t52_steal_toctou_aot"
+# Issue #148: t60_barrier_cross_worker_aot uses the identical LICM-class
+# plain-Int round-handshake cells as the drivers above; its own header
+# documents this (-O 0 required, same as t38/t47/t50/t52).  Added to
+# AOT_O0_DRIVERS here so the gate builds it at the required level.
+# t58_stack_registry_aot (issue #145, PR #164 fold): default-optimization
+# compiler crash, same class as t47_pool_scheduler_aot above.  Building at
+# -O 0 compiles cleanly and the driver passes every scenario.
+AOT_O0_DRIVERS="t50_park_commit_window_aot t30_worker_pool_aot t33_steal_aot t34_two_phase_aot t34b_affinity_aot t34c_duplicate_wake_aot t35_idle_sleep_aot t36_fairness_aot t41_idle_timer_wake_aot t24_rendezvous_oneshot_aot t39_reactor_aot t40_io_token_aot t41_tcp_connect_aot t42_tcp_accept_aot t42_io_cancel_deadline_aot t44_tcp_read_write_aot t45_reactor_race_aot t46_reactor_fairness_aot t47_pool_scheduler_aot t49_pool_churn_aot t47_channel_cross_worker_aot t38_mutex_cross_worker_aot t52_steal_toctou_aot t60_barrier_cross_worker_aot t58_stack_registry_aot"
 
 failures=0; reds=0; known_reds=0; matrix=""
 

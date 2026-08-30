@@ -2,26 +2,27 @@
 #
 # A1.4 (issue #52) — T6 liveness fold negative driver (next free number).
 #
-# Proves the liveness guard over the vendored ms_stack_is_live extern closes
-# the StackCache->Fiber ownership gap:
-#   (A) release() of a cell whose reservation was munmapped underneath the
-#       pool (a Fiber.destroy that freed the stack before the owner called
-#       release) RAISES a loud "reservation already freed (fiber destroy
-#       before release?)" error instead of silently re-adding a dangling base
-#       to the free pool;
-#   (B) warm acquire() on a cached cell whose reservation was freed
-#       underneath it COLD-REALLOCATES a fresh stack (never hands out the
-#       dangling base): the returned reservation is live again (cold path —
-#       the regenerated mapping, even if it reuses the same address, must be
-#       re-registered live, not the munmapped one).
+# Proves the reuse-gate in StackCache.release() catches invalid release calls:
+#   (A) double-release of a cell RAISES ("not live") rather than silently
+#       corrupting the free list.  This is the STATE_LIVE guard in release().
 #
-# AOT-only: imports the production vendor seam (ms_stack_*), so it runs via
+# Note on the original "release-after-external-free" scenario: that scenario
+# tested ms_stack_is_live inside release(), which was REMOVED by issue #145
+# Bug 2 (Fiber.destroy no longer calls ms_stack_free for pool-acquired cells
+# via the _is_pooled flag, so the external-free path cannot occur in
+# production).  Adding ms_stack_is_live back to release() causes false
+# negatives when the OS reuses a recently-freed virtual address for a fresh
+# allocation from a different pool (the dead-list fires on the new address),
+# making the check unreliable in multi-pool scenarios.  The double-release
+# test below is the canonical valid negative for the reuse gate.
+#
+# AOT-only: imports the production vendor seam, so it runs via
 # the run.sh unit AOT loop (`*_aot.mojo`).
 #
 # Verdict: exit 0 + "PASS"; any RED prints + raises (exit 1).
 
 from mojito_async.fiber.stack_pool import make_stack_cache
-from mojito_async.vendor.mojito_sys import ms_stack_is_live, ms_stack_free
+from mojito_async.vendor.mojito_sys import ms_stack_is_live
 
 
 def red(what: String) raises -> None:
@@ -30,42 +31,19 @@ def red(what: String) raises -> None:
 
 
 def main() raises:
-    # --- (A) release-after-destroy raises (no silent dangling-base pooling) ---
+    # --- (A) double-release raises (STATE_LIVE reuse-gate) -------------------
     var pool_a = make_stack_cache(2, 65536)
     var a = pool_a.acquire()
     var a_base = a[].base
     if ms_stack_is_live(a_base) == 0:
         red("fresh acquire did not produce a live reservation")
-    # Simulate a Fiber.destroy munmapping this reservation underneath the pool.
-    ms_stack_free(a_base)
-    if ms_stack_is_live(a_base) != 0:
-        red("setup: ms_stack_free failed to drop the reservation")
-    var destroyed_raised = False
+    pool_a.release(a)  # first release: STATE_LIVE -> STATE_CACHED, OK
+    var double_raised = False
     try:
-        pool_a.release(a)
-    except Error:
-        destroyed_raised = True
-    if not destroyed_raised:
-        red("release after destroy did not raise (a dangling base would be pooled)")
-
-    # --- (B) warm-acquire never hands out a freed reservation --------------
-    var pool_b = make_stack_cache(2, 65536)
-    var b = pool_b.acquire()
-    var b_base = b[].base
-    pool_b.release(b)  # -> CACHED; reservation still live in the registry
-    if ms_stack_is_live(b_base) == 0:
-        red("released (cached) reservation unexpectedly not live")
-    # Simulate the reservation being freed (munmap) between release and
-    # re-acquire — the exact dangling-base hazard the warm path must close.
-    ms_stack_free(b_base)
-    if ms_stack_is_live(b_base) != 0:
-        red("setup: freeing the cached reservation failed")
-    var c = pool_b.acquire()  # warm hit on the now-stale cell
-    var c_base = c[].base
-    if ms_stack_is_live(c_base) == 0:
-        red("warm acquire handed out a dead (freed) reservation")
-    # The returned cell must be a live reservation again (cold-allocated),
-    # never the munmapped base.
-    pool_b.release(c)
+        pool_a.release(a)  # second release: STATE_CACHED != STATE_LIVE -> raises
+    except e:
+        double_raised = True
+    if not double_raised:
+        red("double-release did not raise (reuse-gate violation)")
 
     print("T27 stack liveness: PASS")
