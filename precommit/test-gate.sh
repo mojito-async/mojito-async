@@ -64,8 +64,24 @@ make_sandbox() {
     kr=$1
     suite_body=$2
     sb=$(mktemp -d 2>/dev/null) || return 1
+    # Every filesystem/git operation below is anchored to $sb explicitly
+    # (an absolute path, and `git -C`, never a bare `cd`) rather than
+    # relying on a subshell's cwd. A bare `cd "$sb"` inside `( ... )` is
+    # supposed to be isolated to that subshell, and `[ -z "$sb" ]` guards
+    # downstream are supposed to catch mktemp failing outright — but this
+    # sandbox WAS observed leaking into the real repo's shared git config
+    # under concurrent gate runs this session (issue #169: several commits
+    # across this session, in both mojito-async and mojito-sys, ended up
+    # authored as "gate selftest <gate-selftest@example.invalid>" — `sh`
+    # on this host treats `cd ""` as a silent no-op success rather than an
+    # error, so any path where a sandbox var went missing under contention
+    # would fall through to whatever cwd was already current, i.e. the
+    # real repo, without any command here noticing). `git -C` removes the
+    # dependency on `cd` succeeding and on subshell cwd propagation
+    # entirely, so whatever the exact trigger was, it can't recur here.
+    [ -n "$sb" ] && [ -d "$sb" ] || return 1
     mkdir -p "$sb/precommit" "$sb/bin" || return 1
-    cp "$GATE" "$sb/precommit/gate.sh"
+    cp "$GATE" "$sb/precommit/gate.sh" || return 1
     chmod +x "$sb/precommit/gate.sh"
     printf '%s\n' "$kr" > "$sb/precommit/known-red.tsv"
     printf '%s\n' "$suite_body" > "$sb/precommit/run-suite.sh"
@@ -83,20 +99,23 @@ done
 echo open
 GH_STUB
     chmod +x "$sb/bin/gh"
-    (
-        cd "$sb" || exit 1
-        git init -q .
-        git config user.email gate-selftest@example.invalid
-        git config user.name  "gate selftest"
-        git config commit.gpgsign false
-        echo probe > probe.txt
-        git add probe.txt
-    ) >/dev/null 2>&1 || return 1
+    git -C "$sb" init -q . || return 1
+    git -C "$sb" config --local user.email gate-selftest@example.invalid
+    git -C "$sb" config --local user.name  "gate selftest"
+    git -C "$sb" config --local commit.gpgsign false
+    echo probe > "$sb/probe.txt"
+    git -C "$sb" add probe.txt || return 1
     printf '%s' "$sb"
 }
 
 run_gate() { # $1 = sandbox; sets GATE_OUT / GATE_STATUS
-    GATE_OUT=$(cd "$1" && PATH="$1/bin:$PATH" MOJITO_GATE_FAST=0 ./precommit/gate.sh 2>&1)
+    sb=$1
+    if [ -z "$sb" ] || [ ! -d "$sb" ]; then
+        GATE_OUT="run_gate: empty or missing sandbox path ('$sb')"
+        GATE_STATUS=2
+        return
+    fi
+    GATE_OUT=$(cd "$sb" && PATH="$sb/bin:$PATH" MOJITO_GATE_FAST=0 ./precommit/gate.sh 2>&1)
     GATE_STATUS=$?
 }
 
