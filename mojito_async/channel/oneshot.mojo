@@ -35,7 +35,7 @@
 # Atomic cannot be Movable/ImplicitlyDeletable, so Oneshot drops those
 # conformances too — it now mirrors Channel/Mutex/RWLock.
 from std.collections import Deque
-from mojito_async.channel.channel import WaitRecord
+from mojito_async.channel.channel import WaitRecord, RecvOutcome, SendOutcome
 from mojito_async.runtime.queue import SpinLock
 from mojito_async.runtime.runtime import Runtime
 from mojito_async.runtime.task_control_block import ResultValue
@@ -198,7 +198,7 @@ struct Oneshot[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable]:
 
     def send[R: ResultValue](
         mut self, mut rt: Runtime, h: JoinHandle[R], item: Self.T
-    ) raises:
+    ) raises -> SendOutcome:
         """Deliver the one-and-only value; raises instead of returning
         False.  Two distinct, documented failure prefixes (both under the
         "ChannelError:" taxonomy, spec-shared-context convention):
@@ -219,6 +219,7 @@ struct Oneshot[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable]:
             raise Error("ChannelError: oneshot already sent")
         _ = self._try_send_locked(item)
         self._guard.unlock()
+        return SendOutcome(SendOutcome.SENT)
 
     # --- recv (may park; safely re-invokable on resume) --------------------
 
@@ -241,7 +242,7 @@ struct Oneshot[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable]:
 
     def recv[R: ResultValue](
         mut self, mut rt: Runtime, h: JoinHandle[R]
-    ) raises -> Optional[Self.T]:
+    ) raises -> RecvOutcome[Self.T]:
         """One-shot receive (issued by a OneshotReceiver).  Safe to
         re-invoke on resume: `_filled`/closed are state-derived, idempotent
         checks (see module docstring — the sender side never parks, so
@@ -263,10 +264,10 @@ struct Oneshot[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable]:
                 self._filled = False
                 self._recv_closed = True
                 self._guard.unlock()
-                return Optional[Self.T](v)
+                return RecvOutcome[Self.T](RecvOutcome.VALUE, Optional[Self.T](v))
             if self._send_closed or self._recv_closed:
                 self._guard.unlock()
-                return Optional[Self.T]()  # closed-and-unset: observe close
+                return RecvOutcome[Self.T](RecvOutcome.CLOSED)
             self._register_receiver_locked(h)
             self._guard.unlock()
             park_prepare(h)
@@ -277,7 +278,7 @@ struct Oneshot[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable]:
             if not park_commit(h):
                 claim_running(h)
                 continue
-            return Optional[Self.T]()
+            return RecvOutcome[Self.T](RecvOutcome.PARKED)
 
     # --- waiter registration (FIFO, dedupe by task id) ----------------------
 
@@ -383,10 +384,10 @@ struct OneshotSender[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable](
 
     def send[R: ResultValue](
         mut self, mut rt: Runtime, h: JoinHandle[R], item: Self.T
-    ) raises:
+    ) raises -> SendOutcome:
         if self._closed:
             raise Error("ChannelError: oneshot already sent")
-        self._chan[].send(rt, h, item)
+        return self._chan[].send(rt, h, item)
 
     def close(mut self) raises:
         """Drop this sender's slot.  When the LAST sender closes without
@@ -421,7 +422,7 @@ struct OneshotReceiver[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable](
 
     def recv[R: ResultValue](
         mut self, mut rt: Runtime, h: JoinHandle[R]
-    ) raises -> Optional[Self.T]:
+    ) raises -> RecvOutcome[Self.T]:
         return self._chan[].recv(rt, h)
 
     def close(mut self) raises:
