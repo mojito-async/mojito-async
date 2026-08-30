@@ -21,6 +21,8 @@
 from mojito_async.channel.channel import (
     Channel,
     Receiver,
+    RecvOutcome,
+    SendOutcome,
     Sender,
     WaitRecord,
     make_channel,
