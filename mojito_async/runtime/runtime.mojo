@@ -179,6 +179,8 @@ struct Runtime:
     # issue #144: worker fault counter — errors that escaped fair_scheduler_loop
     # are caught by pool_worker_loop_scheduled's catch-count-continue guard and
     # tallied here so diagnostics can observe them without losing the thread.
+    # Thread safety: safe to read only after join_all() completes, or under
+    # external synchronization.
     var _worker_faults: Int
 
     # M9 (review fold, issue #73): PER-SLICE COUNTER COST, documented and
