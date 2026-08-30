@@ -44,7 +44,7 @@
 # Verdict: exit 0 + "PASS"; any hang/mismatch prints RED and forces exit 1.
 # AOT-only (pthread externs; modular/modular#6971).
 from std.time import sleep
-from mojito_async.channel import Channel, Receiver, Sender, make_channel
+from mojito_async.channel import Channel, Receiver, RecvOutcome, SendOutcome, Sender, make_channel
 from mojito_async.integration.sys import BytePtr, IntResult
 from mojito_async.runtime.park import unpark_current
 from mojito_async.runtime.runtime import Runtime
@@ -142,16 +142,12 @@ def dispatch_w0(mut rt: Runtime, tcb_addr: Int, tid: Int, ud: BytePtr) raises ->
         UnsafePointer[TB, MutAnyOrigin](unsafe_from_address=tcb_addr), tid
     )
     claim_running(h)
-    sc[].tx.send(rt, h, sc[].next_value[])
-    # State MUST be read right here, BEFORE `_drain()` runs (mirrors
-    # t21_channel_park.mojo's producer_slice/dispatch split): `_drain()`
-    # may immediately re-wake THIS SAME task (a legitimate cross-worker
-    # race — the matching recv() already pushed our WaitRecord to
-    # `_to_wake` before we got here, and this call's OWN drain may be the
-    # one that pops it) — checking state AFTER drain would misread a
-    # fresh WAITING -> RUNNABLE transition as "the send never parked" and
-    # attempt an illegal RUNNABLE -> COMPLETED transition.
-    if h.state() == TaskControlBlock.WAITING:
+    var outcome = sc[].tx.send(rt, h, sc[].next_value[])
+    # Outcome is captured synchronously at send() return (issue #152):
+    # the return value records park at call-time, immune to the race where
+    # `_drain()` immediately re-wakes this same task between the send()
+    # return and a subsequent h.state() read.
+    if outcome.is_parked():
         _drain(rt, sc)
         return 1
     h.tcb()[].transition(TaskControlBlock.COMPLETED)
@@ -168,12 +164,12 @@ def dispatch_w1(mut rt: Runtime, tcb_addr: Int, tid: Int, ud: BytePtr) raises ->
     )
     claim_running(h)
     var v = sc[].rx.recv(rt, h)
-    # See dispatch_w0: state MUST be read before `_drain()` runs.
-    if h.state() == TaskControlBlock.WAITING:
+    # Same race-safety rationale as dispatch_w0 above.
+    if v.is_parked():
         _drain(rt, sc)
         return 1
     h.tcb()[].transition(TaskControlBlock.COMPLETED)
-    if v:
+    if v.is_value():
         sc[].sum_received[] += v.value()
         sc[].received[] += 1
     else:

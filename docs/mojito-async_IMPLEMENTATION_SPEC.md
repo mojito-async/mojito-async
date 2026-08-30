@@ -455,16 +455,16 @@ mojito_async/
 │   ├── worker.mojo
 │   ├── scheduler.mojo
 │   ├── task_control_block.mojo
-│   ├── fiber.mojo
-│   ├── parking_lot.mojo
-│   ├── timer_wheel.mojo
+│   ├── fiber.mojo                 # not implemented (fiber/ is a sibling package)
+│   ├── parking_lot.mojo           # not implemented
+│   ├── timer_wheel.mojo           # not implemented (timer_heap.mojo in time/)
 │   ├── inject_queue.mojo
-│   ├── local_queue.mojo
-│   ├── remote_ready.mojo
-│   ├── task_allocator.mojo
-│   ├── stack_cache.mojo
-│   ├── blocking_pool.mojo
-│   └── metrics.mojo
+│   ├── local_queue.mojo           # not implemented (queue.mojo owns local work)
+│   ├── remote_ready.mojo          # not implemented
+│   ├── task_allocator.mojo        # not implemented
+│   ├── stack_cache.mojo           # not implemented (fiber/stack_pool.mojo)
+│   ├── blocking_pool.mojo         # not implemented — blocking calls wedge a worker
+│   └── metrics.mojo               # not implemented
 ├── integration/
 │   └── sys.mojo              # the only low-level adapter to mojito-sys
 ├── sync/
@@ -473,34 +473,34 @@ mojito_async/
 │   ├── semaphore.mojo
 │   ├── event.mojo
 │   ├── condvar.mojo
-│   ├── once.mojo
+│   ├── once.mojo                  # not implemented
 │   └── barrier.mojo
 ├── channel/
 │   ├── channel.mojo
-│   ├── bounded.mojo
+│   ├── bounded.mojo               # not implemented as a separate file; ring-buffered bounded channel lives in channel.mojo; rendezvous.mojo is zero-capacity (synchronous handoff); oneshot.mojo is single-message
 │   ├── unbounded.mojo
 │   └── select.mojo
 ├── time/
 │   ├── timer_heap.mojo
-│   ├── timer_wheel.mojo
+│   ├── timer_wheel.mojo           # not implemented
 │   └── sleep.mojo
 ├── io/
-│   ├── reactor.mojo
-│   ├── operation.mojo
-│   ├── registration.mojo
-│   ├── tcp.mojo
-│   ├── udp.mojo
-│   └── dns.mojo
+│   ├── reactor.mojo               # not implemented (reactor/ is a sibling package)
+│   ├── operation.mojo             # not implemented
+│   ├── registration.mojo          # not implemented
+│   ├── tcp.mojo                   # not implemented (net/tcp_stream.mojo)
+│   ├── udp.mojo                   # not implemented
+│   └── dns.mojo                   # not implemented — DNS wedges a worker (no blocking pool)
 ├── blocking/
-│   ├── pool.mojo
-│   └── blocking.mojo
+│   ├── pool.mojo                  # not implemented — no blocking pool; blocking calls wedge a worker
+│   └── blocking.mojo              # not implemented
 ├── parallel/
-│   ├── parallel_for.mojo
-│   ├── join.mojo
-│   └── reduction.mojo
+│   ├── parallel_for.mojo          # not implemented
+│   ├── join.mojo                  # not implemented
+│   └── reduction.mojo             # not implemented
 ├── unsafe/
-│   ├── detached.mojo
-│   └── borrowed_spawn.mojo
+│   ├── detached.mojo              # not implemented
+│   └── borrowed_spawn.mojo        # not implemented
 ├── test/
 │   ├── unit/
 │   ├── deterministic/
@@ -508,16 +508,16 @@ mojito_async/
 │   ├── model/
 │   └── integration/
 └── benchmark/
-    ├── ordinary_call.mojo
-    ├── spawn_join.mojo
-    ├── context_switch_integration.mojo
-    ├── park_unpark.mojo
-    ├── channel_pingpong.mojo
-    ├── mutex_contention.mojo
+    ├── ordinary_call.mojo         # not implemented
+    ├── spawn_join.mojo            # not implemented
+    ├── context_switch_integration.mojo  # not implemented
+    ├── park_unpark.mojo           # not implemented
+    ├── channel_pingpong.mojo      # not implemented
+    ├── mutex_contention.mojo      # not implemented
     ├── timer_scale.mojo
-    ├── tcp_echo.mojo
-    ├── cpu_parallel.mojo
-    └── memory_per_task.mojo
+    ├── tcp_echo.mojo              # not implemented
+    ├── cpu_parallel.mojo          # not implemented
+    └── memory_per_task.mojo       # not implemented
 ```
 
 There is deliberately **no `native/` directory and no platform-specific I/O directory** in this repository. Those belong to `mojito-sys`.
@@ -1357,8 +1357,12 @@ def with_timeout[T: Movable](
     var operation: Callable[() -> T],
 ) raises -> T
 ```
-
-`with_timeout` SHOULD create a child scope with a deadline rather than inventing a separate timeout-specific task model.
+`sleep()` raises when called without a driven scheduler frame (Mojo b2 has no
+global current-task pointer); use `sleep_current(rt, h, heap, clock, duration)`
+from inside the dispatcher. `sleep_until()` raises for the same reason; use
+`sleep_until_current(rt, h, heap, clock, deadline)` instead. `with_timeout`
+SHOULD create a child scope with a deadline rather than inventing a separate
+timeout-specific task model.
 
 ---
 
