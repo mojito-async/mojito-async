@@ -111,13 +111,14 @@ for d in $DRIVERS; do
             > "$BUILD_DIR/${d}_defaultO.build.log" 2>&1; then
         # A build failure here is the OTHER, upstream cause of the -O 0 pin
         # (the `mojo build` optimizer crash, modular/modular#6971's sibling),
-        # which EPIC #140 excludes.  Report it as an environment result, not
-        # as this issue's red.
+        # which EPIC #140 excludes from scope.  Skip this driver and continue;
+        # the lane is testing LICM-class racy reads, not upstream crashes.
         echo "  $d: BUILD FAILED at default -O (upstream optimizer crash;"
         echo "      excluded from #140 — see the build log)"
         tail -n 3 "$BUILD_DIR/${d}_defaultO.build.log" | sed 's/^/        | /'
-        stop_load
-        exit 2
+        matrix="$matrix  $d UPSTREAM-CRASH-EXCLUDED
+"
+        continue
     fi
 
     npass=0; nred=0; nhang=0; ncrash=0
