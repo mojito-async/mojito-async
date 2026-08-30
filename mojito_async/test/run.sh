@@ -172,7 +172,18 @@ fi
 # with no winner marker stamped" raise. Confirmed empirically: 15/15 runs
 # RED at default -O, 30/30 runs PASS at -O 0 on an otherwise-unmodified
 # tree. `-O 0` closes the gap exactly like every driver below it.
-AOT_O0_DRIVERS="t56_idle_accounting_aot t50_park_commit_window_aot t30_worker_pool_aot t33_steal_aot t34_two_phase_aot t34b_affinity_aot t34c_duplicate_wake_aot t35_idle_sleep_aot t36_fairness_aot t41_idle_timer_wake_aot t24_rendezvous_oneshot_aot t39_reactor_aot t40_io_token_aot t41_tcp_connect_aot t42_tcp_accept_aot t42_io_cancel_deadline_aot t44_tcp_read_write_aot t45_reactor_race_aot t46_reactor_fairness_aot t47_pool_scheduler_aot t49_pool_churn_aot t47_channel_cross_worker_aot t38_mutex_cross_worker_aot t52_steal_toctou_aot t60_barrier_cross_worker_aot"
+# Issue #191: t58_stack_registry_aot's own header already documented
+# "BUILD LEVEL: -O 0, and NOT by choice... mojo build at default -O
+# CRASHES on it" since the driver's very first commit (1ce1ca4, the same
+# PR that fixed issue #145) — the SAME upstream default-O compiler-crash
+# class as t24/t39/t40/t47/t49/t56 above, not a new or distinct defect.
+# It was simply never added to this list, so every run compiled it at the
+# default optimization level and hit the documented crash: `mojo build`
+# SIGSEGVs 3/3, reproducibly, even with no dylib linked at all (proving
+# the crash is purely compile-time and independent of the vendored C the
+# driver exercises). At `-O 0` it builds and PASSes 8/8. `-O 0` closes the
+# gap exactly like every driver above it.
+AOT_O0_DRIVERS="t56_idle_accounting_aot t50_park_commit_window_aot t30_worker_pool_aot t33_steal_aot t34_two_phase_aot t34b_affinity_aot t34c_duplicate_wake_aot t35_idle_sleep_aot t36_fairness_aot t41_idle_timer_wake_aot t24_rendezvous_oneshot_aot t39_reactor_aot t40_io_token_aot t41_tcp_connect_aot t42_tcp_accept_aot t42_io_cancel_deadline_aot t44_tcp_read_write_aot t45_reactor_race_aot t46_reactor_fairness_aot t47_pool_scheduler_aot t49_pool_churn_aot t47_channel_cross_worker_aot t38_mutex_cross_worker_aot t52_steal_toctou_aot t60_barrier_cross_worker_aot t58_stack_registry_aot"
 
 failures=0; reds=0; known_reds=0; matrix=""
 
