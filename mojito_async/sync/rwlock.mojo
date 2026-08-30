@@ -233,12 +233,24 @@ struct RWLock[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable]:
         self._guard.unlock()
         park_prepare(h)
         if park_validate(h):
+            # Early wake in PREPARE/COMMIT window: may be a GRANT or a
+            # CANCEL (cancel_read_wait removes from FIFO then latches
+            # readiness without stamping the grant marker).
             _ = park_commit(h)
             claim_running(h)
+            if not self.is_granted(h):
+                h.tcb()[].transition(TaskControlBlock.RUNNABLE)
+                rt.enqueue_local(Int(h.tcb()), h.id())
+                return False
             h.tcb()[].wait_node()[].set_next(0)
             return True
         if not park_commit(h):
+            # Early wake between validate and commit — same ambiguity.
             claim_running(h)
+            if not self.is_granted(h):
+                h.tcb()[].transition(TaskControlBlock.RUNNABLE)
+                rt.enqueue_local(Int(h.tcb()), h.id())
+                return False
             h.tcb()[].wait_node()[].set_next(0)
             return True
         return False
@@ -266,12 +278,22 @@ struct RWLock[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable]:
         self._guard.unlock()
         park_prepare(h)
         if park_validate(h):
+            # Early wake: GRANT from unlock_write OR CANCEL from
+            # cancel_write_wait.  Check the marker to distinguish.
             _ = park_commit(h)
             claim_running(h)
+            if not self.is_granted(h):
+                h.tcb()[].transition(TaskControlBlock.RUNNABLE)
+                rt.enqueue_local(Int(h.tcb()), h.id())
+                return False
             h.tcb()[].wait_node()[].set_next(0)
             return True
         if not park_commit(h):
             claim_running(h)
+            if not self.is_granted(h):
+                h.tcb()[].transition(TaskControlBlock.RUNNABLE)
+                rt.enqueue_local(Int(h.tcb()), h.id())
+                return False
             h.tcb()[].wait_node()[].set_next(0)
             return True
         return False
