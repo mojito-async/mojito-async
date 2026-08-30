@@ -19,13 +19,14 @@
 # pre-dylib.
 #
 # Verdicts per driver: PASS = exit 0 + "PASS"; RED = exit 1 + "RED"
-# (intentional TDD-red; allow-listed at gate level via precommit/known-red.tsv
-# row `suite`); everything else FAIL.  Exits nonzero while any driver is not
-# green, so the pre-commit gate sees the suite as not-yet-green.
+# (intentional TDD-red — exempted by a matching row in precommit/known-red.tsv;
+# unknown reds cause exit 1); everything else FAIL.  Exits 0 when all
+# non-exempt drivers pass (known reds are logged but not counted toward exit).
 set -u
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 REPO_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/../.." && pwd)
 BUILD_DIR="$REPO_ROOT/build"
+KNOWN_RED="$REPO_ROOT/precommit/known-red.tsv"
 MOJO=${MOJO:-mojo}
 command -v "$MOJO" >/dev/null 2>&1 || { echo "ERROR: mojo not found"; exit 2; }
 
@@ -114,14 +115,20 @@ fi
 # it at the default optimization level on every gate run.
 AOT_O0_DRIVERS="t30_worker_pool_aot t33_steal_aot t34_two_phase_aot t34b_affinity_aot t34c_duplicate_wake_aot t35_idle_sleep_aot t36_fairness_aot t41_idle_timer_wake_aot t24_rendezvous_oneshot_aot t39_reactor_aot t40_io_token_aot t41_tcp_connect_aot t42_tcp_accept_aot t42_io_cancel_deadline_aot t44_tcp_read_write_aot t45_reactor_race_aot t46_reactor_fairness_aot t47_pool_scheduler_aot t49_pool_churn_aot"
 
-failures=0; reds=0; matrix=""
+failures=0; reds=0; known_reds=0; matrix=""
 
 run_one() { # <name> <out> <exit>
     name=$1; out=$2; st=$3
     if [ "$st" -eq 0 ] && printf '%s' "$out" | grep -q "PASS"; then
         row="$name PASS"
     elif printf '%s' "$out" | grep -q "RED"; then
-        if [ "$st" -eq 1 ]; then row="$name RED (known-red, TDD)"; reds=$((reds+1))
+        if [ "$st" -eq 1 ]; then
+            if grep -q "^$name	" "$KNOWN_RED" 2>/dev/null; then
+                row="$name RED (known-red, TDD)"; known_reds=$((known_reds+1))
+            else
+                row="$name RED (unexpected — add to precommit/known-red.tsv if intentional)"
+                reds=$((reds+1))
+            fi
         else row="$name FAIL (RED text but exit $st)"; failures=$((failures+1)); fi
     else
         row="$name FAIL (exit $st; no PASS/RED verdict)"
@@ -186,5 +193,6 @@ echo "mojito-async A1 acceptance matrix (runtime #33, sync #34, channel #35, tim
 printf '%b' "$matrix" | sed 's/^/  /'
 echo ""
 [ "$failures" -ne 0 ] && { echo "RESULT: $failures FAILURE(S)"; exit 1; }
-[ "$reds" -ne 0 ] && { echo "RESULT: $reds RED (intentional TDD-red)"; exit 1; }
+[ "$reds" -ne 0 ] && { echo "RESULT: $reds RED (unexpected)"; exit 1; }
+[ "$known_reds" -ne 0 ] && echo "RESULT: $known_reds RED (intentional TDD-red)"
 echo "RESULT: all green"; exit 0
