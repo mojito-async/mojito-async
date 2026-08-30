@@ -289,10 +289,12 @@ struct UnboundedChannel[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable]:
             self._guard.unlock()
             park_prepare(h)
             if park_validate(h):
-                park_commit(h)
+                _ = park_commit(h)
                 claim_running(h)
                 continue
-            park_commit(h)
+            if not park_commit(h):
+                claim_running(h)
+                continue
             return Optional[Self.T]()
 
     # --- waiter registration (FIFO, dedupe by task id) -------------------------

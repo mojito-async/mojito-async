@@ -205,12 +205,12 @@ struct Reactor(Movable):
             # attached to the op-table slot in this branch (attach only
             # ever happens post-commit) — the caller's checkpoint/state
             # inspection after this call decides what to do with `token`.
-            park_commit(h)
+            _ = park_commit(h)
         else:
-            park_commit(h, SuspendReason.IO)
-            self.attach_waiter(
-                rt, token, Int(h.tcb()), h.id(), h.tcb()[].generation()
-            )
+            if park_commit(h, SuspendReason.IO):
+                self.attach_waiter(
+                    rt, token, Int(h.tcb()), h.id(), h.tcb()[].generation()
+                )
         return token
 
     def unregister(mut self, token: IoToken) raises:

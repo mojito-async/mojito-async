@@ -304,10 +304,11 @@ def fiber_suspend_current[R: ResultValue](
     for other RUNNABLE records either way."""
     park_prepare(h)
     if park_validate(h):
-        park_commit(h)
+        _ = park_commit(h)
         rt.push_remote(Int(h.tcb()), h.id())
         return
-    park_commit(h, reason)
+    if not park_commit(h, reason):
+        rt.push_remote(Int(h.tcb()), h.id())
 
 
 def fiber_yield_now[R: ResultValue](mut rt: Runtime, h: JoinHandle[R]) raises:
