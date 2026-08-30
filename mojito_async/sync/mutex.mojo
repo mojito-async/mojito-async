@@ -225,11 +225,14 @@ struct Mutex[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable]:
             # this waiter was already popped off the FIFO.  Close the
             # window (unwinds to RUNNABLE without ever entering WAITING)
             # and re-claim RUNNING — this call never actually suspended.
-            park_commit(h)
+            _ = park_commit(h)
             claim_running(h)
             h.tcb()[].wait_node()[].set_next(0)
             return True
-        park_commit(h)
+        if not park_commit(h):
+            claim_running(h)
+            h.tcb()[].wait_node()[].set_next(0)
+            return True
         return False
 
     # --- unlock / handoff (spec §34.3) -------------------------------------
