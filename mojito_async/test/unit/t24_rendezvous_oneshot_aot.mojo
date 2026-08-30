@@ -38,9 +38,11 @@ from mojito_async.channel import (
     Oneshot,
     OneshotReceiver,
     OneshotSender,
+    RecvOutcome,
     RendezvousChannel,
     RendezvousReceiver,
     RendezvousSender,
+    SendOutcome,
     make_oneshot,
     make_rendezvous,
 )
@@ -105,10 +107,10 @@ def pair_receiver_slice(
 ) raises:
     claim_running(h)
     var v = sc[].rx.recv(rt, h)
-    if h.state() == TaskControlBlock.WAITING:
+    if v.is_parked():
         sc[].r_parked = True
         return
-    if v:
+    if v.is_value():
         _complete_ok(h, v.value())
         return
     _complete_ok(h, -1)  # closed-and-unset observed
@@ -119,12 +121,12 @@ def pair_sender_slice(
 ) raises:
     claim_running(h)
     try:
-        sc[].tx.send(rt, h, sc[].s_item)
+        var outcome = sc[].tx.send(rt, h, sc[].s_item)
+        if outcome.is_parked():
+            sc[].s_parked = True
+            return
     except e:
         _complete_ok(h, -1)  # raised: closed
-        return
-    if h.state() == TaskControlBlock.WAITING:
-        sc[].s_parked = True
         return
     _complete_ok(h, sc[].s_item)
 
@@ -197,9 +199,9 @@ struct AdvScene(ImplicitlyCopyable, ImplicitlyDeletable):
 def adv_r1_slice(mut rt: Runtime, h: JoinHandle[IntResult], sc: UnsafePointer[AdvScene, MutAnyOrigin]) raises:
     claim_running(h)
     var v = sc[].rx1.recv(rt, h)
-    if h.state() == TaskControlBlock.WAITING:
+    if v.is_parked():
         return
-    if v:
+    if v.is_value():
         _complete_ok(h, v.value())
         return
     _complete_ok(h, -1)
@@ -208,9 +210,9 @@ def adv_r1_slice(mut rt: Runtime, h: JoinHandle[IntResult], sc: UnsafePointer[Ad
 def adv_r2_slice(mut rt: Runtime, h: JoinHandle[IntResult], sc: UnsafePointer[AdvScene, MutAnyOrigin]) raises:
     claim_running(h)
     var v = sc[].rx2.recv(rt, h)
-    if h.state() == TaskControlBlock.WAITING:
+    if v.is_parked():
         return
-    if v:
+    if v.is_value():
         _complete_ok(h, v.value())
         return
     _complete_ok(h, -1)
@@ -219,11 +221,11 @@ def adv_r2_slice(mut rt: Runtime, h: JoinHandle[IntResult], sc: UnsafePointer[Ad
 def adv_s_slice(mut rt: Runtime, h: JoinHandle[IntResult], sc: UnsafePointer[AdvScene, MutAnyOrigin]) raises:
     claim_running(h)
     try:
-        sc[].tx.send(rt, h, sc[].s_item)
+        var outcome = sc[].tx.send(rt, h, sc[].s_item)
+        if outcome.is_parked():
+            return
     except e:
         _complete_ok(h, -1)
-        return
-    if h.state() == TaskControlBlock.WAITING:
         return
     _complete_ok(h, sc[].s_item)
 
@@ -276,9 +278,9 @@ struct OScene(ImplicitlyCopyable, ImplicitlyDeletable):
 def o_receiver_slice(mut rt: Runtime, h: JoinHandle[IntResult], sc: UnsafePointer[OScene, MutAnyOrigin]) raises:
     claim_running(h)
     var v = sc[].rx.recv(rt, h)
-    if h.state() == TaskControlBlock.WAITING:
+    if v.is_parked():
         return
-    if v:
+    if v.is_value():
         _complete_ok(h, v.value())
         return
     _complete_ok(h, -1)
@@ -610,12 +612,12 @@ def main() raises:
     var t_h2o = TB.create()
     var h2o = spawn(rt2o, UnsafePointer[TB, MutAnyOrigin](to=t_h2o), 0)
     claim_running(h2o)
-    tx2o.send(rt2o, h2o, 21)  # h2o is unused by Oneshot.send() (never parks)
+    _ = tx2o.send(rt2o, h2o, 21)  # h2o is unused by Oneshot.send() (never parks)
     if not os2.is_filled():
         red("O2: first send() must fill the slot")
     var raised2 = False
     try:
-        tx2o.send(rt2o, h2o, 22)
+        _ = tx2o.send(rt2o, h2o, 22)
     except e:
         raised2 = "already sent" in String(e)
     if not raised2:
@@ -635,7 +637,7 @@ def main() raises:
     claim_running(h3o)
     var raised3 = False
     try:
-        tx3o.send(rt3o, h3o, 31)
+        _ = tx3o.send(rt3o, h3o, 31)
     except e:
         raised3 = "receiver dropped" in String(e)
     if not raised3:
@@ -661,7 +663,7 @@ def main() raises:
     if os4.recv_waiters_len() != 1:
         red("O4: receiver must be registered as a waiter")
     var tx4o = os4.sender()
-    tx4o.send(rt4o, h_r4o, 77)  # h_r4o unused by send(); never parks
+    _ = tx4o.send(rt4o, h_r4o, 77)  # h_r4o unused by send(); never parks
     if not os4.is_filled() or os4.recv_waiters_len() != 0 or os4.to_wake_len() != 1:
         red("O4: send() must fill the slot and wake the parked receiver")
     o_drain(rt4o, scp4o)

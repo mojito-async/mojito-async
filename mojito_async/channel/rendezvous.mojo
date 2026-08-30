@@ -75,7 +75,7 @@
 # Atomic cannot be Movable/ImplicitlyDeletable, so RendezvousChannel drops
 # those conformances too — it now mirrors Channel/Mutex/RWLock.
 from std.collections import Deque, List
-from mojito_async.channel.channel import WaitRecord
+from mojito_async.channel.channel import WaitRecord, RecvOutcome, SendOutcome
 from mojito_async.runtime.queue import SpinLock
 from mojito_async.runtime.runtime import Runtime
 from mojito_async.runtime.task_control_block import ResultValue
@@ -370,7 +370,7 @@ struct RendezvousChannel[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable]:
 
     def send[R: ResultValue](
         mut self, mut rt: Runtime, h: JoinHandle[R], item: Self.T
-    ) raises:
+    ) raises -> SendOutcome:
         """One-shot send (issued by a RendezvousSender).  A resumed call
         (task id already carries an outcome) short-circuits to success or
         raises "closed" WITHOUT touching the match/park logic again — see
@@ -392,7 +392,7 @@ struct RendezvousChannel[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable]:
             self._guard.lock()
             if self._take_send_done_locked(h.id()):
                 self._guard.unlock()
-                return
+                return SendOutcome(SendOutcome.SENT)
             if self._take_send_failed_locked(h.id()):
                 self._guard.unlock()
                 raise Error("ChannelError: send on closed channel")
@@ -401,7 +401,7 @@ struct RendezvousChannel[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable]:
                 raise Error("ChannelError: send on closed channel")
             if self._match_waiting_receiver_locked(item):
                 self._guard.unlock()
-                return
+                return SendOutcome(SendOutcome.SENT)
             self._register_send_wait_locked(h, item)
             self._guard.unlock()
             park_prepare(h)
@@ -412,11 +412,11 @@ struct RendezvousChannel[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable]:
             if not park_commit(h):
                 claim_running(h)
                 continue
-            return
+            return SendOutcome(SendOutcome.PARKED)
 
     def recv[R: ResultValue](
         mut self, mut rt: Runtime, h: JoinHandle[R]
-    ) raises -> Optional[Self.T]:
+    ) raises -> RecvOutcome[Self.T]:
         """One-shot receive (issued by a RendezvousReceiver).  Safe to
         re-invoke on resume: both a filled `_slot` (Case A) and a queued
         sender (Case B) are state-derived, idempotent checks — no outcome
@@ -433,14 +433,14 @@ struct RendezvousChannel[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable]:
                 self._slot = Optional[Self.T]()
                 self._try_advance_locked()
                 self._guard.unlock()
-                return Optional[Self.T](v)
+                return RecvOutcome[Self.T](RecvOutcome.VALUE, Optional[Self.T](v))
             var matched = self._match_waiting_sender_locked()
             if matched:
                 self._guard.unlock()
-                return Optional[Self.T](matched.value().item)
+                return RecvOutcome[Self.T](RecvOutcome.VALUE, Optional[Self.T](matched.value().item))
             if self._send_closed or self._recv_closed:
                 self._guard.unlock()
-                return Optional[Self.T]()
+                return RecvOutcome[Self.T](RecvOutcome.CLOSED)
             self._register_receiver_locked(h)
             self._guard.unlock()
             park_prepare(h)
@@ -451,7 +451,7 @@ struct RendezvousChannel[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable]:
             if not park_commit(h):
                 claim_running(h)
                 continue
-            return Optional[Self.T]()
+            return RecvOutcome[Self.T](RecvOutcome.PARKED)
 
     # --- waiter registration (FIFO, dedupe by task id) ----------------------
 
@@ -574,10 +574,10 @@ struct RendezvousSender[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable](
 
     def send[R: ResultValue](
         mut self, mut rt: Runtime, h: JoinHandle[R], item: Self.T
-    ) raises:
+    ) raises -> SendOutcome:
         if self._closed:
             raise Error("ChannelError: send on closed channel")
-        self._chan[].send(rt, h, item)
+        return self._chan[].send(rt, h, item)
 
     def close(mut self) raises:
         """Drop this sender's slot.  When the LAST sender closes, the send
@@ -612,7 +612,7 @@ struct RendezvousReceiver[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable]
 
     def recv[R: ResultValue](
         mut self, mut rt: Runtime, h: JoinHandle[R]
-    ) raises -> Optional[Self.T]:
+    ) raises -> RecvOutcome[Self.T]:
         return self._chan[].recv(rt, h)
 
     def close(mut self) raises:
