@@ -56,7 +56,7 @@
 # Movable/ImplicitlyDeletable, so UnboundedChannel drops those
 # conformances too — it now mirrors Channel/Mutex/RWLock.
 from std.collections import Deque
-from mojito_async.channel.channel import WaitRecord
+from mojito_async.channel.channel import WaitRecord, RecvOutcome, SendOutcome
 from mojito_async.runtime.queue import SpinLock
 from mojito_async.runtime.runtime import Runtime
 from mojito_async.runtime.task_control_block import ResultValue
@@ -237,7 +237,7 @@ struct UnboundedChannel[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable]:
 
     def send[R: ResultValue](
         mut self, mut rt: Runtime, h: JoinHandle[R], item: Self.T
-    ) raises:
+    ) raises -> SendOutcome:
         """One-shot send of the current task (issued by a Sender).  Always
         buffers — an unbounded channel never applies backpressure — and, if
         a receiver is parked (it parked on an empty store), wakes the
@@ -255,10 +255,11 @@ struct UnboundedChannel[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable]:
             _ = self._recv_waiters.popleft()
             self._to_wake.append(w)
         self._guard.unlock()
+        return SendOutcome(SendOutcome.SENT)
 
     def recv[R: ResultValue](
         mut self, mut rt: Runtime, h: JoinHandle[R]
-    ) raises -> Optional[Self.T]:
+    ) raises -> RecvOutcome[Self.T]:
         """One-shot receive of the current task (issued by a Receiver).
 
         Fast path: store non-empty — move the OLDEST value out (no sender
@@ -281,10 +282,10 @@ struct UnboundedChannel[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable]:
             if len(self._items) > 0:
                 var v = self._items.popleft()
                 self._guard.unlock()
-                return Optional[Self.T](v)
+                return RecvOutcome[Self.T](RecvOutcome.VALUE, Optional[Self.T](v))
             if self._send_closed or self._recv_closed:
                 self._guard.unlock()
-                return Optional[Self.T]()
+                return RecvOutcome[Self.T](RecvOutcome.CLOSED)
             self._register_receiver_locked(h)
             self._guard.unlock()
             park_prepare(h)
@@ -295,7 +296,7 @@ struct UnboundedChannel[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable]:
             if not park_commit(h):
                 claim_running(h)
                 continue
-            return Optional[Self.T]()
+            return RecvOutcome[Self.T](RecvOutcome.PARKED)
 
     # --- waiter registration (FIFO, dedupe by task id) -------------------------
 
@@ -414,10 +415,10 @@ struct Sender[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable](
 
     def send[R: ResultValue](
         mut self, mut rt: Runtime, h: JoinHandle[R], item: Self.T
-    ) raises:
+    ) raises -> SendOutcome:
         if self._closed:
             raise Error("ChannelError: send on closed channel")
-        self._chan[].send(rt, h, item)
+        return self._chan[].send(rt, h, item)
 
     def close(mut self) raises:
         """Drop this sender's slot.  When the LAST sender closes, the send
@@ -454,7 +455,7 @@ struct Receiver[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable](
 
     def recv[R: ResultValue](
         mut self, mut rt: Runtime, h: JoinHandle[R]
-    ) raises -> Optional[Self.T]:
+    ) raises -> RecvOutcome[Self.T]:
         return self._chan[].recv(rt, h)
 
     def close(mut self) raises:
