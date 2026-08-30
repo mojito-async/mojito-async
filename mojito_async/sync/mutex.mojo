@@ -115,6 +115,13 @@ struct Mutex[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable]:
     slot.  The marker itself needs no guard: only the resumed owner-task
     ever reads/clears it, strictly after the wake claim that resumed it
     (happens-before via the SAME claim the guard below serializes).
+
+    SAFETY: MUST NOT be moved while waiters are queued.  The address-based
+    grant marker (unlock() stamps UnsafePointer(to=self)) becomes stale after
+    a move; the waiter's holds_grant() check would fail and the lock would
+    never be claimed, producing a permanent deadlock.  In practice the pool
+    never moves live sync primitives; a scope that moves a Mutex with waiters
+    queued is a bug.
     """
 
     var _guard: SpinLock
@@ -129,6 +136,26 @@ struct Mutex[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable]:
         self._value = initial
         self._w_tcb = Deque[Int]()
         self._w_id = Deque[Int]()
+
+    def __moveinit__(mut self, mut existing: Mutex[Self.T]):
+        """Move constructor — transfers ownership of a lock with no waiters.
+
+        SAFETY: asserts at runtime that no waiters are queued before the move
+        completes.  Moving a lock whose unlock() has already stamped a
+        UnsafePointer(to=self) grant marker into a waiter's WaitNode would
+        leave that marker stale (pointing at the old address); the waiter's
+        next holds_grant() call would never match, producing a permanent
+        deadlock.  The assertion fires in debug builds; treat a fire as a
+        hard bug in the caller.
+        """
+        assert (
+            len(existing._w_tcb) == 0
+        ), "moving a lock with waiters is undefined behavior"
+        self._guard = SpinLock()
+        self._locked = existing._locked
+        self._value = existing._value
+        self._w_tcb = existing._w_tcb.copy()
+        self._w_id = existing._w_id.copy()
 
     # --- queries -----------------------------------------------------------
 

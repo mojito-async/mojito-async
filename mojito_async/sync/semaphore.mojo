@@ -89,6 +89,13 @@ struct Semaphore:
 
     RAII: `acquire` returns a bearer handle; `Permit.release(rt)` returns the
     permits and wakes waiters FIFO.
+
+    SAFETY: MUST NOT be moved while waiters are queued.  The address-based
+    grant marker (release() stamps UnsafePointer(to=self)) becomes stale after
+    a move; the waiter's is_granted() check would fail and the permit would
+    never be claimed, producing a permanent deadlock.  In practice the pool
+    never moves live sync primitives; a scope that moves a Semaphore with
+    waiters queued is a bug.
     """
 
     var _guard: SpinLock
@@ -103,6 +110,26 @@ struct Semaphore:
         self._w_tcb = Deque[Int]()
         self._w_id = Deque[Int]()
         self._w_n = Deque[Int]()
+
+    def __moveinit__(mut self, mut existing: Semaphore):
+        """Move constructor — transfers ownership of a semaphore with no
+        waiters.
+
+        SAFETY: asserts at runtime that no waiters are queued before the move
+        completes.  Moving a semaphore whose release() has already stamped a
+        UnsafePointer(to=self) grant marker into a waiter's WaitNode would
+        leave that marker stale; the waiter's next is_granted() call would
+        never match, producing a permanent deadlock.  The assertion fires in
+        debug builds; treat a fire as a hard bug in the caller.
+        """
+        assert (
+            len(existing._w_tcb) == 0
+        ), "moving a lock with waiters is undefined behavior"
+        self._guard = SpinLock()
+        self._permits = existing._permits
+        self._w_tcb = existing._w_tcb.copy()
+        self._w_id = existing._w_id.copy()
+        self._w_n = existing._w_n.copy()
 
     def available(mut self) -> Int:
         self._guard.lock()
