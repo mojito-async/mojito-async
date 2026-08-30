@@ -560,6 +560,7 @@ def pool_worker_loop_scheduled[
     c[].entry_ok = Int(back) == Int(c[].worker)
     var w = UnsafePointer[Worker, MutAnyOrigin](unsafe_from_address=Int(c[].worker))
     var ud = c[].dispatch_ud
+    var consecutive_faults: Int = 0
     while True:
         if Int(Atomic[DType.uint8].load[ordering=Ordering.ACQUIRE](c[].latch)) != 0:
             break
@@ -578,7 +579,14 @@ def pool_worker_loop_scheduled[
             )
         except e:
             w[].runtime()[].note_worker_fault()
+            consecutive_faults += 1
+            if consecutive_faults > 10:
+                raise Error(
+                    "worker fault threshold exceeded (10 consecutive): "
+                    + str(e)
+                )
             continue
+        consecutive_faults = 0  # reset on each successful dispatch iteration
         var stolen = w[].try_steal_unstarted[R]()
         if stolen:
             var rec = stolen.value()
