@@ -19,15 +19,15 @@
 # capacity budget.  A warm acquire() (reuse of a still-live released stack)
 # performs NO fresh ms_stack_alloc: warm-path OS allocation is flat.
 #
-# Liveness (T6 fold, issue #52): the pool owns the *Mojo* policy but the C
-# substrate owns liveness.  Fiber.destroy() munmaps a pooled reservation
-# directly via ms_stack_free; if the pool simply re-acquired that cell it
-# would hand out a dangling base (SIGSEGV on use).  The vendored
-# ms_stack_is_live(base) extern closes the gap: release() verifies the cell's
-# reservation is still live and raises loudly otherwise ("fiber destroy
-# before release?"); the warm acquire() path re-checks and falls back to a
-# cold allocation rather than recycling a freed reservation.
-#
+# Liveness (T6 fold, issue #52 / #145): the pool is the SOLE OWNER of each
+# cell's OS reservation.  Issue #145 Bug 2 closed the ABA hole: Fiber.destroy()
+# no longer calls ms_stack_free for pool-acquired cells (_is_pooled flag);
+# pool.retire() / drain() are the only callers of ms_stack_free for pool cells.
+# Consequently the pool's STATE array (_state[idx]) is the single source of
+# truth for cell liveness: a CACHED cell's reservation is guaranteed live
+# (never freed between release() and acquire()) without any ms_stack_is_live
+# probe.  The ABA hole is eliminated: the C registry address-based probe
+# (ms_stack_is_live) is no longer used in the pool's hot paths.
 # Reuse gate (spec §15 "never recycle until unquestionably complete"): a
 # cache entry is handed to a NEW caller only after an explicit release(),
 # which the caller performs once the owning fiber/task is TERMINAL.  The
@@ -62,7 +62,6 @@ from mojito_async.vendor.mojito_sys import (
     ms_page_size,
     ms_stack_alloc,
     ms_stack_free,
-    ms_stack_is_live,
     ms_stack_total_size,
 )
 
@@ -224,25 +223,17 @@ struct StackCache(Movable, ImplicitlyDeletable):
     # acquired).
     def acquire(mut self) raises -> UnsafePointer[NativeStack, MutAnyOrigin]:
         if self._cached > 0:
-            # Warm hit: pop the head cell.  A Object.destroy may have munmapped
-            # the reservation under us since release() (fiber destroy before
-            # release?), so verify it is still live before pooling it out.
+            # Warm hit: pop the head cell.  The pool is the sole OS owner of
+            # each cell (issue #145 Bug 2: Fiber.destroy() skips stack_free
+            # for pool cells, so the reservation is guaranteed live).  The
+            # pool's STATE array is the source of truth; no ms_stack_is_live
+            # probe is needed.
             var idx = self._head
             self._head = self._next[idx]
             self._next[idx] = NO_NEXT
             self._state[idx] = STATE_LIVE
             self._cached -= 1
             self._live += 1
-            if ms_stack_is_live(self._cells[idx].base) == 0:
-                # Reservation freed underneath us: cold-reallocate into this
-                # cell instead of handing out a dangling base.
-                var slots = stack_allocation[2, BytePtr]()
-                var rc = ms_stack_alloc(self._stack_bytes, slots, slots + 1)
-                if rc != 0:
-                    raise Error(
-                        "stack_pool.acquire: ms_stack_alloc failed rc=" + String(rc)
-                    )
-                self._cells[idx] = NativeStack(slots[], (slots + 1)[])
             return self._cells + idx
 
         # Cold: is the pool at capacity (all cells live or cached)?
@@ -277,6 +268,11 @@ struct StackCache(Movable, ImplicitlyDeletable):
     # to the free set.  The caller attests the owning fiber/task reached
     # TERMINAL before invoking this; the pool enforces that the cell is in
     # fact live (never double-release, never release-of-unknown).
+    #
+    # Issue #145 Bug 2: no ms_stack_is_live probe here.  Pool cells are
+    # never freed by Fiber.destroy() (_is_pooled flag); the STATE_LIVE check
+    # below is sufficient — the reservation is guaranteed to still be in the
+    # C registry.
     def release(mut self, cell: UnsafePointer[NativeStack, MutAnyOrigin]) raises:
         var idx = self._index_of(cell)
         if idx < 0:
@@ -285,14 +281,6 @@ struct StackCache(Movable, ImplicitlyDeletable):
             raise Error(
                 "stack_pool.release: cell " + String(idx)
                 + " not live (reuse-gate violation: recycle of a non-terminal task)"
-            )
-        # Verify the reservation is still live (not freed by a Fiber.destroy
-        # that munmapped it underneath us) before marking it CACHED.  A freed
-        # reservation must never re-enter the free set.
-        if ms_stack_is_live(self._cells[idx].base) == 0:
-            raise Error(
-                "stack_pool.release: cell " + String(idx)
-                + " reservation already freed (fiber destroy before release?)"
             )
         self._next[idx] = self._head
         self._head = idx
