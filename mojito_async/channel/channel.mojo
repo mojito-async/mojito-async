@@ -364,11 +364,14 @@ struct Channel[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable]:
             self._guard.unlock()
             park_prepare(h)
             if park_validate(h):
-                park_commit(h)
+                _ = park_commit(h)
                 claim_running(h)
                 raise_if_cancel_wake(h)
                 continue
-            park_commit(h)
+            if not park_commit(h):
+                claim_running(h)
+                raise_if_cancel_wake(h)
+                continue
             return
 
     def recv[R: ResultValue](
@@ -400,11 +403,14 @@ struct Channel[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable]:
             self._guard.unlock()
             park_prepare(h)
             if park_validate(h):
-                park_commit(h)
+                _ = park_commit(h)
                 claim_running(h)
                 raise_if_cancel_wake(h)
                 continue
-            park_commit(h)
+            if not park_commit(h):
+                claim_running(h)
+                raise_if_cancel_wake(h)
+                continue
             return Optional[Self.T]()
 
     # --- token-aware slow paths (A4.3, issue #57) ---------------------------

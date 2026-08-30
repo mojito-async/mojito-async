@@ -176,6 +176,12 @@ struct Runtime:
     var _service_sweeps: Int
     var _yields: Int
     var _starvation_events: Int
+    # issue #144: worker fault counter — errors that escaped fair_scheduler_loop
+    # are caught by pool_worker_loop_scheduled's catch-count-continue guard and
+    # tallied here so diagnostics can observe them without losing the thread.
+    # Thread safety: safe to read only after join_all() completes, or under
+    # external synchronization.
+    var _worker_faults: Int
 
     # M9 (review fold, issue #73): PER-SLICE COUNTER COST, documented and
     # bounded.  Every served slice costs exactly ONE non-atomic Int
@@ -216,6 +222,7 @@ struct Runtime:
         self._service_sweeps = 0
         self._yields = 0
         self._starvation_events = 0
+        self._worker_faults = 0
     # --- root-task execution (A0-T1) ----------------------------------------
 
     def run[T: def() raises -> None](mut self, task: T) raises:
@@ -346,6 +353,15 @@ struct Runtime:
         """Dequeue the next LOCAL record (owner LIFO end); raises on an
         empty deque."""
         return self._local.pop_back()
+
+    def try_pop_local(mut self) raises -> Optional[TaskRecord]:
+        """Atomic check-and-pop of the local deque: check and pop in a SINGLE
+        critical section, eliminating the TOCTOU race between a separate
+        has_local() and pop_local() call (issue #144).  Returns None on an
+        empty deque.  The `raises` annotation is required because the
+        underlying Deque.pop() is raising; under the guard the empty check
+        ensures the pop path is unreachable."""
+        return self._local.try_pop_back()
 
     def pop_remote(mut self) raises -> TaskRecord:
         """Dequeue the next REMOTE-ready record (owner FIFO pop); raises on
@@ -601,6 +617,18 @@ struct Runtime:
         """Count one successful unstarted-task steal (issue #70 step 5)."""
         self._steal_total += 1
 
+
+    def note_worker_fault(mut self):
+        """Count one fault that escaped fair_scheduler_loop (issue #144):
+        a loop-body error that the embedder's catch-count-continue guard
+        swallowed to keep the worker thread alive.  Visible via
+        worker_faults_total()."""
+        self._worker_faults += 1
+
+    def worker_faults_total(self) -> Int:
+        """Number of fair_scheduler_loop errors caught and continued by the
+        embedder's worker-thread fault guard (issue #144)."""
+        return self._worker_faults
     def task_steals_total(self) -> Int:
         """Successful unstarted-task steals on this runtime (spec §71
         `task_steals_total`).  Exact: one bump per steal, zero on failed
