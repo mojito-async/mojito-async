@@ -47,7 +47,10 @@ name: ci
 # yet — and what no session working this repo from a macOS host can do
 # directly — is exercise the actual success path on a live Linux kernel
 # with io_uring; that verification is deferred entirely to this CI runner,
-# once it can build at all.
+# once it can build at all. Same maintenance note as suite-linux above:
+# flip this job's `continue-on-error` off too once `make` succeeds here --
+# a real regression in this lane must start blocking the moment it is
+# able to, not stay reported-only forever by inertia.
 
 on:
   push:
