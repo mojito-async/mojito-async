@@ -50,7 +50,10 @@
 # (allocated once at construction — caller-owns-cells, TCB pattern).
 # acquire() returns a pointer INTO the cell array; the caller owns that
 # NativeStack handle while acquired and MUST release()/retire() it before
-# the pool may reuse the cell.
+# the pool may reuse the cell.  Callers that hand the acquired cell to
+# seam_bind_slot MUST pass pooled=True so Fiber.destroy() leaves the
+# reservation to the pool and does not double-free it (single-owner rule,
+# issue #145 Bug 2).
 #
 # Link with:  mojo run -Xlinker <repo>/libmojito_spike.dylib <driver>
 
