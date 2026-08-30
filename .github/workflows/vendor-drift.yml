@@ -41,12 +41,12 @@ jobs:
         with:
           repository: mojito-async/mojito-sys
           path: mojito-sys
-          # mojito-sys is PRIVATE, and the default GITHUB_TOKEN is scoped to
-          # this repository only: without a cross-repo read token the checkout
-          # fails with "Not Found", which is what the first run of this
-          # workflow did.  Create a fine-grained PAT with Contents: read on
-          # mojito-async/mojito-sys and store it as the MOJITO_SYS_TOKEN
-          # secret.  Until that exists this job fails LOUDLY at checkout,
+          # The first run of this workflow failed at checkout with "Not
+          # Found": mojito-sys was private and the default GITHUB_TOKEN is
+          # scoped to this repository only.  Both repositories are public
+          # now, so the default token reaches it.  MOJITO_SYS_TOKEN is still
+          # honoured first, so this keeps working if either repository goes
+          # private again — in which case the job fails LOUDLY at checkout,
           # which is the correct outcome and the same rule the check itself
           # follows: an unverifiable vendor tree must never read as an
           # unchanged one.
