@@ -29,7 +29,10 @@ BUILD_DIR="$REPO_ROOT/build"
 MOJO=${MOJO:-mojo}
 command -v "$MOJO" >/dev/null 2>&1 || { echo "ERROR: mojo not found"; exit 2; }
 
+# The substrate is a .dylib on Darwin and a .so elsewhere (issue #141:
+# the Linux lanes must be able to run at all).
 DYLIB="$REPO_ROOT/libmojito_spike.dylib"
+[ -f "$DYLIB" ] || DYLIB="$REPO_ROOT/libmojito_spike.so"
 LINK_FLAGS=""
 if [ -f "$DYLIB" ]; then
     LINK_FLAGS="-Xlinker $DYLIB"
@@ -158,7 +161,8 @@ run_one() { # <name> <out> <exit>
         row="$name FAIL (exit $st; no PASS/RED verdict)"
         failures=$((failures+1))
     fi
-    matrix="$matrix$row"
+    matrix="$matrix$row
+"
     echo "== $name"; printf '%s\n' "$out" | tail -n 2 | sed 's/^/   | /'
 }
 
@@ -192,7 +196,8 @@ for t in $AOT_TESTS; do
             >"$BUILD_DIR/$name.build.log" 2>&1; then
         row="$name FAIL (AOT build error)"
         failures=$((failures+1))
-        matrix="$matrix$row"
+        matrix="$matrix$row
+"
         echo "== $name"; tail -n 3 "$BUILD_DIR/$name.build.log" | sed 's/^/   | /'
     else
         out=$("$bin" 2>&1); st=$?
@@ -203,6 +208,14 @@ done
 echo ""
 echo "mojito-async A1 acceptance matrix (runtime #33, sync #34, channel #35, timer #36, stress #37, stack cache #52)"
 printf '%b' "$matrix" | sed 's/^/  /'
+echo ""
+
+# --- per-driver verdict rows (issue #141) ----------------------------------
+# One machine-readable line per driver for precommit/gate.sh, which scores
+# known-red allow-listing PER DRIVER.  Before #141 the gate saw a single
+# check named `suite`, so one allow-list row covered every driver and every
+# bench in the tree at once.
+printf '%b' "$matrix" | awk 'NF>=2 {print "VERDICT\t" $1 "\t" $2}'
 echo ""
 [ "$failures" -ne 0 ] && { echo "RESULT: $failures FAILURE(S)"; exit 1; }
 [ "$reds" -ne 0 ] && { echo "RESULT: $reds RED (intentional TDD-red)"; exit 1; }
