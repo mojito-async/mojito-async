@@ -171,6 +171,21 @@ struct LocalDeque:
         self._guard.unlock()
         return rec
 
+    def try_pop_back(mut self) raises -> Optional[TaskRecord]:
+        """Atomic check-and-pop at the owner's LIFO end: check and pop in a
+        SINGLE critical section, eliminating the TOCTOU window that existed
+        between a separate is_empty() and pop_back() call (issue #144).
+        Returns None on an empty deque.  The `raises` annotation is required
+        because Deque.pop() is a raising call; under the guard the check
+        ensures the pop path is unreachable."""
+        self._guard.lock()
+        if len(self._data) == 0:
+            self._guard.unlock()
+            return Optional[TaskRecord]()
+        var rec = self._data.pop()
+        self._guard.unlock()
+        return Optional[TaskRecord](rec)
+
     def steal_front(mut self) raises -> TaskRecord:
         """Thief pop: the FRONT — the OPPOSITE end from the owner's LIFO
         pops (spec §20).  E4 wires cross-worker stealing; t31 proves this
@@ -182,6 +197,21 @@ struct LocalDeque:
         var rec = self._data.popleft()
         self._guard.unlock()
         return rec
+
+    def try_steal_front(mut self) raises -> Optional[TaskRecord]:
+        """Atomic check-and-steal at the thief's FRONT end: check and pop in a
+        SINGLE critical section, eliminating the TOCTOU window that existed
+        between a separate is_empty() and steal_front() call (issue #144).
+        Returns None on an empty deque.  The `raises` annotation is required
+        because Deque.popleft() is a raising call; under the guard the check
+        ensures the pop path is unreachable."""
+        self._guard.lock()
+        if len(self._data) == 0:
+            self._guard.unlock()
+            return Optional[TaskRecord]()
+        var rec = self._data.popleft()
+        self._guard.unlock()
+        return Optional[TaskRecord](rec)
 
     def is_empty(mut self) -> Bool:
         self._guard.lock()
