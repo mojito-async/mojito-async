@@ -89,31 +89,55 @@ struct WaitNode(ImplicitlyCopyable, ImplicitlyDeletable):
     """Embedded intrusive wait node (spec §24).  One reusable node lives in
     each TCB so park/wake performs no per-suspension allocation.  `_generation`
     claims a waiter epoch at WAITING commit; `_reason` is why the task waits
-    (intrusive list link `_next`)."""
+    (intrusive list link `_next`).
+
+    Issue #190: `_next` (the cross-worker winner/GRANT marker — the shared
+    convention mutex.mojo's module header documents, reused verbatim by
+    semaphore.mojo/rwlock.mojo/condvar.mojo/barrier.mojo) and `_reason` (the
+    wake cause, double-duty as the winner cause per SuspendReason's
+    docstring) are Atomic[DType.int64] with explicit acquire/release
+    ordering, matching issue #143's treatment of TaskControlBlock._state/
+    _generation/_claim_epoch: one worker's notify/wake leg stamps them and a
+    DIFFERENT worker's resumed task reads them back (park.mojo's
+    park_validate/park_commit, condvar.mojo's resolve_winner/notify_marker)
+    across a SpinLock-guarded critical section — a plain field is not
+    guaranteed fresh across that boundary at Mojo's default `-O` (the
+    LICM-class miscompilation #143 documents); #175 hit exactly this gap in
+    t60_barrier_cross_worker_aot before this fix closed it at the source.
+    `_generation` stays plain storage here: WaitNode.generation() is only
+    ever read back by the SAME owner worker that stamped it at WAITING
+    commit (cancel.mojo/timer_service.mojo/timeout_scope.mojo pass it as a
+    snapshot `required_gen` into unpark_current, which re-validates against
+    TCB_Prefix's OWN atomic `_generation` before claiming — the field these
+    callers actually race on is already #143-covered)."""
 
     var _generation: Int
-    var _reason: Int
-    var _next: Int
+    var _reason: Int64  # atomic acquire/release (issue #190, matches #143)
+    var _next: Int64    # atomic acquire/release (issue #190, matches #143)
 
     def __init__(out self):
         self._generation = 0
-        self._reason = 0
-        self._next = 0
+        self._reason = Int64(0)
+        self._next = Int64(0)
 
     def generation(self) -> Int:
         return self._generation
 
-    def reason(self) -> Int:
-        return self._reason
+    def reason(mut self) -> Int:
+        return Int(Atomic[DType.int64].load[ordering=Ordering.ACQUIRE](
+            UnsafePointer[Int64, MutAnyOrigin](to=self._reason)))
 
-    def next(self) -> Int:
-        return self._next
+    def next(mut self) -> Int:
+        return Int(Atomic[DType.int64].load[ordering=Ordering.ACQUIRE](
+            UnsafePointer[Int64, MutAnyOrigin](to=self._next)))
 
     def set_reason(mut self, r: Int):
-        self._reason = r
+        Atomic[DType.int64].store[ordering=Ordering.RELEASE](
+            UnsafePointer[Int64, MutAnyOrigin](to=self._reason), Int64(r))
 
     def set_next(mut self, n: Int):
-        self._next = n
+        Atomic[DType.int64].store[ordering=Ordering.RELEASE](
+            UnsafePointer[Int64, MutAnyOrigin](to=self._next), Int64(n))
 
 
 # ---------------------------------------------------------------------------
@@ -190,9 +214,16 @@ struct TCB_Prefix(ImplicitlyCopyable, ImplicitlyDeletable):
     # claim decision it feeds) happens under the OWNER worker's remote-ready
     # queue spinlock — the one lock every wake path already serializes
     # through (issue #68 memory-ordering banner) — so the latch/claim and
-    # the parker's commit are atomic with respect to each other.
+    # the parker's commit are atomic with respect to each other.  Issue
+    # #190: the guard alone does not stop the optimizer from caching a
+    # plain field read across the lock/unlock boundary at default `-O`
+    # (the same LICM-class gap #143 closed for _state/_generation/
+    # _claim_epoch — #175 hit the WaitNode half of it in
+    # t60_barrier_cross_worker_aot), so `_early` is Atomic[DType.uint8]
+    # (0/1 latch) with explicit acquire/release ordering, read/written
+    # through the same UnsafePointer-cast pattern #143 established.
     var _owner_runtime: Int
-    var _early: Bool
+    var _early: UInt8  # atomic acquire/release (issue #190, matches #143)
     # H2 (PR #109) — CLAIMED-EPOCH marker: the generation of the last
     # successful wake claim (0 = no claim consumed yet).  The WAKE leg
     # stamps it exactly when wake_claim() consumes a WAITING epoch; a
@@ -216,7 +247,7 @@ struct TCB_Prefix(ImplicitlyCopyable, ImplicitlyDeletable):
         self._started = False
         self._owner_worker = 0
         self._owner_runtime = 0
-        self._early = False
+        self._early = UInt8(0)
         self._claim_epoch = Int64(0)
     # --- construction ------------------------------------------------------
 
@@ -269,10 +300,14 @@ struct TCB_Prefix(ImplicitlyCopyable, ImplicitlyDeletable):
     def transition(mut self, to: Int) raises:
         """Validate and perform a transition; raises
         IllegalTransitionError-as-Error for non-allowed pairs."""
-        if not TCB_Prefix._is_allowed(Int(self._state), to):
+        # Issue #190: read the CURRENT state through the atomic getter, not
+        # the plain field — matches wake_claim below; a foreign-thread wake
+        # (unpark_current's loud-raise tail) can reach this same check.
+        var cur = self.state()
+        if not TCB_Prefix._is_allowed(cur, to):
             var what = (
                 "IllegalTransitionError: illegal transition "
-                + String(Int(self._state))
+                + String(cur)
                 + String(to)
             )
             var err = IllegalTransitionError(what)
@@ -287,7 +322,7 @@ struct TCB_Prefix(ImplicitlyCopyable, ImplicitlyDeletable):
         generation discipline in `wake_claim`) is the A2/EPIC#2 seam; on the
         single cooperative worker there is no interleaving inside a dispatch
         slice, so the plain check is exact for today."""
-        if self._state == Int64(from_) and TCB_Prefix._is_allowed(from_, to):
+        if self.state() == from_ and TCB_Prefix._is_allowed(from_, to):
             self._apply(to)
             return True
         return False
@@ -309,15 +344,27 @@ struct TCB_Prefix(ImplicitlyCopyable, ImplicitlyDeletable):
         for unpark_current: any later wake carrying that same required_gen
         is a duplicate of this claim and must no-op quietly in every state
         (the generation counter alone cannot tell, since it only bumps at
-        the NEXT WAITING commit)."""
-        if self._state != Int64(TaskControlBlock.WAITING):
+        the NEXT WAITING commit).
+
+        Issue #190: this is the OTHER half of the same LICM-class gap the
+        WaitNode fields closed — `wake_claim` is the one place a REMOTE
+        thread's `unpark_current` reads TCB_Prefix's own `_state`/
+        `_generation` (under the owner's remote-ready queue guard, the same
+        guard the WAITING-committing side holds in `_apply`/`transition`).
+        #143 made the STORAGE atomic and added atomic external getters
+        (`state()`/`generation()`), but this method's own checks still read
+        the plain fields directly, leaving exactly the gap #143 intended to
+        close open on the read side a foreign thread actually exercises on
+        every cross-worker wake claim.  Routed through the atomic getters
+        below instead."""
+        if self.state() != TaskControlBlock.WAITING:
             return False
-        if required_gen != 0 and Int(self._generation) != required_gen:
+        if required_gen != 0 and self.generation() != required_gen:
             return False
         self._apply(TaskControlBlock.RUNNABLE)
         Atomic[DType.int64].store[ordering=Ordering.RELEASE](
             UnsafePointer[Int64, MutAnyOrigin](to=self._claim_epoch),
-            self._generation)
+            Int64(self.generation()))
         return True
 
     # --- queries -----------------------------------------------------------
@@ -368,18 +415,21 @@ struct TCB_Prefix(ImplicitlyCopyable, ImplicitlyDeletable):
         A2.5 issue #71)."""
         self._owner_runtime = addr
 
-    def early_readiness(self) -> Bool:
+    def early_readiness(mut self) -> Bool:
         """Two-phase early-wake latch (A0-T11): True once a wake was
         delivered while the task was RUNNING/PARKING (before the WAITING
         commit).  Guarded by the OWNER's remote-ready queue spinlock;
         consumed by park_commit (the unwind-vs-WAITING decision)."""
-        return self._early
+        return Atomic[DType.uint8].load[ordering=Ordering.ACQUIRE](
+            UnsafePointer[UInt8, MutAnyOrigin](to=self._early)) != 0
 
     def set_early_readiness(mut self):
-        self._early = True
+        Atomic[DType.uint8].store[ordering=Ordering.RELEASE](
+            UnsafePointer[UInt8, MutAnyOrigin](to=self._early), UInt8(1))
 
     def clear_early_readiness(mut self):
-        self._early = False
+        Atomic[DType.uint8].store[ordering=Ordering.RELEASE](
+            UnsafePointer[UInt8, MutAnyOrigin](to=self._early), UInt8(0))
 
     def claimed_epoch(mut self) -> Int:
         """H2 (PR #109): the generation of the last consumed wake claim."""
@@ -556,7 +606,7 @@ struct TaskControlBlock[T: ResultValue](ImplicitlyCopyable, ImplicitlyDeletable)
         A2.5 issue #71)."""
         self._pre.set_owner_runtime(addr)
 
-    def early_readiness(self) -> Bool:
+    def early_readiness(mut self) -> Bool:
         """Two-phase early-wake latch (A0-T11): True once a wake was
         delivered while the task was RUNNING/PARKING (before the WAITING
         commit).  Guarded by the OWNER's remote-ready queue spinlock;
