@@ -77,9 +77,6 @@ from mojito_async.runtime.park import (
 )
 
 
-comptime RW_GRANTED = Int(1)
-
-
 def _rw_waiter_handle[R: ResultValue](tcb_addr: Int, tid: Int) -> JoinHandle[R]:
     """Reconstruct a waiter's one-shot handle from the queued (addr, id)."""
     return JoinHandle[R](
@@ -111,6 +108,13 @@ struct RWLock[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable]:
       _value          — the protected value.
       _r_tcb/_r_id    — FIFO of parked reader waiters (tcb_addr, task id).
       _w_tcb/_w_id    — FIFO of parked writer waiters (tcb_addr, task id).
+
+    SAFETY: MUST NOT be moved while waiters are queued.  The address-based
+    grant marker (unlock() stamps UnsafePointer(to=self)) becomes stale after
+    a move; the waiter's holds_grant() check would fail and the lock would
+    never be claimed, producing a permanent deadlock.  In practice the pool
+    never moves live sync primitives; a scope that moves a RWLock with waiters
+    queued is a bug.
     """
 
     var _guard: SpinLock
@@ -131,6 +135,28 @@ struct RWLock[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable]:
         self._r_id = Deque[Int]()
         self._w_tcb = Deque[Int]()
         self._w_id = Deque[Int]()
+
+    def __moveinit__(mut self, mut existing: RWLock[Self.T]):
+        """Move constructor — transfers ownership of a lock with no waiters.
+
+        SAFETY: asserts at runtime that no reader or writer waiters are queued.
+        Moving a lock whose unlock() has already stamped an
+        UnsafePointer(to=self) grant marker into a waiter's WaitNode would
+        leave that marker stale; the waiter's next holds_grant() call would
+        never match, producing a permanent deadlock.  The assertion fires in
+        debug builds; treat a fire as a hard bug in the caller.
+        """
+        assert (
+            len(existing._w_tcb) == 0
+        ), "moving a lock with waiters is undefined behavior"
+        self._guard = SpinLock()
+        self._readers = existing._readers
+        self._writer_locked = existing._writer_locked
+        self._value = existing._value
+        self._r_tcb = existing._r_tcb.copy()
+        self._r_id = existing._r_id.copy()
+        self._w_tcb = existing._w_tcb.copy()
+        self._w_id = existing._w_id.copy()
 
     # --- queries -------------------------------------------------------------
 
@@ -220,7 +246,7 @@ struct RWLock[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable]:
            tasks while WAITING.  A later `unlock_write` drains the reader
            FIFO and grants every one of them at once — readers never
            contend with each other."""
-        if h.tcb()[].wait_node()[].next() == RW_GRANTED:
+        if h.tcb()[].wait_node()[].next() == Int(UnsafePointer[Self, MutAnyOrigin](to=self)):
             h.tcb()[].wait_node()[].set_next(0)
             return True
         self._guard.lock()
@@ -265,7 +291,7 @@ struct RWLock[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable]:
         batch-review fix, mirrors `read`) and parked via the two-phase
         kernel (see `read`); a later unlock hands off to the FIFO-head
         writer (writer preference — spec see module docstring)."""
-        if h.tcb()[].wait_node()[].next() == RW_GRANTED:
+        if h.tcb()[].wait_node()[].next() == Int(UnsafePointer[Self, MutAnyOrigin](to=self)):
             h.tcb()[].wait_node()[].set_next(0)
             return True
         self._guard.lock()
@@ -322,7 +348,7 @@ struct RWLock[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable]:
         self._writer_locked = True
         self._guard.unlock()
         var hw = _rw_waiter_handle[R](tcb, tid)
-        hw.tcb()[].wait_node()[].set_next(RW_GRANTED)
+        hw.tcb()[].wait_node()[].set_next(Int(UnsafePointer[Self, MutAnyOrigin](to=self)))
         unpark_current(rt, hw)
         return True
 
@@ -342,7 +368,7 @@ struct RWLock[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable]:
             self._writer_locked = True
             self._guard.unlock()
             var hw = _rw_waiter_handle[R](tcb, tid)
-            hw.tcb()[].wait_node()[].set_next(RW_GRANTED)
+            hw.tcb()[].wait_node()[].set_next(Int(UnsafePointer[Self, MutAnyOrigin](to=self)))
             unpark_current(rt, hw)
             return 1
         var n = len(self._r_tcb)
@@ -357,7 +383,7 @@ struct RWLock[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable]:
             var tcb = kept_tcb.popleft()
             var tid = kept_id.popleft()
             var hr = _rw_waiter_handle[R](tcb, tid)
-            hr.tcb()[].wait_node()[].set_next(RW_GRANTED)
+            hr.tcb()[].wait_node()[].set_next(Int(UnsafePointer[Self, MutAnyOrigin](to=self)))
             unpark_current(rt, hr)
         return n
 
@@ -420,12 +446,12 @@ struct RWLock[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable]:
         self._guard.unlock()
         return found
 
-    def is_granted[R: ResultValue](self, h: JoinHandle[R]) -> Bool:
+    def is_granted[R: ResultValue](mut self, h: JoinHandle[R]) -> Bool:
         """Diagnostics: does `h` carry an outstanding GRANT marker?  No
         guard needed: only the resumed owner-task ever reads its own
         marker, strictly after the wake claim that resumed it (mirrors
         Mutex.holds_grant)."""
-        return h.tcb()[].wait_node()[].next() == RW_GRANTED
+        return h.tcb()[].wait_node()[].next() == Int(UnsafePointer[Self, MutAnyOrigin](to=self))
 
 
 # ---------------------------------------------------------------------------
