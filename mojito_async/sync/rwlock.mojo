@@ -108,6 +108,13 @@ struct RWLock[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable]:
       _value          — the protected value.
       _r_tcb/_r_id    — FIFO of parked reader waiters (tcb_addr, task id).
       _w_tcb/_w_id    — FIFO of parked writer waiters (tcb_addr, task id).
+
+    SAFETY: MUST NOT be moved while waiters are queued.  The address-based
+    grant marker (unlock() stamps UnsafePointer(to=self)) becomes stale after
+    a move; the waiter's holds_grant() check would fail and the lock would
+    never be claimed, producing a permanent deadlock.  In practice the pool
+    never moves live sync primitives; a scope that moves a RWLock with waiters
+    queued is a bug.
     """
 
     var _guard: SpinLock
@@ -128,6 +135,28 @@ struct RWLock[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable]:
         self._r_id = Deque[Int]()
         self._w_tcb = Deque[Int]()
         self._w_id = Deque[Int]()
+
+    def __moveinit__(mut self, mut existing: RWLock[Self.T]):
+        """Move constructor — transfers ownership of a lock with no waiters.
+
+        SAFETY: asserts at runtime that no reader or writer waiters are queued.
+        Moving a lock whose unlock() has already stamped an
+        UnsafePointer(to=self) grant marker into a waiter's WaitNode would
+        leave that marker stale; the waiter's next holds_grant() call would
+        never match, producing a permanent deadlock.  The assertion fires in
+        debug builds; treat a fire as a hard bug in the caller.
+        """
+        assert (
+            len(existing._w_tcb) == 0
+        ), "moving a lock with waiters is undefined behavior"
+        self._guard = SpinLock()
+        self._readers = existing._readers
+        self._writer_locked = existing._writer_locked
+        self._value = existing._value
+        self._r_tcb = existing._r_tcb.copy()
+        self._r_id = existing._r_id.copy()
+        self._w_tcb = existing._w_tcb.copy()
+        self._w_id = existing._w_id.copy()
 
     # --- queries -------------------------------------------------------------
 
