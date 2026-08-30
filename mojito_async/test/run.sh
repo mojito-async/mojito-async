@@ -50,6 +50,41 @@ if [ -z "$UNIT_TESTS" ] && [ -z "$STRESS_TESTS" ] && [ -z "$AOT_TESTS" ]; then
     exit 2
 fi
 
+# issue #169: the "affected-drivers-only" gate tier scopes this suite to
+# just the drivers a test-only diff touched, instead of paying for all ~100
+# drivers on a one-file change. MOJITO_TEST_FILES, when set, is a
+# newline-separated list of paths (relative to the repo root or absolute);
+# each of UNIT_TESTS/STRESS_TESTS/AOT_TESTS is intersected against it by
+# basename, keeping every existing selection rule (the *_aot split, the
+# O0 pins below) exactly as-is for whatever subset is selected. Unset (the
+# default, and always the case in CI, which has nothing staged) runs every
+# driver, unchanged from before this scoping existed.
+if [ -n "${MOJITO_TEST_FILES:-}" ]; then
+    scope_to_files() {
+        list=$1
+        wanted="$2"
+        for f in $list; do
+            base=$(basename "$f")
+            case "
+$wanted
+" in
+                *"
+$base
+"*) printf '%s\n' "$f" ;;
+            esac
+        done
+    }
+    wanted_basenames=$(printf '%s\n' "$MOJITO_TEST_FILES" | xargs -n1 basename 2>/dev/null || true)
+    UNIT_TESTS=$(scope_to_files "$UNIT_TESTS" "$wanted_basenames")
+    STRESS_TESTS=$(scope_to_files "$STRESS_TESTS" "$wanted_basenames")
+    AOT_TESTS=$(scope_to_files "$AOT_TESTS" "$wanted_basenames")
+    if [ -z "$UNIT_TESTS" ] && [ -z "$STRESS_TESTS" ] && [ -z "$AOT_TESTS" ]; then
+        echo "run.sh: MOJITO_TEST_FILES named no known driver; nothing to scope to:"
+        printf '%s\n' "$MOJITO_TEST_FILES" | sed 's/^/    | /'
+        exit 2
+    fi
+fi
+
 # A2.5 two-phase/affinity/duplicate drivers (t34/t34b/t34c — H4-partial and
 # M10 of PR #109): their cross-thread handshake cells are PLAIN Ints
 # published with release/acquire fences, so these drivers MUST be built at
@@ -194,9 +229,13 @@ done
 # two that exercise the real cross-worker handoff at the DEFAULT
 # optimization level — the way a downstream user builds — and runs them 30
 # times each.  It is deliberately NOT in AOT_O0_DRIVERS: the whole point is
-# the optimization level.
+# the optimization level. It is a cross-driver repeatability check, not a
+# single driver file, so MOJITO_TEST_FILES scoping (issue #169) skips it:
+# an affected-drivers-only run is for test-only diffs, which by definition
+# do not touch the scheduler code this lane exists to catch a miscompile
+# in. Full-tier runs (the default, and always CI) still run it.
 O_REPEAT_SH="$SCRIPT_DIR/t51_default_o_repeat.sh"
-if [ -x "$O_REPEAT_SH" ]; then
+if [ -x "$O_REPEAT_SH" ] && [ -z "${MOJITO_TEST_FILES:-}" ]; then
     out=$("$O_REPEAT_SH" 2>&1); st=$?
     run_one t51_default_o_repeat "$out" "$st"
 fi
