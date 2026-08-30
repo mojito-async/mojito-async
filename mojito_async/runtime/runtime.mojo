@@ -51,7 +51,7 @@ from mojito_async.runtime.task_control_block import ResultValue, TaskControlBloc
 from std.atomic import Atomic
 from mojito_async.runtime.inject_queue import InjectQueue
 from mojito_async.integration.sys import BytePtr
-from mojito_async.runtime.idle import announce_work, wake_one as idle_wake_one
+from mojito_async.runtime.idle import announce_work, complete_work, wake_one as idle_wake_one
 
 
 # ---------------------------------------------------------------------------
@@ -287,6 +287,20 @@ struct Runtime:
         # latency).
         self._announce_and_wake()
 
+    def enqueue_local_stolen(mut self, tcb_addr: Int, task_id: Int) raises:
+        """Re-enqueue a STOLEN unstarted record onto THIS worker's local deque
+        WITHOUT announcing new work (issue #150).  The task was already
+        announced on the source worker when it was first seeded; stealing is a
+        TRANSFER — the pending counter must not grow again.  enqueue_local
+        would call _announce_and_wake and create an unmatched +1 per steal
+        that the scheduler's complete_dispatched never balances (the task is
+        dispatched and completed only once).  This path pushes and bumps
+        _enqueued for observability but never touches the acct."""
+        if self._shutdown:
+            raise Error("runtime.enqueue_local_stolen: runtime is shut down")
+        self._local.push_back(TaskRecord(tcb_addr, task_id))
+        self._enqueued += 1
+
     def push_remote(mut self, tcb_addr: Int, task_id: Int) raises:
         """Deliver a wake to THIS worker's remote-ready queue (STARTED-fiber
         wakes, spec §19.2/§21).  ANY worker may push; the OWNER pops.  E5
@@ -348,6 +362,18 @@ struct Runtime:
         if Int(self._acct) > 1:
             announce_work(self._acct, 1)
             idle_wake_one(self._acct, self._event)
+
+    def _complete_dispatched(mut self) raises:
+        """Symmetric drain pair for _announce_and_wake: one work unit that was
+        announced on enqueue has now been dispatched to completion, parking, or
+        re-enqueue (yield_now announces again on the re-enqueue, making the
+        pair symmetric: announce → dispatch → complete for every scheduler
+        iteration).  Decrements the pending counter so workers' pre-park
+        re-check does not see phantom work once the queues are empty.  No-op
+        when the acct block is unarmed (the address-1 sentinel) — the same
+        guard as _announce_and_wake so unarmed unit-test runtimes are safe."""
+        if Int(self._acct) > 1:
+            complete_work(self._acct, 1)
 
     def pop_local(mut self) raises -> TaskRecord:
         """Dequeue the next LOCAL record (owner LIFO end); raises on an
