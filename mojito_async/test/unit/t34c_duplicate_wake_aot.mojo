@@ -12,7 +12,15 @@
 #     once.  Under the owner's remote-ready queue guard exactly ONE claims
 #     (wake_claim + one enqueue); the loser must return quietly whatever it
 #     observes (RUNNABLE right after the claim, RUNNING mid-resume, or a
-#     later epoch) — never a raise, never a second enqueue.
+#     later epoch) — never a raise, never a second enqueue.  Both wakers
+#     rendezvous on wA_pending/wB_pending (each sets its own flag after
+#     observing WAITING, then spins on the other's) BEFORE either calls
+#     unpark_current (issue #176): a plain poll-and-sleep race here let the
+#     loser's ~100us blind spot miss the whole PH_PARKED1 window when the
+#     winner + owner redispatch raced through it first, especially under
+#     host contention — a driver-harness timing assumption, not a
+#     park.mojo/unpark_current race (see the git history for the full
+#     root-cause writeup this comment summarizes).
 #   P2 MID-RUNNING DUPLICATE (deterministic window): while the owner runs
 #     the ep2 slice (task RUNNING, generation still 2, ep1 already claimed),
 #     B delivers the ep1 duplicate (required_gen=2).  It must NOT latch the
@@ -64,7 +72,7 @@ from mojito_async.runtime.scheduler import scheduler_loop
 from mojito_async.runtime.task_control_block import TaskControlBlock
 from mojito_async.runtime.worker import Worker, make_worker
 from mojito_async.task import JoinHandle, claim_running
-from mojito_async.vendor.mojito_sys import c_free, c_malloc, entry_pointer
+from mojito_async.vendor.mojito_sys import c_malloc, entry_pointer
 
 
 @extern("pthread_create")
@@ -291,6 +299,29 @@ def serve_wakerA(scp: UnsafePointer[Scene, MutAnyOrigin]) raises:
                 _fail(sc.failures, "wakerA: ep1 parker not WAITING (state "
                       + String(h.state()) + ")")
             sc.wA_observed[] += 1
+            sc.wA_pending[] = 1
+            fence[Ordering.RELEASE]()  # M10: publish the arrival
+            # #176 RENDEZVOUS: block the race until B has ALSO observed the
+            # ep1 WAITING park.  Without this, a poll-interval blind spot
+            # (this loop only re-checks `phase` every ~100us) lets B win the
+            # claim, get requeued, and have the owner race clean through
+            # PH_PARKED1 -> PH_RUNNING2 -> PH_PARKED2 before A's NEXT poll —
+            # A then falls straight into the PH_PARKED2 branch below,
+            # skipping ep1 entirely (wake1_done stuck at 1, wA_observed
+            # stuck at 0).  The rendezvous makes "both wakers observed the
+            # WAITING park before either claims" an invariant instead of a
+            # timing assumption: nobody can call unpark_current, so the
+            # owner cannot be requeued, so phase cannot leave PH_PARKED1,
+            # until BOTH pending flags are up.
+            var bspins = 0
+            while sc.wB_pending[] == 0:
+                bspins += 1
+                if bspins > 2000000:
+                    _fail(sc.failures, "wakerA: B never arrived at the ep1 rendezvous")
+                    set_phase(sc.phase, PH_ERR)
+                    return
+                sleep(0.00001)
+            fence[Ordering.ACQUIRE]()  # M10: acquire B's arrival
             # P1: the same-epoch claim as waker B — exactly one of the two
             # wins; the loser's call is a quiet no-op.
             unpark_current(rtA[], h, required_gen=sc.parked_gen[])
@@ -336,11 +367,25 @@ def serve_wakerB(scp: UnsafePointer[Scene, MutAnyOrigin]) raises:
             return
         if ph == PH_PARKED1 and b_ep1 == 0:
             fence[Ordering.ACQUIRE]()  # M10
+            sc.ep1_gen[] = sc.parked_gen[]  # remember ep1's epoch for P2-P4
+            sc.wB_pending[] = 1
+            fence[Ordering.RELEASE]()  # M10: publish the arrival
+            # #176 RENDEZVOUS: mirror of waker A's — block the race until A
+            # has ALSO observed the ep1 WAITING park (see the long comment
+            # there for the poll-blind-spot this closes).
+            var aspins = 0
+            while sc.wA_pending[] == 0:
+                aspins += 1
+                if aspins > 2000000:
+                    _fail(sc.failures, "wakerB: A never arrived at the ep1 rendezvous")
+                    set_phase(sc.phase, PH_ERR)
+                    return
+                sleep(0.00001)
+            fence[Ordering.ACQUIRE]()  # M10: acquire A's arrival
             # P1: the RACING duplicate claim of ep1's epoch — same
             # required_gen as waker A; exactly one of the two claims.
             unpark_current(rtB[], _waker_handle(scp), required_gen=sc.parked_gen[])
             b_ep1 = 1
-            sc.ep1_gen[] = sc.parked_gen[]  # remember ep1's epoch for P2-P4
             sc.wake1_done[] += 1
             fence[Ordering.RELEASE]()
             continue
@@ -552,8 +597,12 @@ def run_scenario(failures: UnsafePointer[Int, MutAnyOrigin]) raises:
     if rc0 != 0 or rcA != 0 or rcB != 0:
         _fail(failures, "pthread_create failed (" + String(rc0) + ", "
                         + String(rcA) + ", " + String(rcB) + ")")
-        c_free(scp.bitcast[Byte]())
-        c_free(tcb.bitcast[Byte]())
+        # issue #138 precedent (applied here for #176): do NOT free `scp`/
+        # `tcb` — a partial pthread_create failure (rc0==0 but rcA/rcB!=0,
+        # or any other partial combination) can leave an already-started
+        # thread spinning in _park_forever, which dereferences `sc[].
+        # progress[me]` forever; freeing scp out from under it is a
+        # use-after-free.  `main()`'s `_iso_exit` reclaims everything.
         return
     var budget = 600_000_000
     while budget > 0:
@@ -629,8 +678,23 @@ def run_scenario(failures: UnsafePointer[Int, MutAnyOrigin]) raises:
                   + String(wBpending)
                   + " — the wake must route to the OWNER remote queue)")
 
-    c_free(scp.bitcast[Byte]())
-    c_free(tcb.bitcast[Byte]())
+    # issue #138 precedent (t34_two_phase_aot.mojo), applied here for #176:
+    # `scp` (this Scene's backing cell) and `tcb` must NOT be freed.
+    # t34c_worker0/t34c_wakerA/t34c_wakerB (spawned above) NEVER return —
+    # `_park_forever` spins on `sc[].progress[me]` FOREVER after each
+    # serve loop quiesces, because a foreign pthread that actually returns
+    # crashes the b2 1.0.0b2 runtime (the exact constraint `_park_forever`
+    # itself documents).  Freeing `scp` here raced these still-spinning
+    # zombie threads against `c_malloc`/`c_free` reusing the same address
+    # for a later allocation — reproduced as a SIGSEGV in a still-running
+    # zombie thread, standalone, with NO host contention required (3/100
+    # in one local run) — the same failure class #138 already root-caused
+    # and fixed in the sibling t34 driver, just never carried over here.
+    # `cells` (the Scene's field-backing data block, allocated above) was
+    # ALREADY never freed for the identical reason; `scp`/`tcb` now match
+    # it — every allocation a zombie thread can still reach is
+    # intentionally leaked for the remaining life of the process, which
+    # `main()`'s final `_iso_exit` reclaims in one shot.
 
 
 def main() raises:
