@@ -89,8 +89,8 @@ comptime ACCT_WAKE_OFF = Int(72)     # wake_total (spec §71)          [line 2]
 comptime ACCT_SPUR_OFF = Int(80)     # spurious_wake_total (spec §71) [line 2]
 comptime ACCT_BYTES = Int(128)
 
-# Debug-build pair-mismatch detection (M7): True in debug/CI builds, False in
-# release.  When True, complete_work() below the announced floor raises.
+# Pair-mismatch detection (M7): unconditionally True — complete_work() below
+# the announced floor raises in all builds.
 comptime IDLE_PAIR_ASSERT = True
 
 def _acct_cell(acct: BytePtr, off: Int) -> UnsafePointer[Int64, MutAnyOrigin]:
