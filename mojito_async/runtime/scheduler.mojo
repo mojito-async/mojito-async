@@ -192,6 +192,7 @@ def scheduler_loop[F: def(mut Runtime, Int, Int, BytePtr) raises -> Int, R: Resu
         )
         if checker[].state() != TaskControlBlock.RUNNABLE:
             rt.note_skipped()
+            rt._complete_dispatched()
             continue
         var own = checker[].owner_worker()
         # no-off-owner invariant (issue #71): a STARTED record is worker-
@@ -220,6 +221,7 @@ def scheduler_loop[F: def(mut Runtime, Int, Int, BytePtr) raises -> Int, R: Resu
             )
         slices += 1
         _ = dispatcher(rt, rec.tcb_addr, rec.task_id, ud)
+        rt._complete_dispatched()
     return slices
 
 
@@ -388,6 +390,7 @@ def fair_scheduler_loop[
                 )
                 if rcheck[].state() != TaskControlBlock.RUNNABLE:
                     rt.note_skipped()
+                    rt._complete_dispatched()
                     continue
                 # H1 no-off-owner assertion (issue #73/#71 coordinate): a
                 # STARTED record must NEVER pop off its owner worker (spec
@@ -416,6 +419,7 @@ def fair_scheduler_loop[
                 rt.note_slice_remote()
                 slices += 1
                 _ = dispatcher(rt, rrec.tcb_addr, rrec.task_id, ud)
+                rt._complete_dispatched()
             while rt.has_inject():
                 var irec = rt.pop_inject()
                 var icheck = UnsafePointer[TaskControlBlock[R], MutAnyOrigin](
@@ -423,6 +427,7 @@ def fair_scheduler_loop[
                 )
                 if icheck[].state() != TaskControlBlock.RUNNABLE:
                     rt.note_skipped()
+                    rt._complete_dispatched()
                     continue
                 if worker_id != 0 and icheck[].owner_worker() == 0:
                     icheck[].set_owner_worker(worker_id)
@@ -432,6 +437,7 @@ def fair_scheduler_loop[
                 rt.note_slice_inject()
                 slices += 1
                 _ = dispatcher(rt, irec.tcb_addr, irec.task_id, ud)
+                rt._complete_dispatched()
 
         # ---- pick the next record (spec §21 order: local, remote, inject) --
         var have = False
@@ -469,6 +475,7 @@ def fair_scheduler_loop[
         )
         if checker[].state() != TaskControlBlock.RUNNABLE:
             rt.note_skipped()
+            rt._complete_dispatched()
             continue
         # H1 no-off-owner assertion (issue #73/#71 coordinate): a STARTED
         # record picked from the REMOTE-ready queue must belong to this
@@ -505,6 +512,7 @@ def fair_scheduler_loop[
         slices += 1
         var yields_before = rt.yields()
         _ = dispatcher(rt, rec.tcb_addr, rec.task_id, ud)
+        rt._complete_dispatched()
 
         # ---- kill-0 starve watch (locally-sourced slices only) ------------
         if cls == CLS_LOCAL:
