@@ -233,11 +233,14 @@ struct RWLock[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable]:
         self._guard.unlock()
         park_prepare(h)
         if park_validate(h):
-            park_commit(h)
+            _ = park_commit(h)
             claim_running(h)
             h.tcb()[].wait_node()[].set_next(0)
             return True
-        park_commit(h)
+        if not park_commit(h):
+            claim_running(h)
+            h.tcb()[].wait_node()[].set_next(0)
+            return True
         return False
 
     def write[R: ResultValue](
@@ -263,11 +266,14 @@ struct RWLock[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable]:
         self._guard.unlock()
         park_prepare(h)
         if park_validate(h):
-            park_commit(h)
+            _ = park_commit(h)
             claim_running(h)
             h.tcb()[].wait_node()[].set_next(0)
             return True
-        park_commit(h)
+        if not park_commit(h):
+            claim_running(h)
+            h.tcb()[].wait_node()[].set_next(0)
+            return True
         return False
 
     # --- unlock / handoff --------------------------------------------------------
