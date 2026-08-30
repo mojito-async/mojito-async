@@ -1,5 +1,5 @@
 #!/bin/sh
-# .github/scripts/install-mojo.sh — install the pinned Mojo toolchain on a CI
+# .github/scripts/install-mojo.sh — install the Mojo toolchain on a CI
 # runner (issue #141).
 #
 # The dev host installs Mojo through the mojito/brew tap, whose formula pulls
@@ -12,9 +12,30 @@
 # toolchain bakes its build-machine prefix into share/max/modular.cfg and the
 # driver resolves std/compilerrt through it, so the prefix has to be
 # rewritten after unpacking exactly as the formula does.
+#
+# CI runs every Mojo lane against Modular's max-nightly channel by default,
+# same reasoning as the mojolang-nightly Homebrew formula: mojito-sys is
+# mid-migration to Mojo-first and wants to see a nightly compiler regression
+# here before it reaches anyone building against a released toolchain. Set
+# MOJO_CHANNEL=max to run a lane against the stable channel instead.
+#
+# Nightly filenames roll roughly daily (mojo-compiler-<date-stamped
+# version>-release.conda), so there is no fixed version to pin the way the
+# stable formula does — MOJO_VERSION, when unset on the nightly channel,
+# resolves to whatever repodata.json currently reports as newest. Set
+# MOJO_VERSION explicitly to pin a reproducible nightly build instead. This
+# resolution runs before the issue #169 cache check below so a cache hit is
+# still keyed on the actual version, not an empty placeholder — and it still
+# costs a network round trip on a cache hit, which is the point: a nightly
+# channel should notice a newer build exists even when yesterday's is cached.
 set -eu
 
-VERSION=${MOJO_VERSION:-1.0.0b2}
+CHANNEL=${MOJO_CHANNEL:-max-nightly}
+case "$CHANNEL" in
+    max|max-nightly) ;;
+    *) echo "install-mojo.sh: unknown MOJO_CHANNEL '$CHANNEL' (want max or max-nightly)"; exit 2 ;;
+esac
+VERSION=${MOJO_VERSION:-}
 PREFIX=${MOJO_PREFIX:-$HOME/mojo-toolchain}
 
 os=$(uname -s)
@@ -26,6 +47,30 @@ case "$os/$arch" in
     *) echo "install-mojo.sh: no Mojo build published for $os/$arch"; exit 2 ;;
 esac
 
+if [ -z "$VERSION" ]; then
+    if [ "$CHANNEL" = max ]; then
+        VERSION=1.0.0b2
+    else
+        echo "install-mojo.sh: resolving latest mojo-compiler on $CHANNEL/$subdir"
+        VERSION=$(curl -fsSL "https://conda.modular.com/$CHANNEL/$subdir/repodata.json" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+pkgs = {**d.get("packages", {}), **d.get("packages.conda", {})}
+names = sorted(n for n in pkgs if n.startswith("mojo-compiler-"))
+if not names:
+    sys.exit("install-mojo.sh: no mojo-compiler package found in repodata.json")
+latest = names[-1]
+v = latest[len("mojo-compiler-"):]
+for suf in ("-release.conda", "-release.tar.bz2"):
+    if v.endswith(suf):
+        v = v[: -len(suf)]
+        break
+print(v)
+')
+        [ -n "$VERSION" ] || { echo "install-mojo.sh: could not resolve latest $CHANNEL version"; exit 2; }
+    fi
+fi
+
 HOME_DIR="$PREFIX/share/max"
 
 # issue #169: CI caches $PREFIX (actions/cache, keyed on this script's hash +
@@ -34,7 +79,9 @@ HOME_DIR="$PREFIX/share/max"
 # compile-probe below instead of re-downloading. A version marker file (not
 # just the binary's existence) guards against a stale cache entry surviving
 # a MOJO_VERSION bump: if the marker doesn't match, fall through and
-# re-install exactly as a cold run would.
+# re-install exactly as a cold run would. On the nightly channel VERSION is
+# now resolved above before this check runs, so a cache entry from an
+# earlier build today only hits while it's still actually the latest.
 marker="$PREFIX/.install-mojo-version"
 if [ -x "$PREFIX/bin/mojo" ] && [ -f "$marker" ] && [ "$(cat "$marker")" = "$VERSION" ]; then
     echo "install-mojo.sh: cache hit, $PREFIX already has mojo-compiler-$VERSION"
@@ -67,9 +114,9 @@ if ! command -v zstd >/dev/null 2>&1; then
     fi
 fi
 
-echo "install-mojo.sh: fetching mojo-compiler-$VERSION from $subdir"
+echo "install-mojo.sh: fetching mojo-compiler-$VERSION from $CHANNEL/$subdir"
 curl -fsSL -o "$work/mojo.conda" \
-    "https://conda.modular.com/max/$subdir/mojo-compiler-$VERSION-release.conda"
+    "https://conda.modular.com/$CHANNEL/$subdir/mojo-compiler-$VERSION-release.conda"
 
 mkdir -p "$work/stage" "$PREFIX"
 unzip -q "$work/mojo.conda" -d "$work/stage"
