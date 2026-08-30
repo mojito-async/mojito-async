@@ -83,7 +83,10 @@ fi
 # own state is reported but not used.
 CANON_REF=""
 if [ -d "$CANON/.git" ] || git -C "$CANON" rev-parse --git-dir >/dev/null 2>&1; then
-    git -C "$CANON" fetch -q origin 2>/dev/null || true
+    if ! git -C "$CANON" fetch -q origin 2>/dev/null; then
+        echo "check-vendored: WARNING: git fetch failed for $CANON; if origin/main" >&2
+        echo "  is stale the comparison below may reflect an outdated canonical." >&2
+    fi
     if git -C "$CANON" rev-parse -q --verify origin/main >/dev/null 2>&1; then
         CANON_REF="origin/main"
     fi
