@@ -51,7 +51,7 @@ OBJS   := $(patsubst $(PROD)/%.c,$(BUILD)/prod/%.o,$(CSRCS_P)) \
 HAS_SOURCES := $(CSRCS_S)$(SSRCS_S)$(CSRCS_P)$(SSRCS_P)
 
 .DELETE_ON_ERROR:
-.PHONY: all test bench clean
+.PHONY: all test bench clean check-vendored
 
 all:
 	@$(if $(HAS_SOURCES),$(MAKE) $(DYLIB),echo "make: no vendored C/asm sources yet; nothing to build.")
@@ -91,6 +91,12 @@ test:
 # the pre-commit suite via precommit/run-suite.sh).
 bench:
 	@MOJO="$(MOJO)" ./bench/run.sh
+
+# mojito-sys#164: diff the vendored substrate against canonical mojito-sys
+# and fail on divergence that is not recorded with a content hash. Needs a
+# canonical tree: $MOJITO_SYS_DIR, a sibling ../mojito-sys checkout, or gh.
+check-vendored:
+	@./mojito_async/vendor/check-vendored.sh
 
 clean:
 	rm -rf $(BUILD) $(DYLIB)
