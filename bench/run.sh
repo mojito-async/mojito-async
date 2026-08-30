@@ -38,7 +38,10 @@ BUILD_DIR="$REPO_ROOT/build"
 MOJO=${MOJO:-mojo}
 command -v "$MOJO" >/dev/null 2>&1 || { echo "ERROR: mojo not found"; exit 2; }
 
+# The substrate is a .dylib on Darwin and a .so elsewhere (issue #141:
+# the Linux lanes must be able to run at all).
 DYLIB="$REPO_ROOT/libmojito_spike.dylib"
+[ -f "$DYLIB" ] || DYLIB="$REPO_ROOT/libmojito_spike.so"
 LINK_FLAGS=""
 if [ -f "$DYLIB" ]; then
     LINK_FLAGS="-Xlinker $DYLIB"
@@ -49,6 +52,7 @@ name="scheduler_scale_aot"
 bin="$BUILD_DIR/$name"
 if ! "$MOJO" build -O 0 -I "$REPO_ROOT" "$SCRIPT_DIR/$name.mojo" -o "$bin" \
         $LINK_FLAGS >"$BUILD_DIR/$name.build.log" 2>&1; then
+    printf 'VERDICT\t%s\tFAIL\n' "bench_scheduler_scale"
     echo "bench: FAIL (AOT build error)"
     tail -n 5 "$BUILD_DIR/$name.build.log" | sed 's/^/   | /'
     exit 1
@@ -99,9 +103,14 @@ if [ "$num" -gt 0 ]; then
         "$num" "$mins" "$med" "$maxs" "$spread"
 fi
 
+# --- per-driver verdict row (issue #141) -----------------------------------
+# precommit/gate.sh scores known-red allow-listing PER DRIVER; before #141 a
+# single row named `suite` covered every driver and every bench at once.
 if [ "$passed" -eq "$REPEAT_RUNS" ]; then
+    printf 'VERDICT\t%s\tPASS\n' "bench_scheduler_scale"
     echo "bench: PASS"
     exit 0
 fi
+printf 'VERDICT\t%s\t%s\n' "bench_scheduler_scale" "$([ "$verdict" = "RED" ] && echo RED || echo FAIL)"
 echo "bench: FAIL (exit $st; $passed/$REPEAT_RUNS runs passed; verdict must hold on EVERY repetition)"
 exit 1
