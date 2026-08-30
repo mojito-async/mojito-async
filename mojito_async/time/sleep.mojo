@@ -101,10 +101,12 @@ def sleep_current[R: ResultValue](
     _ = heap.arm(h.id(), Int(h.tcb()), deadline)
     park_prepare(h)
     if park_validate(h):
-        park_commit(h)
+        _ = park_commit(h)
         claim_running(h)
         return
-    park_commit(h, SuspendReason.TIMER)
+    if not park_commit(h, SuspendReason.TIMER):
+        _ = heap.cancel(h.id())
+        claim_running(h)
 
 
 def sleep_until_current[R: ResultValue](
@@ -127,7 +129,9 @@ def sleep_until_current[R: ResultValue](
     _ = heap.arm(h.id(), Int(h.tcb()), ticks)
     park_prepare(h)
     if park_validate(h):
-        park_commit(h)
+        _ = park_commit(h)
         claim_running(h)
         return
-    park_commit(h, SuspendReason.TIMER)
+    if not park_commit(h, SuspendReason.TIMER):
+        _ = heap.cancel(h.id())
+        claim_running(h)
