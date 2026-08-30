@@ -1,9 +1,21 @@
-# Intentional TDD-red tests. Format: <test-name>	<tracking-issue-url>
+# Intentional TDD-red DRIVERS. Three TAB-separated fields:
 #
-# precommit/gate.sh runs the suite on every commit. A failing test listed
-# here is expected (TDD: red test first, implementation lands in a later
-# commit of the same PR) and does NOT block the commit; the failure is still
-# logged. Remove the row as soon as the implementation turns the test green —
-# an unlisted failure blocks the commit.
-suite	https://github.com/mojito-async/mojito-async/issues/61
-t60_barrier_cross_worker_aot	https://github.com/mojito-async/mojito-async/issues/148	2026-08-29
+#   <driver-name>	<tracking-issue-url>	<yyyy-mm-dd added>
+#
+# <driver-name> is the name a suite runner prints in its per-driver verdict
+# line (VERDICT<TAB><name><TAB><PASS|RED|FAIL>) — a single driver, never a
+# suite. precommit/gate.sh refuses a row that names a whole suite, a row
+# whose tracking issue is CLOSED, and a row older than the staleness horizon
+# (MOJITO_GATE_RED_MAX_AGE_DAYS, default 30).
+#
+# Remove the row the moment the driver goes green. An unlisted failing
+# driver blocks the commit.
+#
+# History (issue #141): this file used to carry one row, `suite`, pointing
+# at issue #61 — closed weeks before. `suite` was the entire unit + stress
+# run plus all four bench gates, so that one row turned every failure of
+# everything into "RED (known-red, TDD)" and let the commit through. It
+# carried a real use-after-free into main: PR #136 dismissed a reproducible
+# post-PASS SIGSEGV as covered by it, and PR #139 root-caused the SIGSEGV as
+# a genuine UAF. The row is gone and the gate is per-driver now.
+t51_default_o_repeat	https://github.com/mojito-async/mojito-async/issues/143	2026-08-30
