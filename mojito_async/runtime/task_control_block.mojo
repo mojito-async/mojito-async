@@ -95,21 +95,29 @@ struct WaitNode(ImplicitlyCopyable, ImplicitlyDeletable):
     convention mutex.mojo's module header documents, reused verbatim by
     semaphore.mojo/rwlock.mojo/condvar.mojo/barrier.mojo) and `_reason` (the
     wake cause, double-duty as the winner cause per SuspendReason's
-    docstring) are Atomic[DType.int64] with explicit acquire/release
-    ordering, matching issue #143's treatment of TaskControlBlock._state/
+    docstring) are accessed exclusively through Atomic[DType.int64].load/
+    .store (explicit acquire/release ordering) over the plain-typed storage
+    below, matching issue #143's treatment of TaskControlBlock._state/
     _generation/_claim_epoch: one worker's notify/wake leg stamps them and a
     DIFFERENT worker's resumed task reads them back (park.mojo's
     park_validate/park_commit, condvar.mojo's resolve_winner/notify_marker)
     across a SpinLock-guarded critical section — a plain field is not
     guaranteed fresh across that boundary at Mojo's default `-O` (the
     LICM-class miscompilation #143 documents); #175 hit exactly this gap in
-    t60_barrier_cross_worker_aot before this fix closed it at the source.
-    `_generation` stays plain storage here: WaitNode.generation() is only
-    ever read back by the SAME owner worker that stamped it at WAITING
-    commit (cancel.mojo/timer_service.mojo/timeout_scope.mojo pass it as a
-    snapshot `required_gen` into unpark_current, which re-validates against
-    TCB_Prefix's OWN atomic `_generation` before claiming — the field these
-    callers actually race on is already #143-covered)."""
+    t60_barrier_cross_worker_aot, and #190's own verification found the
+    conversion improves but does not fully close it (residual flake, root
+    cause not yet isolated — issue #195), so t38/t47/t60's `-O 0` pins in
+    test/run.sh's AOT_O0_DRIVERS stay.
+    `_generation` stays plain storage here: WaitNode.generation() is, as
+    far as every CURRENT caller goes, only ever read back by the SAME
+    owner worker that stamped it at WAITING commit (timer_service.mojo/
+    timeout_scope.mojo pass it as a snapshot `required_gen` into
+    unpark_current, which re-validates against TCB_Prefix's OWN atomic
+    `_generation` before claiming — the field these callers actually race
+    on is already #143-covered).  Nothing currently enforces that
+    invariant structurally (a timeout scope armed for a task pinned to a
+    different worker would violate it), so this is a same-worker
+    observation about today's call sites, not a guaranteed contract."""
 
     var _generation: Int
     var _reason: Int64  # atomic acquire/release (issue #190, matches #143)
@@ -292,7 +300,12 @@ struct TCB_Prefix(ImplicitlyCopyable, ImplicitlyDeletable):
             # §14.1/§19.1, ADR-006).
             self._started = True
         if to == TaskControlBlock.WAITING:
-            var new_gen = self._generation + Int64(1)
+            # Issue #190: read the current generation through the atomic
+            # getter, not the plain field, for the same reason wake_claim
+            # does below (consistency, even though this specific call only
+            # ever runs on the task's OWN owner thread advancing its own
+            # state — same-worker, so not itself cross-thread-hazardous).
+            var new_gen = Int64(self.generation()) + Int64(1)
             Atomic[DType.int64].store[ordering=Ordering.RELEASE](
                 UnsafePointer[Int64, MutAnyOrigin](to=self._generation), new_gen)
             self._wait._generation = Int(new_gen)
@@ -318,10 +331,12 @@ struct TCB_Prefix(ImplicitlyCopyable, ImplicitlyDeletable):
         """Ordered check-then-store transition (NOT compare-and-swap): applies
         `from_` -> `to` only when the current state equals `from_` AND the
         pair is legal.  Never raises, and — unlike a real CAS — claims no M:N
-        atomic ordering.  A true compare-exchange (or the acquire/consume
-        generation discipline in `wake_claim`) is the A2/EPIC#2 seam; on the
-        single cooperative worker there is no interleaving inside a dispatch
-        slice, so the plain check is exact for today."""
+        atomic ordering: the load (now routed through the atomic `state()`
+        getter, issue #190) and the `_apply` store are still two separate
+        operations, so a concurrent writer between them is not excluded.  A
+        true compare-exchange (or the acquire/consume generation discipline
+        in `wake_claim`) is the A2/EPIC#2 seam; today this method has no
+        caller in the tree (grep-verified), so the gap is latent, not live."""
         if self.state() == from_ and TCB_Prefix._is_allowed(from_, to):
             self._apply(to)
             return True
@@ -356,15 +371,19 @@ struct TCB_Prefix(ImplicitlyCopyable, ImplicitlyDeletable):
         the plain fields directly, leaving exactly the gap #143 intended to
         close open on the read side a foreign thread actually exercises on
         every cross-worker wake claim.  Routed through the atomic getters
-        below instead."""
+        below instead.  (Reads `generation()` exactly once, reused for both
+        the required_gen check and the `_claim_epoch` stamp below — they
+        cannot disagree since `_apply(RUNNABLE)` never touches
+        `_generation`, only the WAITING branch does.)"""
         if self.state() != TaskControlBlock.WAITING:
             return False
-        if required_gen != 0 and self.generation() != required_gen:
+        var gen = self.generation()
+        if required_gen != 0 and gen != required_gen:
             return False
         self._apply(TaskControlBlock.RUNNABLE)
         Atomic[DType.int64].store[ordering=Ordering.RELEASE](
             UnsafePointer[Int64, MutAnyOrigin](to=self._claim_epoch),
-            Int64(self.generation()))
+            Int64(gen))
         return True
 
     # --- queries -----------------------------------------------------------

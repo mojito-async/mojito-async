@@ -112,9 +112,15 @@ struct Mutex[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable]:
     lock sets when it hands ownership over in unlock(); the resumed task's
     lock() claims (clears) it and returns True.  The marker is per-waiter, so
     several waiters can be granted in separate unlock calls without a shared
-    slot.  The marker itself needs no guard: only the resumed owner-task
-    ever reads/clears it, strictly after the wake claim that resumed it
-    (happens-before via the SAME claim the guard below serializes).
+    slot.  The marker itself needs no GUARD (SpinLock): only the resumed
+    owner-task ever reads/clears it, strictly after the wake claim that
+    resumed it (happens-before via the SAME claim the guard below
+    serializes).  It DOES need to be atomic storage, though (issue #190):
+    the field itself (WaitNode._next) is accessed exclusively through
+    Atomic[DType.int64].load/.store, because the happens-before argument
+    above is a logical ordering claim, not a guarantee that the compiler
+    treats a plain field read as fresh across the cross-thread boundary at
+    Mojo's default `-O` — see task_control_block.mojo's WaitNode docstring.
 
     SAFETY: MUST NOT be moved while waiters are queued.  The address-based
     grant marker (unlock() stamps UnsafePointer(to=self)) becomes stale after
