@@ -1,7 +1,7 @@
 # mojito-async
 
 Colorless, direct-style structured concurrency for Mojo, implemented on the
-[`mojito-sys`](https://git.opsite.ca/mojito/mojito-sys) systems substrate.
+[`mojito-sys`](https://github.com/mojito-async/mojito-sys) systems substrate.
 
 Ordinary Mojo `def` functions park and resume via stackful one-shot fibers and
 an M:N scheduler. No `async def`, no `await`, no duplicated sync/async APIs:
@@ -14,10 +14,10 @@ ordinary call -> operation ready?  -> return normally
 
 ## Status
 
-**Pre-A0.** Implementation has not started. Per
+**A1–A6 complete.** 115+ PRs merged; the M:N scheduler, fiber park/resume,
+structured scopes, sync primitives, channels, reactor-backed I/O, and the
+timer lane are live. Per
 [`docs/mojito-async_IMPLEMENTATION_SPEC.md`](docs/mojito-async_IMPLEMENTATION_SPEC.md):
 
-- Hard prerequisite: `mojito-sys` passes its S0 handoff gate.
-- First phase here will be **A0: Colorless Parking and Structured-Task
-  Feasibility** (one-worker direct-style runtime; park/run/resume with correct
-  join, cancellation, error, and scope behavior).
+- `mojito-sys` S0 handoff gate passed.
+- The runtime is exercised by the full precommit gate suite (`precommit/gate.sh`).
