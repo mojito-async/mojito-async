@@ -74,7 +74,7 @@ def _complete(h: JoinHandle[IntResult], res: Int) raises:
 struct Scene(ImplicitlyCopyable, ImplicitlyDeletable):
     var chan_0: UnsafePointer[Channel[Int], MutAnyOrigin]
     var chan_1: UnsafePointer[Channel[Int], MutAnyOrigin]
-    var branches: UnsafePointer[List[SelectBranch], MutAnyOrigin]
+    var branches: UnsafePointer[List[SelectBranch[Int]], MutAnyOrigin]
     var state: UnsafePointer[SelectState, MutAnyOrigin]
     var sel_id: Int
     var winner: UnsafePointer[Int, MutAnyOrigin]
@@ -86,7 +86,7 @@ struct Scene(ImplicitlyCopyable, ImplicitlyDeletable):
     def __init__(out self):
         self.chan_0 = UnsafePointer[Channel[Int], MutAnyOrigin](unsafe_from_address=1)
         self.chan_1 = UnsafePointer[Channel[Int], MutAnyOrigin](unsafe_from_address=1)
-        self.branches = UnsafePointer[List[SelectBranch], MutAnyOrigin](unsafe_from_address=1)
+        self.branches = UnsafePointer[List[SelectBranch[Int]], MutAnyOrigin](unsafe_from_address=1)
         self.state = UnsafePointer[SelectState, MutAnyOrigin](unsafe_from_address=1)
         self.sel_id = 0
         self.winner = UnsafePointer[Int, MutAnyOrigin](unsafe_from_address=1)
@@ -152,14 +152,14 @@ def run_r1(mut rng: Int) raises -> Int:
     var rt = create()
     var chan0 = make_channel[Int](2)
     var chan1 = make_channel[Int](2)
-    var branches = List[SelectBranch]()
+    var branches = List[SelectBranch[Int]]()
     branches.append(recv_branch[Int](UnsafePointer[Channel[Int], MutAnyOrigin](to=chan0)))
     branches.append(recv_branch[Int](UnsafePointer[Channel[Int], MutAnyOrigin](to=chan1)))
     var state = SelectState()
     var sc = Scene()
     sc.chan_0 = UnsafePointer[Channel[Int], MutAnyOrigin](to=chan0)
     sc.chan_1 = UnsafePointer[Channel[Int], MutAnyOrigin](to=chan1)
-    sc.branches = UnsafePointer[List[SelectBranch], MutAnyOrigin](to=branches)
+    sc.branches = UnsafePointer[List[SelectBranch[Int]], MutAnyOrigin](to=branches)
     sc.state = UnsafePointer[SelectState, MutAnyOrigin](to=state)
     var winner = Int(-1)
     var scratch = Int(0)
@@ -243,14 +243,14 @@ def run_r2(mut rng: Int) raises -> Bool:
     var rt = create()
     var chan0 = make_channel[Int](2)
     var chan1 = make_channel[Int](2)  # unused second wake source; kept for dispatch()
-    var branches = List[SelectBranch]()
+    var branches = List[SelectBranch[Int]]()
     branches.append(recv_branch[Int](UnsafePointer[Channel[Int], MutAnyOrigin](to=chan0)))
-    branches.append(deadline_branch(hp, clock, Deadline(1)))  # 1ms
+    branches.append(deadline_branch[Int](hp, clock, Deadline(1)))  # 1ms
     var state = SelectState()
     var sc = Scene()
     sc.chan_0 = UnsafePointer[Channel[Int], MutAnyOrigin](to=chan0)
     sc.chan_1 = UnsafePointer[Channel[Int], MutAnyOrigin](to=chan1)
-    sc.branches = UnsafePointer[List[SelectBranch], MutAnyOrigin](to=branches)
+    sc.branches = UnsafePointer[List[SelectBranch[Int]], MutAnyOrigin](to=branches)
     sc.state = UnsafePointer[SelectState, MutAnyOrigin](to=state)
     var winner = Int(-1)
     var timed_out = Int(0)
@@ -344,7 +344,7 @@ def run_r4(mut rng: Int) raises -> Bool:
     var rt = create()
     var chan0 = make_channel[Int](2)
     var chan1 = make_channel[Int](2)  # never touched; RECV-only race
-    var branches = List[SelectBranch]()
+    var branches = List[SelectBranch[Int]]()
     branches.append(recv_branch[Int](UnsafePointer[Channel[Int], MutAnyOrigin](to=chan0)))
     var state = SelectState()
     var t = TB.create()

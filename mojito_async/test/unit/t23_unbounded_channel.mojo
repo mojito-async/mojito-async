@@ -32,6 +32,8 @@
 # Verdict: exit 0 + "PASS"; any RED prints + raises (exit 1).
 from std.memory import stack_allocation
 from mojito_async.channel import (
+    RecvOutcome,
+    SendOutcome,
     UnboundedChannel,
     UnboundedReceiver,
     UnboundedSender,
@@ -117,8 +119,8 @@ def producer_slice(
     mut rt: Runtime, h: JoinHandle[IntResult], sc: UnsafePointer[Scene, MutAnyOrigin]
 ) raises:
     claim_running(h)
-    sc[].tx.send(rt, h, 42)
-    if h.state() == TaskControlBlock.WAITING:
+    var outcome = sc[].tx.send(rt, h, 42)
+    if outcome.is_parked():
         red("producer_slice: unbounded send must never park")
     rec(sc, EV_P_SENT)
     _complete(h, 42)
@@ -132,10 +134,10 @@ def receiver_once_slice(
     call re-enters on resume and takes the fast path or observes close."""
     claim_running(h)
     var v = sc[].rx.recv(rt, h)
-    if h.state() == TaskControlBlock.WAITING:
+    if v.is_parked():
         rec(sc, EV_C_PARK)
         return
-    if v:
+    if v.is_value():
         rec(sc, EV_C_RECV)
         _complete(h, v.value())
         rec(sc, EV_C_DONE)
@@ -402,7 +404,7 @@ def main() raises:
     var h_x4 = spawn(rt4, UnsafePointer[TB, MutAnyOrigin](to=t_x4), 0)
     var raised = False
     try:
-        tx4.send(rt4, h_x4, 9)
+        _ = tx4.send(rt4, h_x4, 9)
     except Error:
         raised = True
     if not raised:
