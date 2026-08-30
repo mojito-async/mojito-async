@@ -192,6 +192,7 @@ def scheduler_loop[F: def(mut Runtime, Int, Int, BytePtr) raises -> Int, R: Resu
         )
         if checker[].state() != TaskControlBlock.RUNNABLE:
             rt.note_skipped()
+            rt._complete_dispatched()
             continue
         var own = checker[].owner_worker()
         # no-off-owner invariant (issue #71): a STARTED record is worker-
@@ -389,6 +390,7 @@ def fair_scheduler_loop[
                 )
                 if rcheck[].state() != TaskControlBlock.RUNNABLE:
                     rt.note_skipped()
+                    rt._complete_dispatched()
                     continue
                 # H1 no-off-owner assertion (issue #73/#71 coordinate): a
                 # STARTED record must NEVER pop off its owner worker (spec
@@ -425,6 +427,7 @@ def fair_scheduler_loop[
                 )
                 if icheck[].state() != TaskControlBlock.RUNNABLE:
                     rt.note_skipped()
+                    rt._complete_dispatched()
                     continue
                 if worker_id != 0 and icheck[].owner_worker() == 0:
                     icheck[].set_owner_worker(worker_id)
@@ -472,6 +475,7 @@ def fair_scheduler_loop[
         )
         if checker[].state() != TaskControlBlock.RUNNABLE:
             rt.note_skipped()
+            rt._complete_dispatched()
             continue
         # H1 no-off-owner assertion (issue #73/#71 coordinate): a STARTED
         # record picked from the REMOTE-ready queue must belong to this
