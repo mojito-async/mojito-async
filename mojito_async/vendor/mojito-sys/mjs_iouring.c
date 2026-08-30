@@ -67,7 +67,12 @@
 /* ---- raw syscall wrappers (io_uring needs no liburing) -------------------
  * syscall() returns -1 on error with errno set; these decode to the frozen
  * contract's negative -errno. On success they return 0 (or a non-negative
- * informational value). */
+ * informational value): ioring_setup returns the ring FD, and ioring_enter
+ * returns the NUMBER OF SQES CONSUMED, which for a one-SQE batch is 1. These
+ * are count-or-negative, NOT the file's 0-or-negative entry-point contract,
+ * so every caller MUST test `rc < 0` and NEVER `rc != 0`. Reading a count as
+ * an error is issue #167: it made mjs_iouring_create tear down the ring it
+ * had just built and return +1, a value that is neither 0 nor -errno. */
 static int ioring_setup(unsigned entries, struct io_uring_params *p)
 {
     long r = syscall(__NR_io_uring_setup, entries, p);
@@ -99,10 +104,28 @@ struct mjs_uring {
     unsigned sq_entries;
     unsigned cq_entries;
 
-    /* mmap'd ring memory */
+    /* mmap'd ring memory. Each *_len is the EXACT length that was passed to
+     * mmap for the pointer beside it, recorded at map time and used verbatim
+     * at unmap time. A length is non-zero if and ONLY if its mapping exists,
+     * which is what makes iouring_unmap correct at any point in the
+     * construction sequence, including halfway through it.
+     *
+     * DO NOT recompute ring geometry in iouring_unmap (issue #169). It used
+     * to, from `entries * elemsize * 4`, while the map path derived lengths
+     * from the kernel's own p->sq_off.array / p->cq_off.cqes. Two formulas
+     * forty lines apart with nothing forcing them to agree: sq_ring came out
+     * a page short (leaking the remainder) and cq_ring two pages long
+     * (silently unmapping whatever followed it, since munmap does not fail
+     * on a range containing pages it does not own). At 4 KiB the two errors
+     * hid each other, and at 16K/64K pages they vanished entirely, so
+     * neither byte-total accounting nor a /proc/self/maps diff could see
+     * them. Correcting the formulas would only re-create the divergence. */
     struct io_uring_sqe *sqes;
+    size_t sqes_len;
     unsigned char *sq_ring;
+    size_t sq_ring_len;
     unsigned char *cq_ring;
+    size_t cq_ring_len;
     uint32_t *sq_head;
     uint32_t *sq_tail;
     uint32_t *sq_mask;
@@ -195,7 +218,16 @@ static struct io_uring_sqe *uring_get_sqe(struct mjs_uring *u)
     return sqe;
 }
 
-/* Commit sqes handed out since the last commit and optionally submit. */
+/* Commit sqes handed out since the last commit and optionally submit.
+ *
+ * RETURNS THE NUMBER OF SQES CONSUMED, or negative -errno. This is the
+ * kernel's count riding straight through from ioring_enter, NOT the
+ * 0-or-negative contract the mjs_iouring_* entry points publish. A short
+ * submit (consumed < pending) is real information and is deliberately kept
+ * here rather than clamped away. Callers MUST check `rc < 0`; `rc != 0`
+ * reads a successful submit as a failure (issue #167). Callers that need
+ * the entry-point contract go through uring_submit_poll_add, which
+ * normalises. */
 static int uring_submit(struct mjs_uring *u, unsigned min_complete,
                         unsigned flags)
 {
@@ -265,7 +297,10 @@ static int uring_stage_timeout_remove(struct mjs_uring *u)
 }
 
 /* Stage a poll_add, flushing the SQ once on queue-full (-EAGAIN); then
- * submit the batch. Never blocks. Returns 0 or negative errno. */
+ * submit the batch. Never blocks. Returns 0 or negative errno: this is the
+ * boundary where uring_submit's SQE COUNT is normalised to the file's
+ * entry-point contract, and it is the only place that normalisation happens
+ * (issue #167). */
 static int uring_submit_poll_add(struct mjs_uring *u, int fd, int poll_mask,
                                  uint64_t user_data)
 {
@@ -278,7 +313,8 @@ static int uring_submit_poll_add(struct mjs_uring *u, int fd, int poll_mask,
     }
     if (rc != 0)
         return rc;
-    return uring_submit(u, 0, 0);
+    rc = uring_submit(u, 0, 0);
+    return (rc < 0) ? rc : 0; /* drop the SQE count: 0 == success (#167) */
 }
 
 /* mjs_iouring_probe(): pure predicate — does THIS KERNEL support io_uring?
@@ -313,36 +349,71 @@ static size_t round_page(size_t n)
     return (n + (size_t)page - 1u) & ~((size_t)page - 1u);
 }
 
+/* Release exactly what was mapped, and nothing else.
+ *
+ * Every length comes from the *_len field recorded beside its pointer at map
+ * time; nothing is recomputed here. A zero length means the mapping was
+ * never made, so it is skipped rather than handed to munmap, which rejects a
+ * zero length with EINVAL.
+ *
+ * That is what makes this safe on the partially-built handle that
+ * iouring_map_rings passes in from its own failure paths. It used to be
+ * called there before u->sq_entries / u->cq_entries were assigned, so every
+ * recomputed length was round_page(0) == 0, every munmap failed EINVAL with
+ * the return ignored, and each already-successful mapping leaked in full
+ * (issue #169). With the length stored at map time there is no ordering to
+ * get wrong.
+ *
+ * Idempotent: each mapping is marked released, so the repeated calls along
+ * mjs_iouring_create's error ladder cannot unmap anything twice. */
 static void iouring_unmap(struct mjs_uring *u)
 {
-    size_t sq_sz = round_page((size_t)u->sq_entries * sizeof(uint32_t) * 4u);
-    size_t cq_sz = round_page((size_t)u->cq_entries *
-                              sizeof(struct io_uring_cqe) * 4u);
-    size_t sqe_sz = round_page((size_t)u->sq_entries *
-                               sizeof(struct io_uring_sqe));
-    if (u->sq_ring != MAP_FAILED && u->sq_ring != NULL)
-        munmap(u->sq_ring, sq_sz);
-    if (u->cq_ring != MAP_FAILED && u->cq_ring != NULL)
-        munmap(u->cq_ring, cq_sz);
-    if (u->sqes != MAP_FAILED && u->sqes != NULL)
-        munmap(u->sqes, sqe_sz);
+    if (u->sq_ring != MAP_FAILED && u->sq_ring != NULL && u->sq_ring_len != 0)
+        munmap(u->sq_ring, u->sq_ring_len);
+    u->sq_ring = MAP_FAILED;
+    u->sq_ring_len = 0;
+
+    if (u->cq_ring != MAP_FAILED && u->cq_ring != NULL && u->cq_ring_len != 0)
+        munmap(u->cq_ring, u->cq_ring_len);
+    u->cq_ring = MAP_FAILED;
+    u->cq_ring_len = 0;
+
+    if (u->sqes != MAP_FAILED && u->sqes != NULL && u->sqes_len != 0)
+        munmap(u->sqes, u->sqes_len);
+    u->sqes = MAP_FAILED;
+    u->sqes_len = 0;
 }
 
 /* Map the SQ/CQ/SQE rings from the ring_fd into user space. */
 static int iouring_map_rings(struct mjs_uring *u,
                              const struct io_uring_params *p)
 {
-    size_t sq_sz = p->sq_off.array + (size_t)p->sq_entries * sizeof(uint32_t);
-    size_t cq_sz = p->cq_off.cqes + (size_t)p->cq_entries *
-                   sizeof(struct io_uring_cqe);
+    /* Lengths are derived from the offsets the KERNEL returned, which are the
+     * only truth about the ring's layout, and each one is stored beside its
+     * pointer the moment the mapping succeeds. iouring_unmap reads these back
+     * verbatim; nothing downstream re-derives them (issue #169). */
+    size_t sq_sz = round_page(p->sq_off.array +
+                              (size_t)p->sq_entries * sizeof(uint32_t));
+    size_t cq_sz = round_page(p->cq_off.cqes + (size_t)p->cq_entries *
+                              sizeof(struct io_uring_cqe));
+    size_t sqe_sz = round_page((size_t)p->sq_entries *
+                               sizeof(struct io_uring_sqe));
 
-    u->sq_ring = (unsigned char *)mmap(NULL, round_page(sq_sz),
+    u->sq_ring = (unsigned char *)mmap(NULL, sq_sz,
                                        PROT_READ | PROT_WRITE,
                                        MAP_SHARED | MAP_POPULATE,
                                        u->ring_fd, IORING_OFF_SQ_RING);
     if (u->sq_ring == MAP_FAILED)
         return -errno;
-    u->cq_ring = (unsigned char *)mmap(NULL, round_page(cq_sz),
+    u->sq_ring_len = sq_sz;
+
+    /* NOTE: under IORING_FEAT_SINGLE_MMAP the kernel returns ctx->rings for
+     * BOTH IORING_OFF_SQ_RING and IORING_OFF_CQ_RING, so this second mapping
+     * is a distinct virtual address over the same object (verified by writing
+     * through one and reading it back through the other). Mapping both is
+     * therefore redundant on such kernels, not wrong: cq_ring + cq_off.cqes
+     * resolves to the real cqes either way. Costs one extra VMA per ring. */
+    u->cq_ring = (unsigned char *)mmap(NULL, cq_sz,
                                        PROT_READ | PROT_WRITE,
                                        MAP_SHARED | MAP_POPULATE,
                                        u->ring_fd, IORING_OFF_CQ_RING);
@@ -351,15 +422,17 @@ static int iouring_map_rings(struct mjs_uring *u,
         iouring_unmap(u);
         return -saved;
     }
+    u->cq_ring_len = cq_sz;
+
     u->sqes = (struct io_uring_sqe *)mmap(
-        NULL, round_page((size_t)p->sq_entries * sizeof(struct io_uring_sqe)),
-        PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE, u->ring_fd,
-        IORING_OFF_SQES);
+        NULL, sqe_sz, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE,
+        u->ring_fd, IORING_OFF_SQES);
     if (u->sqes == MAP_FAILED) {
         int saved = errno;
         iouring_unmap(u);
         return -saved;
     }
+    u->sqes_len = sqe_sz;
 
     u->sq_head  = (uint32_t *)(u->sq_ring + p->sq_off.head);
     u->sq_tail  = (uint32_t *)(u->sq_ring + p->sq_off.tail);

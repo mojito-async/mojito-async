@@ -286,7 +286,7 @@ def park_validate[R: ResultValue](h: JoinHandle[R]) -> Bool:
 def park_commit[R: ResultValue](
     h: JoinHandle[R],
     reason: Int = SuspendReason.PARK,
-) raises:
+) raises -> Bool:
     """Two-phase park step 3 — COMMIT: close the early-wake window.
 
     Under the OWNER's remote-ready queue guard (the same lock the WAKE leg
@@ -295,10 +295,17 @@ def park_commit[R: ResultValue](
         consume the latch and unwind PARKING -> RUNNABLE — WAITING is NEVER
         entered and the wait generation is NEVER bumped (A0-T11).  No
         enqueue here (Q6): the record was already dequeued; the caller keeps
-        running the task in this slice.
+        running the task in this slice.  Returns False.
       - else: PARKING -> WAITING — FRESH wait epoch (generation bump) and
         the wait reason `r` stamped on the embedded node (spec §25).  The
-        wake producer claims the new generation exactly once.
+        wake producer claims the new generation exactly once.  Returns True.
+
+    Returns True when the task committed to WAITING (genuinely parked);
+    False when it unwound PARKING -> RUNNABLE because an early wake was
+    consumed.  Callers MUST handle False: the task is RUNNABLE, in NO queue,
+    and the caller's dispatcher is still live on the OS-thread — the caller
+    must either claim_running and continue in the same slice (mutex/channel
+    style) or push_remote to re-enqueue for a later slice (fiber-seam style).
 
     Exactly ONE winner (A0-T10): the commit's readiness check and the WAKE
     leg's latch/claim are serialized under the same guard, so a wake can
@@ -312,20 +319,21 @@ def park_commit[R: ResultValue](
         if h.tcb()[].early_readiness():
             h.tcb()[].clear_early_readiness()
             h.tcb()[].transition(TaskControlBlock.RUNNABLE)
-        else:
-            h.tcb()[].wait_node()[].set_reason(reason)
-            h.tcb()[].transition(TaskControlBlock.WAITING)
-        return
+            return False
+        h.tcb()[].wait_node()[].set_reason(reason)
+        h.tcb()[].transition(TaskControlBlock.WAITING)
+        return True
     var owner = UnsafePointer[Runtime, MutAnyOrigin](unsafe_from_address=addr)
     owner[].remote_queue()[]._guard.lock()
     if h.tcb()[].early_readiness():
         h.tcb()[].clear_early_readiness()
         h.tcb()[].transition(TaskControlBlock.RUNNABLE)
-    else:
-        h.tcb()[].wait_node()[].set_reason(reason)
-        h.tcb()[].transition(TaskControlBlock.WAITING)
+        owner[].remote_queue()[]._guard.unlock()
+        return False
+    h.tcb()[].wait_node()[].set_reason(reason)
+    h.tcb()[].transition(TaskControlBlock.WAITING)
     owner[].remote_queue()[]._guard.unlock()
-
+    return True
 
 # ---------------------------------------------------------------------------
 # PARKING-LOT-ADAPTER (A2 seam history — the two-phase protocol above is the
@@ -410,18 +418,19 @@ def park_cancellable[R: ResultValue](
 
 
 def wake_cancelled[R: ResultValue](mut rt: Runtime, h: JoinHandle[R]) raises:
-    """Push-cancel a WAITING task (issue #57): stamp the wait reason CANCEL
-    then deliver the SAME wake `unpark_current` would for readiness.
+    """Push-cancel a WAITING task (issue #57): deliver the same wake
+    `unpark_current` would for readiness, passing CANCEL as the win_reason
+    so that `unpark_current` stamps the reason INSIDE its guard — only when
+    the claim actually succeeds (A4.4, issue #58).
 
     Callers that own a primitive-specific wait queue (Mutex/Semaphore/
     Channel) MUST remove `h` from their own queue FIRST (see module header)
     — this function only performs the state transition, exactly like
     unpark_current's contract.  If readiness already claimed the wake (the
     task is no longer WAITING), unpark_current's existing no-op path fires
-    and `_reason` is left untouched — the earlier winner's stamp (or lack
-    of one) stands; this call never overwrites a settled outcome."""
-    h.tcb()[].wait_node()[].set_reason(SuspendReason.CANCEL)
-    unpark_current(rt, h)
+    and `_reason` is left untouched — the earlier winner's stamp (or lack of
+    one) stands; this call never overwrites a settled outcome."""
+    unpark_current(rt, h, win_reason=SuspendReason.CANCEL)
 
 
 def is_cancel_wake[R: ResultValue](h: JoinHandle[R]) -> Bool:
