@@ -20,8 +20,21 @@ CFLAGS  ?= -O2 -g -Wall -Wextra
 SPIKE   := spike/colorless_runtime/vendor/mojito-sys
 PROD    := mojito_async/vendor/mojito-sys
 BUILD   := build
-DYLIB   := libmojito_spike.dylib
 MOJO    ?= mojo
+
+# Shared-library naming and flags per platform (issue #141: the Linux lanes
+# have never executed anywhere, which is what mojito-sys#162/#163 are gated
+# on; they cannot start executing while the only recipe here emits a Mach-O
+# dylib).  The suite runners accept either name.
+UNAME_S := $(shell uname -s)
+ifeq ($(UNAME_S),Darwin)
+DYLIB   := libmojito_spike.dylib
+SHFLAGS := -dynamiclib
+else
+DYLIB   := libmojito_spike.so
+SHFLAGS := -shared
+CFLAGS  += -fPIC
+endif
 RUNSH   := spike/colorless_runtime/tests/run.sh
 A11SH   := mojito_async/test/run.sh
 
@@ -38,7 +51,7 @@ OBJS   := $(patsubst $(PROD)/%.c,$(BUILD)/prod/%.o,$(CSRCS_P)) \
 HAS_SOURCES := $(CSRCS_S)$(SSRCS_S)$(CSRCS_P)$(SSRCS_P)
 
 .DELETE_ON_ERROR:
-.PHONY: all test bench clean
+.PHONY: all test bench clean check-vendored
 
 all:
 	@$(if $(HAS_SOURCES),$(MAKE) $(DYLIB),echo "make: no vendored C/asm sources yet; nothing to build.")
@@ -63,7 +76,7 @@ $(BUILD)/prod/%.o: $(PROD)/%.S | $(BUILD)/prod
 	$(CC) -I$(PROD)/include -c $< -o $@
 
 $(DYLIB): $(OBJS)
-	$(CC) -dynamiclib -o $@ $^
+	$(CC) $(SHFLAGS) -o $@ $^
 
 # Build the dylib when present, then run the spike harness + A1 suite. When
 # the vendor substrate is absent, run.sh reports a clear environment ERROR
@@ -78,6 +91,12 @@ test:
 # the pre-commit suite via precommit/run-suite.sh).
 bench:
 	@MOJO="$(MOJO)" ./bench/run.sh
+
+# mojito-sys#164: diff the vendored substrate against canonical mojito-sys
+# and fail on divergence that is not recorded with a content hash. Needs a
+# canonical tree: $MOJITO_SYS_DIR, a sibling ../mojito-sys checkout, or gh.
+check-vendored:
+	@./mojito_async/vendor/check-vendored.sh
 
 clean:
 	rm -rf $(BUILD) $(DYLIB)
