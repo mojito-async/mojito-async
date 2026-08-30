@@ -225,16 +225,24 @@ struct Barrier:
 
         The FIFO search + removal is ONE guarded critical section (issue
         #148): _w_tcb/_w_id are shared with wait()'s release path on
-        another worker."""
+        another worker. The `_count`/`_target` shrink stays inside the
+        guard (it protects the phase invariant for other waiters), but the
+        stamp+wake moves outside it (issue #173): notify_marker's
+        unpark_current chains to an OS wake syscall, and holding the FIFO
+        lock across it forces a concurrent cancel_waiter/timeout_waiter/
+        release on another worker to spin for the syscall's duration."""
         self._guard.lock()
         var n = len(self._w_tcb)
         var found = False
+        var winner_tcb = 0
+        var winner_tid = 0
         for _ in range(n):
             var tcb = self._w_tcb.popleft()
             var tid = self._w_id.popleft()
             if tid == h.id() and not found:
                 found = True
-                notify_marker[R](rt, tcb, tid, WINNER_CANCELLED)
+                winner_tcb = tcb
+                winner_tid = tid
             else:
                 self._w_tcb.append(tcb)
                 self._w_id.append(tid)
@@ -242,6 +250,8 @@ struct Barrier:
             self._count -= 1
             self._target -= 1
         self._guard.unlock()
+        if found:
+            notify_marker[R](rt, winner_tcb, winner_tid, WINNER_CANCELLED)
         return found
 
     def timeout_waiter[R: ResultValue](
@@ -251,16 +261,20 @@ struct Barrier:
         and shrink `_target` in lockstep with `_count` (see cancel_waiter).
         Idempotent: False when `h` already left the FIFO.
 
-        Guarded by _guard (issue #148) — mirrors cancel_waiter."""
+        Guarded by _guard (issue #148) — mirrors cancel_waiter, including
+        deferring the stamp+wake until after _guard releases (issue #173)."""
         self._guard.lock()
         var n = len(self._w_tcb)
         var found = False
+        var winner_tcb = 0
+        var winner_tid = 0
         for _ in range(n):
             var tcb = self._w_tcb.popleft()
             var tid = self._w_id.popleft()
             if tid == h.id() and not found:
                 found = True
-                notify_marker[R](rt, tcb, tid, WINNER_TIMEOUT)
+                winner_tcb = tcb
+                winner_tid = tid
             else:
                 self._w_tcb.append(tcb)
                 self._w_id.append(tid)
@@ -268,6 +282,8 @@ struct Barrier:
             self._count -= 1
             self._target -= 1
         self._guard.unlock()
+        if found:
+            notify_marker[R](rt, winner_tcb, winner_tid, WINNER_TIMEOUT)
         return found
 
     # --- reset (explicit next-phase / abort-current-phase) -------------------
