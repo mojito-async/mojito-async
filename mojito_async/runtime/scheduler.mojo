@@ -220,6 +220,7 @@ def scheduler_loop[F: def(mut Runtime, Int, Int, BytePtr) raises -> Int, R: Resu
             )
         slices += 1
         _ = dispatcher(rt, rec.tcb_addr, rec.task_id, ud)
+        rt._complete_dispatched()
     return slices
 
 
@@ -416,6 +417,7 @@ def fair_scheduler_loop[
                 rt.note_slice_remote()
                 slices += 1
                 _ = dispatcher(rt, rrec.tcb_addr, rrec.task_id, ud)
+                rt._complete_dispatched()
             while rt.has_inject():
                 var irec = rt.pop_inject()
                 var icheck = UnsafePointer[TaskControlBlock[R], MutAnyOrigin](
@@ -432,6 +434,7 @@ def fair_scheduler_loop[
                 rt.note_slice_inject()
                 slices += 1
                 _ = dispatcher(rt, irec.tcb_addr, irec.task_id, ud)
+                rt._complete_dispatched()
 
         # ---- pick the next record (spec §21 order: local, remote, inject) --
         var have = False
@@ -505,6 +508,7 @@ def fair_scheduler_loop[
         slices += 1
         var yields_before = rt.yields()
         _ = dispatcher(rt, rec.tcb_addr, rec.task_id, ud)
+        rt._complete_dispatched()
 
         # ---- kill-0 starve watch (locally-sourced slices only) ------------
         if cls == CLS_LOCAL:
