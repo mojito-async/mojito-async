@@ -8,9 +8,16 @@ Vendored on:       2026-08-24T04:04:28Z
 RE-PINNED on:      2026-08-28 (A2.0 issue #101 — in-repo substrate rework:
                     ms_ctx_t v2 168B -> v3 176B, resume-table/global removal)
 
-Files (byte-identical to the PROD mojito_async/vendor/mojito-sys/ tree —
-`diff -r` between the two vendored dirs is empty; the spike harness links
-the same libmojito_spike.dylib, built from PROD):
+Files (same basenames as the PROD mojito_async/vendor/mojito-sys/ tree;
+the spike harness links the same libmojito_spike.dylib, built from PROD
+only — SPIKE's own *.c/*.S are not independently compiled by any target,
+mojito-async#180). NOT asserted byte-identical: this file used to claim
+`diff -r` between the two vendored dirs was empty, which had been false
+since #101 landed on PROD without a matching re-vendor of SPIKE (issue
+#170 instance 6). Divergence is tracked, not asserted away — see
+mojito_async/vendor/check-vendored.sh finding [4] and
+mojito_async/vendor/VENDORED_EXCEPTIONS.tsv's `spike:` rows for exactly
+which files diverge and why:
   include/mojito_spike.h   # ms_ctx_t v3 layout (176 B: x19-x30, d8-d15, sp,
                            #   return_to @168)
   native_stack.c           # ms_stack_alloc/free with PROT_NONE guard page

@@ -5,8 +5,18 @@
 #   <basename>    <sha256-of-vendored-file>    <reason>
 #
 # <basename>        the filename as it appears under vendor/mojito-sys/
-#                   (e.g. native_stack.c, mojito_sys.h)
+#                   (e.g. native_stack.c, mojito_sys.h), OR, for a
+#                   SPIKE-vs-PROD divergence (check-vendored.sh finding
+#                   [4], issue #170 instance 6), `spike:<basename>` — the
+#                   `spike:` prefix disambiguates from a finding [1]
+#                   PROD-vs-canonical row of the same basename (e.g.
+#                   native_stack.c has independent rows for each axis).
 # <sha256>          sha256sum of the VENDORED copy — NOT the canonical copy.
+#                   For a `spike:` row this is the SPIKE copy
+#                   (spike/colorless_runtime/vendor/mojito-sys/<basename>),
+#                   matching finding [4]'s framing of PROD as the
+#                   authoritative side (Makefile:12 — the dylib is built
+#                   from PROD only) and SPIKE as the one that drifted.
 #                   Computed with: shasum -a 256 <file> | awk '{print $1}'
 #                   check-vendored.sh refuses the row if the file's current
 #                   hash differs, so a re-diverged file is caught automatically.
@@ -43,3 +53,18 @@ mjs_socket.c	540cfd837a3be48cf02aaeb180c25b6f42c0712536efe265755bd266ac529d3b	in
 # while the C was taken in slices (finding [3]).  Both are intentional and
 # are suppressed by the _spike_substrate_ sentinel below.
 _spike_substrate_	intentional	intentional spike substrate; frozen ABI integration pending sys#164
+#
+# SPIKE (spike/colorless_runtime/vendor/mojito-sys) against PROD
+# (finding [4], issue #170 instance 6). Makefile:9-16 claims these two
+# trees are byte-identical; they have not been since at least the A2.0
+# M:N rework (issue #101) landed on PROD without a matching re-vendor of
+# SPIKE, and nothing checked the claim before finding [4] existed.  PROD
+# is authoritative (Makefile:12: the dylib links PROD's objects only;
+# $(BUILD)/spike/%.o pattern rules exist but are never referenced by any
+# target, so SPIKE's C has not actually been COMPILED by `make` for as
+# long as this OBJS wiring has looked like this — a second, smaller
+# instance of the same "the comment claims something the build graph
+# doesn't do" pattern, filed as mojito-async#180 rather than fixed here).
+spike:VENDORED_AT.txt	4fb8b793a9633791f4f961221d21070d3febd410c009c4b2b222c56342a08beb	provenance/prose-only file, expected to differ per copy (different vendor dates/paths); both copies also carried their own "byte-identical, diff -r is empty" claim, which was itself false the same way the Makefile's was — corrected in both copies in the same pass as this row (issue #170)
+spike:mojito_spike.h	15c6aed2c372bfd411e7ab4ac01ef0f62a1dd64580496cc2cd896688c1e82b15	PROD's header gained ms_live_stack_count (oversubscription guard, EPIC #2/#101) that SPIKE's copy never received; SPIKE is a frozen A0 snapshot, not a live consumer of the newer stack-pool guard (issue #170)
+spike:native_stack.c	c3902e81b8d054327845ea309364ff7a7aca9d8d940d1a37ec9277f1c61d67fc	SAFETY TRIPWIRE, read before ever re-linking SPIKE's objects: PROD's copy carries issue #145's g_registry_lock mutex (Bug 1: concurrent ms_stack_alloc/free/is_live) and ABA dead-list (Bug 2); SPIKE's copy has NEITHER. This is safe today ONLY because SPIKE's compiled objects are never linked into any dylib (see the OBJS note above) — SPIKE's own mojito_spike.mojo bindings resolve their externs against the PROD-built libmojito_spike.dylib at link time. If SPIKE ever becomes independently linked again, re-vendor this file from PROD FIRST (issue #170)
