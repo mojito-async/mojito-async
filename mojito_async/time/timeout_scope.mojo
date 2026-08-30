@@ -447,8 +447,10 @@ def timeout_scope_driver[R: ResultValue](
                 + String(sp[].handle())
                 + " expired"
             )
-            if h.state() == TaskControlBlock.WAITING:
-                unpark_current(rt, h)
+            var gen = h.tcb()[].wait_node()[].generation()
+            var was_waiting = h.tcb()[].state() == TaskControlBlock.WAITING
+            unpark_current(rt, h, required_gen=gen)
+            if was_waiting and h.tcb()[].state() == TaskControlBlock.RUNNABLE:
                 woke += 1
             continue
         # plain (non-scope) timer: service_timers' own wake, reproduced so
@@ -459,8 +461,10 @@ def timeout_scope_driver[R: ResultValue](
             ),
             e.id,
         )
-        if h2.state() == TaskControlBlock.WAITING:
-            unpark_current(rt, h2)
+        var gen2 = h2.tcb()[].wait_node()[].generation()
+        var was_waiting2 = h2.tcb()[].state() == TaskControlBlock.WAITING
+        unpark_current(rt, h2, required_gen=gen2)
+        if was_waiting2 and h2.tcb()[].state() == TaskControlBlock.RUNNABLE:
             woke += 1
     return woke
 
