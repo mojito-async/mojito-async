@@ -32,7 +32,7 @@
 #     Channel[T] cell, and for SEND the caller-owned item slot).  No T
 #     parameter lives on the struct — b2 has no vtables/function-typed
 #     fields, so a branch cannot carry a typed pointer AND be storable in a
-#     single `List[SelectBranch]` unless the struct itself is monomorphic.
+#     single `List[SelectBranch[T]]` unless the struct itself is monomorphic.
 #     `recv_branch[T]`/`send_branch[T]`/`deadline_branch` are generic
 #     CONVENIENCE FACTORIES that extract the Int address from a typed
 #     pointer at the callsite (mirrors how channel.mojo's WaitRecord erases
@@ -146,10 +146,15 @@ from mojito_async.time.timer_heap import TimerHeap
 # SelectBranch — type-erased DATA descriptor (entry axis, see header)
 # ---------------------------------------------------------------------------
 
-struct SelectBranch(ImplicitlyCopyable, ImplicitlyDeletable, Movable):
+struct SelectBranch[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable](ImplicitlyCopyable, ImplicitlyDeletable, Movable):
     """One branch of a select call: a kind discriminant plus plain Int
     addresses.  Build with `recv_branch`/`send_branch`/`deadline_branch`
-    (module factories, #92) rather than the raw constructor."""
+    (module factories, #92) rather than the raw constructor.
+    T is a phantom type parameter — it appears in no field (all fields are
+    plain Int addresses) and imposes zero memory overhead.  Its sole purpose
+    is to make List[SelectBranch[T]] a typed surface so the Mojo type system
+    rejects List[SelectBranch[Int]] where List[SelectBranch[Msg]] is expected
+    at compile time."""
 
     comptime RECV = Int(0)
     comptime SEND = Int(1)
@@ -190,31 +195,34 @@ struct SelectBranch(ImplicitlyCopyable, ImplicitlyDeletable, Movable):
 
 def recv_branch[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable](
     chan: UnsafePointer[Channel[T], MutAnyOrigin],
-) -> SelectBranch:
+) -> SelectBranch[T]:
     """RECV branch over `chan` (issue #92)."""
-    return SelectBranch(SelectBranch.RECV, Int(chan), 0, 0)
+    return SelectBranch[T](SelectBranch[T].RECV, Int(chan), 0, 0)
 
 
 def send_branch[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable](
     chan: UnsafePointer[Channel[T], MutAnyOrigin],
     item_slot: UnsafePointer[T, MutAnyOrigin],
-) -> SelectBranch:
+) -> SelectBranch[T]:
     """SEND branch over `chan`; `item_slot` is a caller-owned cell holding
     the value to send if this branch wins (issue #92)."""
-    return SelectBranch(SelectBranch.SEND, Int(chan), Int(item_slot), 0)
+    return SelectBranch[T](SelectBranch[T].SEND, Int(chan), Int(item_slot), 0)
 
 
-def deadline_branch(deadline_ticks: Int) -> SelectBranch:
+def deadline_branch[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable](deadline_ticks: Int) -> SelectBranch[T]:
     """DEADLINE branch (issue #92 descriptor; real timer wiring is #91).
-    Selectable once a caller-supplied `now_ticks >= deadline_ticks`."""
-    return SelectBranch(SelectBranch.DEADLINE, 0, 0, deadline_ticks)
+    Selectable once a caller-supplied `now_ticks >= deadline_ticks`.
+    NOTE: T cannot be inferred from the arguments (there is no Channel[T]
+    parameter here); callers must write `never[MyType]()` /
+    `deadline_branch[MyType](ticks)` explicitly."""
+    return SelectBranch[T](SelectBranch[T].DEADLINE, 0, 0, deadline_ticks)
 
 
-def deadline_branch(
+def deadline_branch[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable](
     heap: UnsafePointer[TimerHeap, MutAnyOrigin],
     clock: MonotonicClock,
     deadline: Deadline,
-) -> SelectBranch:
+) -> SelectBranch[T]:
     """Real timer-integrated DEADLINE branch (issue #91): the #92 bare
     descriptor carries a tick value nobody arms; this overload additionally
     stores `heap`'s address so `select()` can ARM a genuine timer wake when
@@ -223,22 +231,28 @@ def deadline_branch(
     site symmetry with `timeout_branch` and with `time/sleep.mojo`'s
     `sleep_until_current(rt, h, heap, clock, deadline)` — an ABSOLUTE
     deadline needs no `now` reading to resolve into ticks, so it is
-    otherwise unused here."""
+    otherwise unused here.
+    NOTE: T cannot be inferred from the arguments (there is no Channel[T]
+    parameter here); callers must write `never[MyType]()` /
+    `deadline_branch[MyType](ticks)` explicitly."""
     var ticks = Int(UInt64(deadline.at_ms()) * 1000000)
-    return SelectBranch(SelectBranch.DEADLINE, 0, 0, ticks, Int(heap))
+    return SelectBranch[T](SelectBranch[T].DEADLINE, 0, 0, ticks, Int(heap))
 
 
-def timeout_branch(
+def timeout_branch[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable](
     heap: UnsafePointer[TimerHeap, MutAnyOrigin],
     clock: MonotonicClock,
     duration: Duration,
-) -> SelectBranch:
+) -> SelectBranch[T]:
     """Real timer-integrated DEADLINE branch from a RELATIVE duration
     (issue #91): resolves `clock.now() + duration.ticks()` into an
     absolute deadline at construction time — the exact convention
-    `time/sleep.mojo#sleep_current` uses for `sleep(duration)`."""
+    `time/sleep.mojo#sleep_current` uses for `sleep(duration)`.
+    NOTE: T cannot be inferred from the arguments (there is no Channel[T]
+    parameter here); callers must write `never[MyType]()` /
+    `deadline_branch[MyType](ticks)` explicitly."""
     var ticks = Int(clock.now() + duration.ticks())
-    return SelectBranch(SelectBranch.DEADLINE, 0, 0, ticks, Int(heap))
+    return SelectBranch[T](SelectBranch[T].DEADLINE, 0, 0, ticks, Int(heap))
 
 
 # Sentinel tick value a `now_ticks` reading can never reach (issue #85 gap
@@ -248,7 +262,7 @@ def timeout_branch(
 comptime NEVER_TICKS = Int(0x7FFF_FFFF_FFFF_FFFF)
 
 
-def never() -> SelectBranch:
+def never[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable]() -> SelectBranch[T]:
     """A DEADLINE branch that can NEVER resolve (issue #85 deliverable: "a
     `never()` branch never fires and only ever loses"; used for
     channel-only selects where no deadline applies, e.g. a socket-only
@@ -266,8 +280,11 @@ def never() -> SelectBranch:
     blockable/claimable branch" well-formedness guard even when a
     `never()` branch sits alongside a single live channel branch) but it
     can never itself become the winner — the select still completes via
-    another branch, exactly as issue #85 requires."""
-    return SelectBranch(SelectBranch.DEADLINE, 0, 0, NEVER_TICKS)
+    another branch, exactly as issue #85 requires.
+    NOTE: T cannot be inferred from the arguments (there is no Channel[T]
+    parameter here); callers must write `never[MyType]()` /
+    `deadline_branch[MyType](ticks)` explicitly."""
+    return SelectBranch[T](SelectBranch[T].DEADLINE, 0, 0, NEVER_TICKS)
 
 
 # ---------------------------------------------------------------------------
@@ -289,7 +306,7 @@ either the claim scan or the park registration (issue #93)."""
 
 
 def classify_branch[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable](
-    branch: SelectBranch, now_ticks: Int = -1
+    branch: SelectBranch[T], now_ticks: Int = -1
 ) raises -> Int:
     """Non-mutating readiness probe (issue #93 rescan step 1): reuses the
     channel's own non-parking try_send/try_recv semantics (spec §40.1) so
@@ -321,7 +338,7 @@ def classify_branch[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable](
 
 
 def branch_ready[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable](
-    branches: List[SelectBranch], idx: Int, now_ticks: Int = -1
+    branches: List[SelectBranch[T]], idx: Int, now_ticks: Int = -1
 ) raises -> Bool:
     """Per-branch fairness/diagnostic probe exposed for tests (issue #93):
     True when `branches[idx]` would be claimable (READY_DATA or
@@ -390,7 +407,7 @@ struct SelectState(ImplicitlyCopyable, ImplicitlyDeletable, Movable):
 # ---------------------------------------------------------------------------
 
 def rescan[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable](
-    branches: List[SelectBranch], mut state: SelectState, now_ticks: Int = -1
+    branches: List[SelectBranch[T]], mut state: SelectState, now_ticks: Int = -1
 ) raises -> Int:
     """Two-pass claim scan shared by select() and select_fast().
 
@@ -486,7 +503,7 @@ struct SelectOutcome[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable](
 # ---------------------------------------------------------------------------
 
 def _claim_at[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable](
-    branches: List[SelectBranch], idx: Int
+    branches: List[SelectBranch[T]], idx: Int
 ) raises -> SelectOutcome[T]:
     var b = branches[idx]
     var out = SelectOutcome[T]()
@@ -515,7 +532,7 @@ def _claim_at[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable](
 
 
 def _unregister_others[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable](
-    branches: List[SelectBranch], task_id: Int, winner_idx: Int
+    branches: List[SelectBranch[T]], task_id: Int, winner_idx: Int
 ) raises:
     """Logical cancellation (issue #92 step 3): remove this task's WaitRecord
     from every branch except the winner.  A no-op per branch when this task
@@ -535,8 +552,8 @@ def _unregister_others[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable](
             )[].unregister_sender(task_id)
 
 
-def _cancel_armed_timer(
-    branches: List[SelectBranch],
+def _cancel_armed_timer[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable](
+    branches: List[SelectBranch[T]],
     mut state: SelectState,
     task_id: Int,
     closed_recv_win: Bool = False,
@@ -586,7 +603,7 @@ def _cancel_armed_timer(
 def select_fast[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable, R: ResultValue](
     mut rt: Runtime,
     h: JoinHandle[R],
-    branches: List[SelectBranch],
+    branches: List[SelectBranch[T]],
     mut state: SelectState,
     now_ticks: Int = -1,
 ) raises -> SelectOutcome[T]:
@@ -602,7 +619,7 @@ def select_fast[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable, R: Result
         return SelectOutcome[T]()
     var out = _claim_at[T](branches, idx)
     _unregister_others[T](branches, h.id(), idx)
-    _cancel_armed_timer(
+    _cancel_armed_timer[T](
         branches, state, h.id(), out.kind == SelectBranch.RECV and out.closed
     )
     state.winner = idx
@@ -616,7 +633,7 @@ def select_fast[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable, R: Result
 def select[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable, R: ResultValue](
     mut rt: Runtime,
     h: JoinHandle[R],
-    branches: List[SelectBranch],
+    branches: List[SelectBranch[T]],
     mut state: SelectState,
     now_ticks: Int = -1,
 ) raises -> SelectOutcome[T]:
@@ -646,7 +663,7 @@ def select[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable, R: ResultValue
     if idx != -1:
         var out = _claim_at[T](branches, idx)
         _unregister_others[T](branches, h.id(), idx)
-        _cancel_armed_timer(
+        _cancel_armed_timer[T](
             branches, state, h.id(), out.kind == SelectBranch.RECV and out.closed
         )
         state.winner = idx
@@ -704,7 +721,7 @@ def select[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable, R: ResultValue
         if idx2 != -1:
             var out2 = _claim_at[T](branches, idx2)
             _unregister_others[T](branches, h.id(), idx2)
-            _cancel_armed_timer(
+            _cancel_armed_timer[T](
                 branches, state, h.id(), out2.kind == SelectBranch.RECV and out2.closed
             )
             state.winner = idx2
@@ -716,7 +733,7 @@ def select[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable, R: ResultValue
         if idx2 != -1:
             var out2 = _claim_at[T](branches, idx2)
             _unregister_others[T](branches, h.id(), idx2)
-            _cancel_armed_timer(
+            _cancel_armed_timer[T](
                 branches, state, h.id(), out2.kind == SelectBranch.RECV and out2.closed
             )
             state.winner = idx2
