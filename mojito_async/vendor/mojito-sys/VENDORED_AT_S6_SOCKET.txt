@@ -41,3 +41,27 @@ module docblock for the Mojo-side wrapper methods
 
 The Makefile's `mojito_async/vendor/mojito-sys/*.c` wildcard picks this up
 automatically; no Makefile edit needed.
+
+UPDATE (issue #182): mjs_socket.c gained TWO more local-only entry points,
+appended right after mjs_socket_connect_error with their own header
+comment:
+  mjs_socket_set_sndbuf(fd, bytes) — setsockopt(SO_SNDBUF).
+  mjs_socket_set_rcvbuf(fd, bytes) — setsockopt(SO_RCVBUF).
+Both exist so a test can shrink a socket's kernel buffer to a known-small,
+deterministic size instead of depending on the platform's auto-tuned
+default — t44_tcp_read_write_aot scenario B's 512KB write_all needs at
+least one real EAGAIN/EWOULDBLOCK, and the platform default for either
+buffer was sometimes large enough on its own to swallow the whole payload
+in one non-blocking burst (confirmed flaky on this host: 5/20 standalone
+runs of the unmodified binary). Same return contract, same "not
+upstreamed" status as the SO_REUSEADDR/SO_ERROR pair above. Matching
+@extern declarations + probe_* shims live at the end of
+vendor/mojito_sys_io/externs.mojo (own "issue #182 deviation externs"
+block); Mojo-side wrappers are NativeSocket.set_send_buffer_size/
+set_recv_buffer_size (vendor/mojito_sys_io/socket.mojo) plus a
+TcpStream.set_send_buffer_size passthrough (net/tcp_stream.mojo) since
+TcpStream does not otherwise expose its underlying NativeSocket — no
+TcpStream-level recv-buffer passthrough (adversarial review, PR #188):
+t44 scenario B's receive side is a raw NativeSocket, not a TcpStream, so
+nothing calls one; add it once a real caller does.
+VENDORED_EXCEPTIONS.tsv's mjs_socket.c row hash was updated to match.

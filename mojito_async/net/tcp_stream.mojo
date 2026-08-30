@@ -260,6 +260,19 @@ struct TcpStream(Movable):
         no `_current` variant needed."""
         self._sock.shutdown(how)
 
+    def set_send_buffer_size(mut self, bytes: Int32) raises:
+        """Shrink the underlying socket's SO_SNDBUF (issue #182 deviation,
+        vendor/mojito_sys_io/socket.mojo's NativeSocket.set_send_buffer_size)
+        to a known-small size instead of the platform's auto-tuned default.
+        Never parks (SYS-5): a plain setsockopt(2) syscall. No recv-buffer
+        twin here on purpose (adversarial review, PR #188): nothing in this
+        tree calls TcpStream on the receive side of t44 scenario B (the
+        client there is a raw NativeSocket, which has its own
+        set_recv_buffer_size directly) — add one only once a real caller
+        needs it, matching this file's existing discipline against
+        speculative/unexercised surface."""
+        self._sock.set_send_buffer_size(bytes)
+
 
 def create_tcp_stream() raises -> TcpStream:
     """Module factory (b2 forbids `@staticmethod`-as-primary-construction

@@ -46,7 +46,7 @@
 #
 # Files with a canonical counterpart that differ from it:
 mjs_epoll.c	30e1193e166851e712bd2e42cc869f69a131f799e683c8ae4542b8b03e390d7b	intentional spike substrate; frozen ABI integration pending sys#164
-mjs_socket.c	540cfd837a3be48cf02aaeb180c25b6f42c0712536efe265755bd266ac529d3b	intentional spike substrate; frozen ABI integration pending sys#164
+mjs_socket.c	0b6a3bc30df6043f0ab9d8e21da29ef5a8ca64615af6035ab8f2f3b2c08dfba1	intentional spike substrate; frozen ABI integration pending sys#164; issue #182 SO_SNDBUF/SO_RCVBUF deviation added on top
 #
 # Structural sentinels: the spike substrate introduces symbols not in
 # canonical native/ (finding [2]) and the vendored header was taken whole

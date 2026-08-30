@@ -272,6 +272,26 @@ def scenario_write_all(mut rt: Runtime, reactor_ptr: UnsafePointer[Reactor, MutA
     var out_stream = create_tcp_stream()
     var client = _accept_pair(rt, reactor_ptr, PORT_B, out_stream)
 
+    # issue #182: shrink BOTH the writer's SO_SNDBUF and the reader's
+    # SO_RCVBUF to a known-small size before any bytes move. The platform
+    # default for either (auto-tuned by the kernel, host- and
+    # run-to-run-variable — observed empirically to vary enough on this
+    # very host to flip the outcome run-to-run of the SAME binary) can be
+    # large enough on its own to swallow the whole 512KB payload below
+    # without write_all_current ever seeing EAGAIN/EWOULDBLOCK: nothing
+    # drains the client during write_all_current's tight non-blocking
+    # retry loop, so the total bytes it can push in one burst is bounded by
+    # the SENDER's queued-but-unacked capacity (SO_SNDBUF) PLUS however
+    # much the RECEIVER's kernel will buffer before its advertised window
+    # closes (SO_RCVBUF) — either one alone being large enough on this host
+    # was enough to make the whole payload fit without ever parking. Pinning
+    # both to TINY_BUF makes the combined capacity two orders of magnitude
+    # smaller than the payload, so the write is GUARANTEED to park at least
+    # once regardless of platform/host state.
+    comptime TINY_BUF = Int32(8192)
+    out_stream.set_send_buffer_size(TINY_BUF)
+    client.set_recv_buffer_size(TINY_BUF)
+
     comptime N = 512 * 1024
     var payload = List[UInt8]()
     for i in range(N):
