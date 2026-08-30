@@ -144,7 +144,9 @@ struct RecvOutcome[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable](
     PARKED | The task committed to WAITING (channel was empty and open).
              | The dispatcher MUST return immediately so the scheduler can
              | drive other tasks; on resume recv() is re-issued and returns
-             | VALUE or CLOSED.
+             | VALUE, CLOSED, or PARKED again (in multi-consumer scenarios a
+             | competing receiver can steal the woken slot between the wake
+             | and re-entry; dispatchers must loop until is_parked() is False).
     """
 
     comptime VALUE  = Int(0)
