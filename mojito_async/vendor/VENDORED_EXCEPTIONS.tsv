@@ -25,6 +25,10 @@
 #   2. Add a row here: <basename>\t<hash>\t<reason>
 #   3. Re-run check-vendored.sh to confirm the row is accepted.
 #
+# When all vendored files track canonical byte-for-byte, the correct
+# representation of "no exceptions" is an empty data section (no data rows).
+# Do not add a placeholder row; the absence of rows is the sentinel.
+#
 # Rows below record INTENTIONAL divergences for the vendored spike substrate.
 # mojito-async uses the spike substrate by design until the frozen ABI
 # integration is complete (sys#164).  When that integration lands, re-vendor

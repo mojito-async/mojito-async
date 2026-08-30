@@ -53,13 +53,14 @@ if [ -n "${MOJITO_SYS_DIR:-}" ] && [ -d "$MOJITO_SYS_DIR/native" ]; then
 elif [ -d "$REPO_ROOT/../mojito-sys/native" ]; then
     CANON=$(CDPATH= cd -- "$REPO_ROOT/../mojito-sys" && pwd)
 elif command -v gh >/dev/null 2>&1; then
-    CANON=$(mktemp -d) || exit 2
-    if ! gh repo clone mojito-async/mojito-sys "$CANON/mojito-sys" -- --depth 1 -q 2>/dev/null; then
+    CANON_TMP=$(mktemp -d) || exit 2
+    trap 'rm -rf "$CANON_TMP"' EXIT
+    if ! gh repo clone mojito-async/mojito-sys "$CANON_TMP/mojito-sys" -- --depth 1 -q 2>/dev/null; then
         echo "check-vendored.sh: could not obtain canonical mojito-sys"
         echo "       (set MOJITO_SYS_DIR, or place a checkout beside this repo)"
         exit 2
     fi
-    CANON="$CANON/mojito-sys"
+    CANON="$CANON_TMP/mojito-sys"
 else
     echo "check-vendored.sh: no canonical mojito-sys and no gh to fetch one."
     echo "       This is an environment failure, not a pass: an unverified"
