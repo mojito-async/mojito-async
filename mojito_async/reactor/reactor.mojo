@@ -89,6 +89,7 @@ from mojito_async.runtime.join_handle import JoinHandle, SuspendReason
 from mojito_async.runtime.park import park_commit, park_prepare, park_validate, unpark_current
 from mojito_async.runtime.runtime import Nil, Runtime
 from mojito_async.runtime.task_control_block import ResultValue, TaskControlBlock
+from mojito_async.task import claim_running
 from mojito_async.time.deadline import Duration
 from mojito_async.vendor.mojito_sys_io.handle import NativeIoHandle
 from mojito_async.vendor.mojito_sys_io.poller import IoEvent, IoInterest
@@ -206,11 +207,14 @@ struct Reactor(Movable):
             # ever happens post-commit) — the caller's checkpoint/state
             # inspection after this call decides what to do with `token`.
             _ = park_commit(h)
+            claim_running(h)
         else:
             if park_commit(h, SuspendReason.IO):
                 self.attach_waiter(
                     rt, token, Int(h.tcb()), h.id(), h.tcb()[].generation()
                 )
+            else:
+                claim_running(h)
         return token
 
     def unregister(mut self, token: IoToken) raises:
