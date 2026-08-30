@@ -27,9 +27,17 @@ case "$os/$arch" in
 esac
 
 # zstd and unzip are the only external tools needed to unpack the payload.
+# Inside a container this runs as root and there is no sudo; on a runner VM
+# there is sudo and we are not root.  Pick whichever applies rather than
+# assuming either.
+SUDO=""
+if [ "$(id -u)" != "0" ] && command -v sudo >/dev/null 2>&1; then
+    SUDO=sudo
+fi
+
 if ! command -v zstd >/dev/null 2>&1; then
     if command -v apt-get >/dev/null 2>&1; then
-        sudo apt-get update -qq && sudo apt-get install -y -qq zstd unzip
+        $SUDO apt-get update -qq && $SUDO apt-get install -y -qq zstd unzip
     elif command -v brew >/dev/null 2>&1; then
         brew install zstd
     else

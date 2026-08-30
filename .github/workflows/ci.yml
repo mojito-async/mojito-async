@@ -65,7 +65,18 @@ jobs:
     name: suite (Linux x86-64, epoll) — reported, not blocking
     runs-on: ubuntu-latest
     continue-on-error: true
+    # Every Linux step runs INSIDE a container rather than on the runner
+    # image, so the lane is the same environment a developer gets from
+    # tests/docker/run-linux-suite.sh and nothing depends on whatever
+    # ubuntu-latest happens to ship this month.
+    container:
+      image: debian:bookworm
     steps:
+      - name: Container prerequisites
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends \
+            build-essential ca-certificates curl git unzip zstd
       - uses: actions/checkout@v4
       - name: Install Mojo toolchain
         run: ./.github/scripts/install-mojo.sh
