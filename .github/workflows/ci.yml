@@ -10,13 +10,24 @@ name: ci
 #   suite-macos    the real suite on the kqueue/arm64 host — the blocking lane
 #   suite-linux    the epoll/io_uring/x86-64 host, which has NEVER executed
 #
-# suite-linux is reported, not blocking, and deliberately so: mojito-sys#162
-# (epoll probe hang, dropped events after deletion) and #163 (io_uring
-# teardown munmapping address space it does not own) are known-open defects
-# on exactly this platform, and mojito-sys#164 says the substrate the
-# runtime links is a vendored fork that has never been built for it. Its
-# job here is to make that red VISIBLE rather than to pretend it is green.
-# Flip `continue-on-error` off the moment those land.
+# suite-linux is reported, not blocking, and we now know exactly where it
+# stops. It does not reach a single test: `make` fails at
+#
+#   mojito_async/vendor/mojito-sys/aarch64_switch.S:50:
+#     #error "aarch64_switch.S targets Apple arm64 (Mach-O) only"
+#
+# The vendored context-switch assembly is Apple/Mach-O only, so the runtime
+# cannot be BUILT on Linux at all — not on x86-64, and not on Linux/arm64
+# either. Canonical mojito-sys ships ms_context_aarch64.S AND
+# ms_context_x86_64.S and builds there cleanly (92 exported symbols,
+# verified in a container). That is mojito-sys#164 with a sharper edge than
+# the issue states: the fork does not merely shed the frozen ABI's safety
+# properties, it cannot target the platforms canonical already supports.
+#
+# So "the Linux lanes have never executed anywhere" has a cause, and it is
+# not only the absence of CI. mojito-sys#162 and #163 sit behind this too.
+# The lane's job is to keep that visible instead of pretending it is green;
+# flip `continue-on-error` off when the substrate builds.
 
 on:
   push:
