@@ -127,6 +127,96 @@ def _remove_waiter_by_id(mut q: Deque[WaitRecord], task_id: Int) raises -> Bool:
     return found
 
 
+
+# ---------------------------------------------------------------------------
+# RecvOutcome[T] — discriminated recv result (issue #152)
+# ---------------------------------------------------------------------------
+
+struct RecvOutcome[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable](
+    ImplicitlyCopyable, ImplicitlyDeletable, Movable
+):
+    """Discriminated result of a blocking recv() call (issue #152).
+
+    KIND   | Meaning
+    -------+----------------------------------------------------------------
+    VALUE  | A value was received.  Call `value()` to obtain it.
+    CLOSED | The channel is closed-and-empty; no further values will arrive.
+    PARKED | The task committed to WAITING (channel was empty and open).
+             | The dispatcher MUST return immediately so the scheduler can
+             | drive other tasks; on resume recv() is re-issued and returns
+             | VALUE, CLOSED, or PARKED again (in multi-consumer scenarios a
+             | competing receiver can steal the woken slot between the wake
+             | and re-entry; dispatchers must loop until is_parked() is False).
+    """
+
+    comptime VALUE  = Int(0)
+    comptime CLOSED = Int(1)
+    comptime PARKED = Int(2)
+
+    var _kind: Int
+    var _value: Optional[Self.T]
+
+    def __init__(out self, kind: Int):
+        self._kind = kind
+        self._value = Optional[Self.T]()
+
+    def __init__(out self, kind: Int, value: Optional[Self.T]):
+        self._kind = kind
+        self._value = value
+
+    def is_value(self) -> Bool:
+        """True when a value was received (VALUE kind)."""
+        return self._kind == Self.VALUE
+
+    def is_closed(self) -> Bool:
+        """True when the channel is closed-and-empty (CLOSED kind)."""
+        return self._kind == Self.CLOSED
+
+    def is_parked(self) -> Bool:
+        """True when the task parked (PARKED kind).  The dispatcher MUST
+        return immediately; do not inspect the value when is_parked()."""
+        return self._kind == Self.PARKED
+
+    def value(self) raises -> Self.T:
+        """Return the received value.  Raises unless `is_value()` is True."""
+        if self._kind != Self.VALUE:
+            raise Error("RecvOutcome: expected VALUE, got kind "
+                        + String(self._kind))
+        return self._value.value()
+
+
+# ---------------------------------------------------------------------------
+# SendOutcome — discriminated send result (issue #152)
+# ---------------------------------------------------------------------------
+
+struct SendOutcome(ImplicitlyCopyable, ImplicitlyDeletable, Movable):
+    """Discriminated result of a blocking send() call (issue #152).
+
+    KIND   | Meaning
+    -------+----------------------------------------------------------------
+    SENT   | The item was delivered (buffered in the ring or handed off).
+    PARKED | The task committed to WAITING (ring was full).
+             | The dispatcher MUST return immediately; on resume send() is
+             | re-issued with the SAME item and returns SENT.
+    """
+
+    comptime SENT   = Int(0)
+    comptime PARKED = Int(1)
+
+    var _kind: Int
+
+    def __init__(out self, kind: Int):
+        self._kind = kind
+
+    def is_sent(self) -> Bool:
+        """True when the item was delivered (SENT kind)."""
+        return self._kind == Self.SENT
+
+    def is_parked(self) -> Bool:
+        """True when the task parked (PARKED kind).  The dispatcher MUST
+        return immediately."""
+        return self._kind == Self.PARKED
+
 # ---------------------------------------------------------------------------
 # Channel[T] — shared ring + wait queues + closed flags
 # ---------------------------------------------------------------------------
@@ -324,7 +414,7 @@ struct Channel[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable]:
 
     def send[R: ResultValue](
         mut self, mut rt: Runtime, h: JoinHandle[R], item: Self.T
-    ) raises:
+    ) raises -> SendOutcome:
         """One-shot send of the current task (issued by a Sender).
 
         Fast path: ring not full — buffer the item, and if a receiver is
@@ -359,7 +449,7 @@ struct Channel[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable]:
                     _ = self._recv_waiters.popleft()
                     self._to_wake.append(w)
                 self._guard.unlock()
-                return
+                return SendOutcome(SendOutcome.SENT)
             self._register_sender_locked(h)
             self._guard.unlock()
             park_prepare(h)
@@ -372,11 +462,11 @@ struct Channel[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable]:
                 claim_running(h)
                 raise_if_cancel_wake(h)
                 continue
-            return
+            return SendOutcome(SendOutcome.PARKED)
 
     def recv[R: ResultValue](
         mut self, mut rt: Runtime, h: JoinHandle[R]
-    ) raises -> Optional[Self.T]:
+    ) raises -> RecvOutcome[Self.T]:
         """One-shot receive of the current task (issued by a Receiver).
 
         Fast path (§40.1): ring non-empty — move the OLDEST value out and
@@ -395,10 +485,10 @@ struct Channel[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable]:
                     _ = self._send_waiters.popleft()
                     self._to_wake.append(w)
                 self._guard.unlock()
-                return Optional[Self.T](v)
+                return RecvOutcome[Self.T](RecvOutcome.VALUE, Optional[Self.T](v))
             if self._send_closed or self._recv_closed:
                 self._guard.unlock()
-                return Optional[Self.T]()
+                return RecvOutcome[Self.T](RecvOutcome.CLOSED)
             self._register_receiver_locked(h)
             self._guard.unlock()
             park_prepare(h)
@@ -411,13 +501,13 @@ struct Channel[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable]:
                 claim_running(h)
                 raise_if_cancel_wake(h)
                 continue
-            return Optional[Self.T]()
+            return RecvOutcome[Self.T](RecvOutcome.PARKED)
 
     # --- token-aware slow paths (A4.3, issue #57) ---------------------------
 
     def send_cancellable[R: ResultValue](
         mut self, mut rt: Runtime, h: JoinHandle[R], item: Self.T, token: CancellationToken,
-    ) raises:
+    ) raises -> SendOutcome:
         """Token-aware send.  Identical to `send()` on every readiness path
         (fast buffer, contended park, re-entry); the ONLY addition is the C6
         winner check this waiter's own resume carries: raises ONLY when
@@ -427,11 +517,11 @@ struct Channel[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable]:
         raise_if_cancel_wake(h)
         if token.is_cancellation_requested():
             raise Error("CancellationError: channel send cancelled")
-        self.send(rt, h, item)
+        return self.send(rt, h, item)
 
     def recv_cancellable[R: ResultValue](
         mut self, mut rt: Runtime, h: JoinHandle[R], token: CancellationToken,
-    ) raises -> Optional[Self.T]:
+    ) raises -> RecvOutcome[Self.T]:
         """Token-aware receive.  Identical to `recv()` on every readiness
         path; raises ONLY when THIS waiter's `cancel_recv_wait` won the
         race (never when a value arrived first)."""
@@ -645,17 +735,17 @@ struct Sender[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable](
 
     def send[R: ResultValue](
         mut self, mut rt: Runtime, h: JoinHandle[R], item: Self.T
-    ) raises:
+    ) raises -> SendOutcome:
         if self._closed:
             raise Error("ChannelError: send on closed channel")
-        self._chan[].send(rt, h, item)
+        return self._chan[].send(rt, h, item)
 
     def send_cancellable[R: ResultValue](
         mut self, mut rt: Runtime, h: JoinHandle[R], item: Self.T, token: CancellationToken,
-    ) raises:
+    ) raises -> SendOutcome:
         if self._closed:
             raise Error("ChannelError: send on closed channel")
-        self._chan[].send_cancellable(rt, h, item, token)
+        return self._chan[].send_cancellable(rt, h, item, token)
 
     def cancel_send_wait[R: ResultValue](
         mut self, mut rt: Runtime, h: JoinHandle[R]
@@ -697,12 +787,12 @@ struct Receiver[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable](
 
     def recv[R: ResultValue](
         mut self, mut rt: Runtime, h: JoinHandle[R]
-    ) raises -> Optional[Self.T]:
+    ) raises -> RecvOutcome[Self.T]:
         return self._chan[].recv(rt, h)
 
     def recv_cancellable[R: ResultValue](
         mut self, mut rt: Runtime, h: JoinHandle[R], token: CancellationToken,
-    ) raises -> Optional[Self.T]:
+    ) raises -> RecvOutcome[Self.T]:
         return self._chan[].recv_cancellable(rt, h, token)
 
     def cancel_recv_wait[R: ResultValue](

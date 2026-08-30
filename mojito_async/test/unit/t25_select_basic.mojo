@@ -68,7 +68,7 @@ def _complete(h: JoinHandle[IntResult], res: Int) raises:
 struct Scene(ImplicitlyCopyable, ImplicitlyDeletable):
     var chan_0: UnsafePointer[Channel[Int], MutAnyOrigin]
     var chan_1: UnsafePointer[Channel[Int], MutAnyOrigin]
-    var branches: UnsafePointer[List[SelectBranch], MutAnyOrigin]
+    var branches: UnsafePointer[List[SelectBranch[Int]], MutAnyOrigin]
     var state: UnsafePointer[SelectState, MutAnyOrigin]
     var sel_id: Int
     var winner: UnsafePointer[Int, MutAnyOrigin]
@@ -77,7 +77,7 @@ struct Scene(ImplicitlyCopyable, ImplicitlyDeletable):
     def __init__(out self):
         self.chan_0 = UnsafePointer[Channel[Int], MutAnyOrigin](unsafe_from_address=1)
         self.chan_1 = UnsafePointer[Channel[Int], MutAnyOrigin](unsafe_from_address=1)
-        self.branches = UnsafePointer[List[SelectBranch], MutAnyOrigin](unsafe_from_address=1)
+        self.branches = UnsafePointer[List[SelectBranch[Int]], MutAnyOrigin](unsafe_from_address=1)
         self.state = UnsafePointer[SelectState, MutAnyOrigin](unsafe_from_address=1)
         self.sel_id = 0
         self.winner = UnsafePointer[Int, MutAnyOrigin](unsafe_from_address=1)
@@ -124,7 +124,7 @@ def main() raises:
     var chB1 = make_channel[Int](2)
     if not chB1.try_send(42):
         red("S1: prefill failed")
-    var branches1 = List[SelectBranch]()
+    var branches1 = List[SelectBranch[Int]]()
     branches1.append(recv_branch[Int](UnsafePointer[Channel[Int], MutAnyOrigin](to=chA1)))
     branches1.append(recv_branch[Int](UnsafePointer[Channel[Int], MutAnyOrigin](to=chB1)))
     var st1 = SelectState()
@@ -149,7 +149,7 @@ def main() raises:
     var chB2 = make_channel[Int](2)
     if not chA2.try_send(10) or not chB2.try_send(20):
         red("S2: prefill failed")
-    var branches2 = List[SelectBranch]()
+    var branches2 = List[SelectBranch[Int]]()
     branches2.append(recv_branch[Int](UnsafePointer[Channel[Int], MutAnyOrigin](to=chA2)))
     branches2.append(recv_branch[Int](UnsafePointer[Channel[Int], MutAnyOrigin](to=chB2)))
     var st2 = SelectState()
@@ -166,14 +166,14 @@ def main() raises:
     var rt3 = create()
     var chA3 = make_channel[Int](2)
     var chB3 = make_channel[Int](2)
-    var branches3 = List[SelectBranch]()
+    var branches3 = List[SelectBranch[Int]]()
     branches3.append(recv_branch[Int](UnsafePointer[Channel[Int], MutAnyOrigin](to=chA3)))
     branches3.append(recv_branch[Int](UnsafePointer[Channel[Int], MutAnyOrigin](to=chB3)))
     var state3 = SelectState()
     var sc3 = Scene()
     sc3.chan_0 = UnsafePointer[Channel[Int], MutAnyOrigin](to=chA3)
     sc3.chan_1 = UnsafePointer[Channel[Int], MutAnyOrigin](to=chB3)
-    sc3.branches = UnsafePointer[List[SelectBranch], MutAnyOrigin](to=branches3)
+    sc3.branches = UnsafePointer[List[SelectBranch[Int]], MutAnyOrigin](to=branches3)
     sc3.state = UnsafePointer[SelectState, MutAnyOrigin](to=state3)
     var winner3 = Int(-1)
     var value3 = Int(-1)
@@ -227,7 +227,7 @@ def main() raises:
     if not chD4.try_send(0):
         red("S4: prefill of D failed")  # D starts FULL -> SEND branch BLOCKED
     var item4 = Int(55)
-    var branches4 = List[SelectBranch]()
+    var branches4 = List[SelectBranch[Int]]()
     branches4.append(recv_branch[Int](UnsafePointer[Channel[Int], MutAnyOrigin](to=chC4)))
     branches4.append(
         send_branch[Int](
@@ -239,7 +239,7 @@ def main() raises:
     var sc4 = Scene()
     sc4.chan_0 = UnsafePointer[Channel[Int], MutAnyOrigin](to=chC4)
     sc4.chan_1 = UnsafePointer[Channel[Int], MutAnyOrigin](to=chD4)
-    sc4.branches = UnsafePointer[List[SelectBranch], MutAnyOrigin](to=branches4)
+    sc4.branches = UnsafePointer[List[SelectBranch[Int]], MutAnyOrigin](to=branches4)
     sc4.state = UnsafePointer[SelectState, MutAnyOrigin](to=state4)
     var winner4 = Int(-1)
     var value4 = Int(-1)

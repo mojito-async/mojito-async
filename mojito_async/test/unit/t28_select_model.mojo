@@ -72,7 +72,7 @@ def _complete(h: JoinHandle[IntResult], res: Int) raises:
 struct Scene(ImplicitlyCopyable, ImplicitlyDeletable):
     var chan_0: UnsafePointer[Channel[Int], MutAnyOrigin]
     var chan_1: UnsafePointer[Channel[Int], MutAnyOrigin]
-    var branches: UnsafePointer[List[SelectBranch], MutAnyOrigin]
+    var branches: UnsafePointer[List[SelectBranch[Int]], MutAnyOrigin]
     var state: UnsafePointer[SelectState, MutAnyOrigin]
     var sel_id: Int
     var run_count: UnsafePointer[Int, MutAnyOrigin]  # body-entry count (stale-wake guard)
@@ -85,7 +85,7 @@ struct Scene(ImplicitlyCopyable, ImplicitlyDeletable):
     def __init__(out self):
         self.chan_0 = UnsafePointer[Channel[Int], MutAnyOrigin](unsafe_from_address=1)
         self.chan_1 = UnsafePointer[Channel[Int], MutAnyOrigin](unsafe_from_address=1)
-        self.branches = UnsafePointer[List[SelectBranch], MutAnyOrigin](unsafe_from_address=1)
+        self.branches = UnsafePointer[List[SelectBranch[Int]], MutAnyOrigin](unsafe_from_address=1)
         self.state = UnsafePointer[SelectState, MutAnyOrigin](unsafe_from_address=1)
         self.sel_id = 0
         self.run_count = UnsafePointer[Int, MutAnyOrigin](unsafe_from_address=1)
@@ -171,14 +171,14 @@ def main() raises:
     var rt1 = create()
     var chan0_1 = make_channel[Int](2)
     var chan1_1 = make_channel[Int](2)
-    var branches1 = List[SelectBranch]()
+    var branches1 = List[SelectBranch[Int]]()
     branches1.append(recv_branch[Int](UnsafePointer[Channel[Int], MutAnyOrigin](to=chan0_1)))
     branches1.append(recv_branch[Int](UnsafePointer[Channel[Int], MutAnyOrigin](to=chan1_1)))
     var state1 = SelectState()
     var sc1 = Scene()
     sc1.chan_0 = UnsafePointer[Channel[Int], MutAnyOrigin](to=chan0_1)
     sc1.chan_1 = UnsafePointer[Channel[Int], MutAnyOrigin](to=chan1_1)
-    sc1.branches = UnsafePointer[List[SelectBranch], MutAnyOrigin](to=branches1)
+    sc1.branches = UnsafePointer[List[SelectBranch[Int]], MutAnyOrigin](to=branches1)
     sc1.state = UnsafePointer[SelectState, MutAnyOrigin](to=state1)
     var run1 = Int(0)
     var winner1 = Int(-1)
@@ -228,14 +228,14 @@ def main() raises:
     var rt2 = create()
     var chan0_2 = make_channel[Int](2)
     var chan1_2 = make_channel[Int](2)
-    var branches2 = List[SelectBranch]()
+    var branches2 = List[SelectBranch[Int]]()
     branches2.append(recv_branch[Int](UnsafePointer[Channel[Int], MutAnyOrigin](to=chan0_2)))
     branches2.append(recv_branch[Int](UnsafePointer[Channel[Int], MutAnyOrigin](to=chan1_2)))
     var state2 = SelectState()
     var sc2 = Scene()
     sc2.chan_0 = UnsafePointer[Channel[Int], MutAnyOrigin](to=chan0_2)
     sc2.chan_1 = UnsafePointer[Channel[Int], MutAnyOrigin](to=chan1_2)
-    sc2.branches = UnsafePointer[List[SelectBranch], MutAnyOrigin](to=branches2)
+    sc2.branches = UnsafePointer[List[SelectBranch[Int]], MutAnyOrigin](to=branches2)
     sc2.state = UnsafePointer[SelectState, MutAnyOrigin](to=state2)
     var run2 = Int(0)
     var winner2 = Int(-1)
@@ -288,14 +288,14 @@ def main() raises:
     var rt3 = create()
     var chan0_3 = make_channel[Int](2)   # never gets data this scenario
     var chan1_3 = make_channel[Int](2)   # unused second slot (dispatch drains both)
-    var branches3 = List[SelectBranch]()
+    var branches3 = List[SelectBranch[Int]]()
     branches3.append(recv_branch[Int](UnsafePointer[Channel[Int], MutAnyOrigin](to=chan0_3)))
-    branches3.append(deadline_branch(hp3, clock3, Deadline(1)))  # 1ms
+    branches3.append(deadline_branch[Int](hp3, clock3, Deadline(1)))  # 1ms
     var state3 = SelectState()
     var sc3 = Scene()
     sc3.chan_0 = UnsafePointer[Channel[Int], MutAnyOrigin](to=chan0_3)
     sc3.chan_1 = UnsafePointer[Channel[Int], MutAnyOrigin](to=chan1_3)
-    sc3.branches = UnsafePointer[List[SelectBranch], MutAnyOrigin](to=branches3)
+    sc3.branches = UnsafePointer[List[SelectBranch[Int]], MutAnyOrigin](to=branches3)
     sc3.state = UnsafePointer[SelectState, MutAnyOrigin](to=state3)
     var run3 = Int(0)
     var winner3 = Int(-1)
@@ -347,14 +347,14 @@ def main() raises:
     var chan0_4 = make_channel[Int](2)
     var chan1_4 = make_channel[Int](2)
     var tx1_4 = chan1_4.sender()
-    var branches4 = List[SelectBranch]()
+    var branches4 = List[SelectBranch[Int]]()
     branches4.append(recv_branch[Int](UnsafePointer[Channel[Int], MutAnyOrigin](to=chan0_4)))
     branches4.append(recv_branch[Int](UnsafePointer[Channel[Int], MutAnyOrigin](to=chan1_4)))
     var state4 = SelectState()
     var sc4 = Scene()
     sc4.chan_0 = UnsafePointer[Channel[Int], MutAnyOrigin](to=chan0_4)
     sc4.chan_1 = UnsafePointer[Channel[Int], MutAnyOrigin](to=chan1_4)
-    sc4.branches = UnsafePointer[List[SelectBranch], MutAnyOrigin](to=branches4)
+    sc4.branches = UnsafePointer[List[SelectBranch[Int]], MutAnyOrigin](to=branches4)
     sc4.state = UnsafePointer[SelectState, MutAnyOrigin](to=state4)
     var run4 = Int(0)
     var winner4 = Int(-1)

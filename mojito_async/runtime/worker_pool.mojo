@@ -569,6 +569,11 @@ struct WorkerPool:
     def worker_count(self) -> Int:
         return self._config.worker_count
 
+    def tracing_enabled(self) -> Bool:
+        """Whether scheduler tracing instrumentation is on (RuntimeConfig
+        spec §89 — consumed by E-lane tracing hooks when wired)."""
+        return self._config.enable_tracing
+
     def started(self) -> Bool:
         return self._started
 
