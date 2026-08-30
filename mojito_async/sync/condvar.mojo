@@ -315,20 +315,30 @@ struct Condvar:
 
         The FIFO search + removal is ONE guarded critical section (issue
         #148): _w_tcb/_w_id are shared with notify_one/notify_all on
-        another worker."""
+        another worker. The stamp+wake happens AFTER _guard releases (issue
+        #173) — notify_marker's unpark_current chains to an OS wake
+        syscall, and holding the FIFO lock across it forces any concurrent
+        cancel_waiter/timeout_waiter/notify_one/notify_all on another
+        worker to spin for the syscall's duration; mirrors mutex.unlock()'s
+        pop-under-lock-then-handoff-outside-it shape."""
         self._guard.lock()
         var n = len(self._w_tcb)
         var found = False
+        var winner_tcb = 0
+        var winner_tid = 0
         for _ in range(n):
             var tcb = self._w_tcb.popleft()
             var tid = self._w_id.popleft()
             if tid == h.id() and not found:
                 found = True
-                notify_marker[R](rt, tcb, tid, WINNER_CANCELLED)
+                winner_tcb = tcb
+                winner_tid = tid
             else:
                 self._w_tcb.append(tcb)
                 self._w_id.append(tid)
         self._guard.unlock()
+        if found:
+            notify_marker[R](rt, winner_tcb, winner_tid, WINNER_CANCELLED)
         return found
 
     def timeout_waiter[R: ResultValue](
@@ -337,18 +347,24 @@ struct Condvar:
         """Claim `h`'s winner marker as TIMEOUT and remove it from the FIFO.
         Idempotent: False when `h` already left the FIFO.
 
-        Guarded by _guard (issue #148) — mirrors cancel_waiter."""
+        Guarded by _guard (issue #148) — mirrors cancel_waiter, including
+        deferring the stamp+wake until after _guard releases (issue #173)."""
         self._guard.lock()
         var n = len(self._w_tcb)
         var found = False
+        var winner_tcb = 0
+        var winner_tid = 0
         for _ in range(n):
             var tcb = self._w_tcb.popleft()
             var tid = self._w_id.popleft()
             if tid == h.id() and not found:
                 found = True
-                notify_marker[R](rt, tcb, tid, WINNER_TIMEOUT)
+                winner_tcb = tcb
+                winner_tid = tid
             else:
                 self._w_tcb.append(tcb)
                 self._w_id.append(tid)
         self._guard.unlock()
+        if found:
+            notify_marker[R](rt, winner_tcb, winner_tid, WINNER_TIMEOUT)
         return found
