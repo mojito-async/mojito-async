@@ -18,6 +18,5 @@
 # carried a real use-after-free into main: PR #136 dismissed a reproducible
 # post-PASS SIGSEGV as covered by it, and PR #139 root-caused the SIGSEGV as
 # a genuine UAF. The row is gone and the gate is per-driver now.
-t47_pool_scheduler_aot	https://github.com/mojito-async/mojito-async/issues/140	2026-08-30
-t51_default_o_repeat	https://github.com/mojito-async/mojito-async/issues/140	2026-08-30
-t58_stack_registry_aot	https://github.com/mojito-async/mojito-async/issues/140	2026-08-30
+t51_default_o_repeat	https://github.com/mojito-async/mojito-async/issues/190	2026-08-30
+t58_stack_registry_aot	https://github.com/mojito-async/mojito-async/issues/191	2026-08-30
