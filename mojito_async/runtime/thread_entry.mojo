@@ -583,7 +583,7 @@ def pool_worker_loop_scheduled[
             if consecutive_faults > 10:
                 raise Error(
                     "worker fault threshold exceeded (10 consecutive): "
-                    + str(e)
+                    + String(e)
                 )
             continue
         consecutive_faults = 0  # reset on each successful dispatch iteration
