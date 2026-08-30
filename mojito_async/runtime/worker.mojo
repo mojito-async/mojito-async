@@ -151,9 +151,9 @@ struct Worker:
         the loop and adds the remote-ready queue).  Included here because
         the E4 steal probe sits exactly after local/remote/inject in the
         §21 order.  None when the deque is empty."""
-        if self._runtime.local_queue()[].is_empty():
-            return Optional[TaskRecord]()
-        return Optional[TaskRecord](self._runtime.local_queue()[].pop_back())
+        # issue #144: atomic check-and-pop via try_pop_local — eliminates the
+        # TOCTOU between the separate is_empty() probe and pop_back() call.
+        return self._runtime.try_pop_local()
 
     def request_steal[R: ResultValue = Nil](
         mut self, target: Int
@@ -181,9 +181,14 @@ struct Worker:
             return Optional[TaskRecord]()
         var peer = self._peers[target]
         var peer_deque = peer[]._runtime.local_queue()
-        if peer_deque[].is_empty():
+        # issue #144: atomic check-and-steal via try_steal_front — eliminates
+        # the TOCTOU between the separate is_empty() probe and steal_front()
+        # call (a concurrent owner-pop in that window made this function raise,
+        # killing the thief's worker thread in production).
+        var steal_opt = peer_deque[].try_steal_front()
+        if not steal_opt:
             return Optional[TaskRecord]()
-        var r = peer_deque[].steal_front()
+        var r = steal_opt.value()
         var checker = UnsafePointer[TaskControlBlock[R], MutAnyOrigin](
             unsafe_from_address=r.tcb_addr
         )
