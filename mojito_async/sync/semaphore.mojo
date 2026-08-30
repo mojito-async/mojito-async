@@ -46,9 +46,6 @@ from mojito_async.runtime.park import (
 from mojito_async.cancellation import CancellationToken
 
 
-comptime PERMIT_GRANTED = Int(1)
-
-
 def _perm_waiter_handle[R: ResultValue](
     tcb_addr: Int, tid: Int
 ) -> JoinHandle[R]:
@@ -157,7 +154,7 @@ struct Semaphore:
         are ONE guarded critical section (A4.1, issue #55) — see Mutex.lock
         for why two separately-guarded calls would be unsafe here.
         """
-        if h.tcb()[].wait_node()[].next() == PERMIT_GRANTED:
+        if h.tcb()[].wait_node()[].next() == Int(UnsafePointer[Self, MutAnyOrigin](to=self)):
             h.tcb()[].wait_node()[].set_next(0)
             return True
         self._guard.lock()
@@ -204,14 +201,14 @@ struct Semaphore:
                 self._permits -= need
                 self._guard.unlock()
                 var hw = _perm_waiter_handle[R](tcb, tid)
-                hw.tcb()[].wait_node()[].set_next(PERMIT_GRANTED)
+                hw.tcb()[].wait_node()[].set_next(Int(UnsafePointer[Self, MutAnyOrigin](to=self)))
                 unpark_current(rt, hw)
                 return True
         self._guard.unlock()
         return False
 
-    def is_granted[R: ResultValue](self, h: JoinHandle[R]) -> Bool:
-        return h.tcb()[].wait_node()[].next() == PERMIT_GRANTED
+    def is_granted[R: ResultValue](mut self, h: JoinHandle[R]) -> Bool:
+        return h.tcb()[].wait_node()[].next() == Int(UnsafePointer[Self, MutAnyOrigin](to=self))
 
     # --- token-aware acquire (A4.3, issue #57) ------------------------------
 
