@@ -73,7 +73,7 @@ def _complete(h: JoinHandle[IntResult], res: Int) raises:
 
 struct Scene(ImplicitlyCopyable, ImplicitlyDeletable):
     var chan: UnsafePointer[Channel[Int], MutAnyOrigin]
-    var branches: UnsafePointer[List[SelectBranch], MutAnyOrigin]
+    var branches: UnsafePointer[List[SelectBranch[Int]], MutAnyOrigin]
     var state: UnsafePointer[SelectState, MutAnyOrigin]
     var sel_id: Int
     var winner: UnsafePointer[Int, MutAnyOrigin]
@@ -83,7 +83,7 @@ struct Scene(ImplicitlyCopyable, ImplicitlyDeletable):
 
     def __init__(out self):
         self.chan = UnsafePointer[Channel[Int], MutAnyOrigin](unsafe_from_address=1)
-        self.branches = UnsafePointer[List[SelectBranch], MutAnyOrigin](unsafe_from_address=1)
+        self.branches = UnsafePointer[List[SelectBranch[Int]], MutAnyOrigin](unsafe_from_address=1)
         self.state = UnsafePointer[SelectState, MutAnyOrigin](unsafe_from_address=1)
         self.sel_id = 0
         self.winner = UnsafePointer[Int, MutAnyOrigin](unsafe_from_address=1)
@@ -133,9 +133,9 @@ def main() raises:
     clock_cell1[0] = 1000
     var clock1 = MonotonicClock(UnsafePointer[UInt64, MutAnyOrigin](to=clock_cell1[0]))
     var chan1 = make_channel[Int](2)  # stays empty: the deadline must win
-    var branches1 = List[SelectBranch]()
+    var branches1 = List[SelectBranch[Int]]()
     branches1.append(recv_branch[Int](UnsafePointer[Channel[Int], MutAnyOrigin](to=chan1)))
-    branches1.append(deadline_branch(hp1, clock1, Deadline(0)))  # already past clock1 (1000)
+    branches1.append(deadline_branch[Int](hp1, clock1, Deadline(0)))  # already past clock1 (1000)
     var st1 = SelectState()
     var rt1 = create()
     var t1 = TB.create()
@@ -160,14 +160,14 @@ def main() raises:
     clock_cell2[0] = 0
     var clock2 = MonotonicClock(UnsafePointer[UInt64, MutAnyOrigin](to=clock_cell2[0]))
     var chan2 = make_channel[Int](2)  # starts empty -> RECV branch BLOCKED
-    var branches2 = List[SelectBranch]()
+    var branches2 = List[SelectBranch[Int]]()
     branches2.append(recv_branch[Int](UnsafePointer[Channel[Int], MutAnyOrigin](to=chan2)))
-    branches2.append(deadline_branch(hp2, clock2, Deadline(1000)))  # far future -> BLOCKED
+    branches2.append(deadline_branch[Int](hp2, clock2, Deadline(1000)))  # far future -> BLOCKED
     var state2 = SelectState()
     var rt2 = create()
     var sc2 = Scene()
     sc2.chan = UnsafePointer[Channel[Int], MutAnyOrigin](to=chan2)
-    sc2.branches = UnsafePointer[List[SelectBranch], MutAnyOrigin](to=branches2)
+    sc2.branches = UnsafePointer[List[SelectBranch[Int]], MutAnyOrigin](to=branches2)
     sc2.state = UnsafePointer[SelectState, MutAnyOrigin](to=state2)
     var winner2 = Int(-1)
     var timed_out2 = Int(-1)
@@ -234,14 +234,14 @@ def main() raises:
     clock_cell3[0] = 0
     var clock3 = MonotonicClock(UnsafePointer[UInt64, MutAnyOrigin](to=clock_cell3[0]))
     var chan3 = make_channel[Int](2)  # stays empty for the whole scenario
-    var branches3 = List[SelectBranch]()
+    var branches3 = List[SelectBranch[Int]]()
     branches3.append(recv_branch[Int](UnsafePointer[Channel[Int], MutAnyOrigin](to=chan3)))
-    branches3.append(deadline_branch(hp3, clock3, Deadline(1)))  # 1ms = 1_000_000 ticks
+    branches3.append(deadline_branch[Int](hp3, clock3, Deadline(1)))  # 1ms = 1_000_000 ticks
     var state3 = SelectState()
     var rt3 = create()
     var sc3 = Scene()
     sc3.chan = UnsafePointer[Channel[Int], MutAnyOrigin](to=chan3)
-    sc3.branches = UnsafePointer[List[SelectBranch], MutAnyOrigin](to=branches3)
+    sc3.branches = UnsafePointer[List[SelectBranch[Int]], MutAnyOrigin](to=branches3)
     sc3.state = UnsafePointer[SelectState, MutAnyOrigin](to=state3)
     var winner3 = Int(-1)
     var timed_out3 = Int(-1)
@@ -303,9 +303,9 @@ def main() raises:
     var chan4a = make_channel[Int](2)
     if not chan4a.try_send(7):
         red("S4a: prefill failed")
-    var branches4a = List[SelectBranch]()
+    var branches4a = List[SelectBranch[Int]]()
     branches4a.append(recv_branch[Int](UnsafePointer[Channel[Int], MutAnyOrigin](to=chan4a)))
-    branches4a.append(deadline_branch(hp4a, clock4a, Deadline(9)))  # 9ms == clock4a exactly
+    branches4a.append(deadline_branch[Int](hp4a, clock4a, Deadline(9)))  # 9ms == clock4a exactly
     var st4a = SelectState()
     var rt4 = create()
     var t4 = TB.create()
@@ -325,8 +325,8 @@ def main() raises:
     var chan4b = make_channel[Int](2)
     if not chan4b.try_send(8):
         red("S4b: prefill failed")
-    var branches4b = List[SelectBranch]()
-    branches4b.append(deadline_branch(hp4b, clock4b, Deadline(9)))  # 9ms == clock4b exactly
+    var branches4b = List[SelectBranch[Int]]()
+    branches4b.append(deadline_branch[Int](hp4b, clock4b, Deadline(9)))  # 9ms == clock4b exactly
     branches4b.append(recv_branch[Int](UnsafePointer[Channel[Int], MutAnyOrigin](to=chan4b)))
     var st4b = SelectState()
     var out4b = select_fast[Int, IntResult](rt4, h4, branches4b, st4b, Int(clock4b.now()))
