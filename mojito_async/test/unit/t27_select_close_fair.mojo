@@ -43,7 +43,7 @@ def main() raises:
     tx1.close()  # last (only) sender -> send side closes; ring stays empty
     if not ch1.is_closed():
         red("S1: channel must report closed after last-sender close")
-    var branches1 = List[SelectBranch]()
+    var branches1 = List[SelectBranch[Int]]()
     branches1.append(recv_branch[Int](UnsafePointer[Channel[Int], MutAnyOrigin](to=ch1)))
     var st1 = SelectState()
     var out1 = select_fast[Int, IntResult](rt, h, branches1, st1)
@@ -65,7 +65,7 @@ def main() raises:
         red("S2: channel must report closed after last-receiver close")
     var item2 = Int(1)
     var chOpen2 = make_channel[Int](2)  # open, empty -> genuinely BLOCKED
-    var branches2 = List[SelectBranch]()
+    var branches2 = List[SelectBranch[Int]]()
     branches2.append(
         send_branch[Int](
             UnsafePointer[Channel[Int], MutAnyOrigin](to=ch2),
@@ -86,7 +86,7 @@ def main() raises:
     var chData3 = make_channel[Int](2)
     if not chData3.try_send(7):
         red("S3: prefill failed")
-    var branchesA = List[SelectBranch]()
+    var branchesA = List[SelectBranch[Int]]()
     branchesA.append(recv_branch[Int](UnsafePointer[Channel[Int], MutAnyOrigin](to=chClosed3)))
     branchesA.append(recv_branch[Int](UnsafePointer[Channel[Int], MutAnyOrigin](to=chData3)))
     var stA = SelectState()
@@ -100,7 +100,7 @@ def main() raises:
     var chClosed3b = make_channel[Int](2)
     var txClosed3b = chClosed3b.sender()
     txClosed3b.close()
-    var branchesB = List[SelectBranch]()
+    var branchesB = List[SelectBranch[Int]]()
     branchesB.append(recv_branch[Int](UnsafePointer[Channel[Int], MutAnyOrigin](to=chData3b)))
     branchesB.append(recv_branch[Int](UnsafePointer[Channel[Int], MutAnyOrigin](to=chClosed3b)))
     var stB = SelectState()
@@ -114,7 +114,7 @@ def main() raises:
     var chL = make_channel[Int](4)
     if not chR.try_send(100) or not chL.try_send(200):
         red("S4: prefill failed")
-    var branches4 = List[SelectBranch]()
+    var branches4 = List[SelectBranch[Int]]()
     branches4.append(recv_branch[Int](UnsafePointer[Channel[Int], MutAnyOrigin](to=chR)))
     branches4.append(recv_branch[Int](UnsafePointer[Channel[Int], MutAnyOrigin](to=chL)))
     var st4 = SelectState()

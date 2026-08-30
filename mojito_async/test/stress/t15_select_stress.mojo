@@ -69,7 +69,7 @@ struct Scene(ImplicitlyCopyable, ImplicitlyDeletable):
     var chan_0: UnsafePointer[Channel[Int], MutAnyOrigin]
     var chan_1: UnsafePointer[Channel[Int], MutAnyOrigin]
     var chan_2: UnsafePointer[Channel[Int], MutAnyOrigin]
-    var branches: UnsafePointer[List[SelectBranch], MutAnyOrigin]  # K-element array
+    var branches: UnsafePointer[List[SelectBranch[Int]], MutAnyOrigin]  # K-element array
     var states: UnsafePointer[SelectState, MutAnyOrigin]           # K-element array
     var winners: UnsafePointer[Int, MutAnyOrigin]                  # K-element array
     var values: UnsafePointer[Int, MutAnyOrigin]                   # K-element array
@@ -80,7 +80,7 @@ struct Scene(ImplicitlyCopyable, ImplicitlyDeletable):
         self.chan_0 = UnsafePointer[Channel[Int], MutAnyOrigin](unsafe_from_address=1)
         self.chan_1 = UnsafePointer[Channel[Int], MutAnyOrigin](unsafe_from_address=1)
         self.chan_2 = UnsafePointer[Channel[Int], MutAnyOrigin](unsafe_from_address=1)
-        self.branches = UnsafePointer[List[SelectBranch], MutAnyOrigin](unsafe_from_address=1)
+        self.branches = UnsafePointer[List[SelectBranch[Int]], MutAnyOrigin](unsafe_from_address=1)
         self.states = UnsafePointer[SelectState, MutAnyOrigin](unsafe_from_address=1)
         self.winners = UnsafePointer[Int, MutAnyOrigin](unsafe_from_address=1)
         self.values = UnsafePointer[Int, MutAnyOrigin](unsafe_from_address=1)
@@ -98,7 +98,7 @@ def dispatch(mut rt: Runtime, tcb_addr: Int, tid: Int, ud: BytePtr) raises -> In
     sc[].run_counts[idx] = sc[].run_counts[idx] + 1
     var out = select[Int, IntResult](
         rt, h,
-        UnsafePointer[List[SelectBranch], MutAnyOrigin](to=sc[].branches[idx])[],
+        UnsafePointer[List[SelectBranch[Int]], MutAnyOrigin](to=sc[].branches[idx])[],
         UnsafePointer[SelectState, MutAnyOrigin](to=sc[].states[idx])[],
         sc[].now_ticks,
     )
@@ -150,14 +150,14 @@ def main() raises:
     # this run) rides alongside the three RECV branches so every task's
     # park exercises a REAL heap arm (issue #91) that the winning channel
     # claim must cancel.
-    var branches_store = List[List[SelectBranch]]()
+    var branches_store = List[List[SelectBranch[Int]]]()
     var states_store = List[SelectState]()
     for _ in range(K):
-        var b = List[SelectBranch]()
+        var b = List[SelectBranch[Int]]()
         b.append(recv_branch[Int](chp0))
         b.append(recv_branch[Int](chp1))
         b.append(recv_branch[Int](chp2))
-        b.append(deadline_branch(hp, clock, Deadline(60_000)))  # 60s: never due
+        b.append(deadline_branch[Int](hp, clock, Deadline(60_000)))  # 60s: never due
         branches_store.append(b^)
         states_store.append(SelectState())
     var branches_ptr = branches_store.unsafe_ptr()
