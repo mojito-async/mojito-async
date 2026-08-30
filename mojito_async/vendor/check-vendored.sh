@@ -271,6 +271,78 @@ else
     fi
 fi
 
+
+# ---------------------------------------------------------------------------
+# 4. SPIKE vendor tree against PROD vendor tree (issue #170 instance 6)
+# ---------------------------------------------------------------------------
+# Makefile:9-16 claims "Two vendored source trees (byte-identical
+# substrate, same basenames)": SPIKE (spike/colorless_runtime/vendor/
+# mojito-sys, the A0 spike harness) and PROD (this dir, the A1 production
+# copy check [1]-[3] above compare against canonical). Finding [1] only
+# ever compares PROD against canonical mojito-sys — nothing compares SPIKE
+# against PROD, which is the actual claim the Makefile makes. `diff -r`
+# between the two trees is not empty today (issue #170), so this applies
+# the identical "identical, or diverged-and-recorded" test as [1], keyed
+# under a `spike:` prefix in VENDORED_EXCEPTIONS.tsv so a shared basename
+# (e.g. native_stack.c) can carry independent PROD-vs-canonical and
+# SPIKE-vs-PROD exception rows without colliding.
+echo ""
+echo "  [4] SPIKE vendor tree against PROD vendor tree (Makefile's"
+echo "      \"byte-identical substrate, same basenames\" claim)"
+SPIKE_DIR="$REPO_ROOT/spike/colorless_runtime/vendor/mojito-sys"
+if [ ! -d "$SPIKE_DIR" ]; then
+    echo "      $SPIKE_DIR missing; cannot compare"
+else
+    prod_counterpart() { # <basename> -> path under PROD, or empty
+        for cand in "$VENDOR/$1" "$VENDOR/include/$1"; do
+            [ -f "$cand" ] && { printf '%s' "$cand"; return 0; }
+        done
+        return 1
+    }
+    spike_only=""
+    for s in "$SPIKE_DIR"/* "$SPIKE_DIR"/include/*; do
+        [ -f "$s" ] || continue
+        base=$(basename "$s")
+        p=$(prod_counterpart "$base") || { spike_only="$spike_only $base"; continue; }
+        if diff -q "$s" "$p" >/dev/null 2>&1; then
+            printf '      %-22s identical\n' "$base"
+            continue
+        fi
+        nlines=$(diff -u "$s" "$p" | grep -c '^[+-][^+-]' 2>/dev/null || echo '?')
+        want=$(hash_of "$s")
+        got=$(recorded_hash "spike:$base")
+        if [ "$got" = "$want" ]; then
+            printf '      %-22s diverged from PROD, RECORDED (%s lines)\n' "$base" "$nlines"
+        else
+            printf '      %-22s DIVERGED FROM PROD, UNRECORDED (%s lines)\n' "$base" "$nlines"
+            if [ -z "$got" ]; then
+                echo "          not listed in $(basename "$EXCEPTIONS") under key spike:$base"
+            else
+                echo "          recorded hash $got does not match $want:"
+                echo "          the SPIKE file changed again after the exception was filed"
+            fi
+            findings=$((findings + 1))
+        fi
+    done
+    if [ -n "$spike_only" ]; then
+        echo "      SPIKE-only (no PROD basename match, informational):$spike_only"
+    fi
+    prod_only=""
+    for p in "$VENDOR"/*.c "$VENDOR"/*.S "$VENDOR"/include/*.h; do
+        [ -f "$p" ] || continue
+        base=$(basename "$p")
+        found=0
+        for cand in "$SPIKE_DIR/$base" "$SPIKE_DIR/include/$base"; do
+            [ -f "$cand" ] && found=1
+        done
+        [ "$found" -eq 0 ] && prod_only="$prod_only $base"
+    done
+    if [ -n "$prod_only" ]; then
+        echo "      PROD-only (no SPIKE basename match, informational — PROD's"
+        echo "      s6 I/O surface that the spike harness never needed):$prod_only"
+    fi
+fi
+
 echo ""
 if [ "$findings" -eq 0 ]; then
     printf 'VERDICT\tvendor_substrate_divergence\tPASS\n'
