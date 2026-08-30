@@ -108,16 +108,17 @@ def _cancel_with_reason(
     reason: Int,
 ) raises -> Bool:
     """Shared body for cancel_op/cancel_and_close: pre-check WAITING (see
-    module docstring's C6 section), release the op-table slot, stamp
-    `reason`, and deliver the wake.  Returns True iff THIS call found the
-    waiter still WAITING and won the race (never calls unpark_current
-    otherwise — a benign loss to a competing winner, not an error)."""
+    module docstring's C6 section), release the op-table slot, and deliver
+    the wake with `reason` as the win_reason so the stamp is written INSIDE
+    unpark_current's guard — only if the claim actually succeeds (A4.4,
+    issue #58).  Returns True iff THIS call found the waiter still WAITING
+    and won the race (never calls unpark_current otherwise — a benign loss
+    to a competing winner, not an error)."""
     var h = _reconstruct_handle(waiter_tcb, waiter_task_id)
     if h.state() != TaskControlBlock.WAITING:
         return False
     reactor.unregister(token)
-    h.tcb()[].wait_node()[].set_reason(reason)
-    unpark_current[Nil](rt, h, required_gen=h.tcb()[].wait_node()[].generation())
+    unpark_current[Nil](rt, h, win_reason=reason)
     return True
 
 
@@ -220,13 +221,6 @@ def service_io_deadlines[R: ResultValue](
     service_io in the same tick (see test/unit/t42_io_cancel_deadline.mojo
     for the composition), exactly like drive_step composes scheduler_loop
     + service_timers today."""
-    # woke is a best-effort diagnostic counter: both the was_waiting read
-    # and the post-unpark state check are outside any guard, so under
-    # concurrent execution (EPIC #2's M:N) the count can undercount tasks
-    # that actually transitioned PARKING→RUNNABLE via the early-wake latch.
-    # Correctness does not depend on the count; it is consumed only by
-    # drive_step for telemetry.  The service_timers / service_io_deadlines
-    # caller must not gate a safety property on the return value.
     var woke = 0
     while heap.has_due(now):
         var e = heap.pop_min()
@@ -238,9 +232,7 @@ def service_io_deadlines[R: ResultValue](
             ),
             e.id,
         )
-        var gen = h.tcb()[].wait_node()[].generation()
-        var was_waiting = h.tcb()[].state() == TaskControlBlock.WAITING
-        unpark_current(rt, h, required_gen=gen, win_reason=SuspendReason.TIMER)
-        if was_waiting and h.tcb()[].state() == TaskControlBlock.RUNNABLE:
+        if h.state() == TaskControlBlock.WAITING:
+            unpark_current(rt, h, 0, SuspendReason.TIMER)
             woke += 1
     return woke
