@@ -837,6 +837,30 @@ struct NativeSocket(Movable):
         # return on every path of a result-bearing def.
         return False
 
+    # ---- issue #182 deviation: SO_SNDBUF / SO_RCVBUF --------------------
+    #
+    # Shrink this socket's kernel send/receive buffer to a known-small size
+    # instead of relying on the platform's auto-tuned (host- and
+    # run-to-run-variable) default. Not part of the frozen ABI's original
+    # s6-socket block; added alongside set_reuseaddr/connect_error above
+    # (see module docblock) for t44_tcp_read_write_aot scenario B, which
+    # needs a 512KB write_all over loopback to GUARANTEE at least one
+    # EAGAIN/EWOULDBLOCK rather than depend on the platform default being
+    # small enough.
+    #
+    # Blocking: no (SYS-5). Allocation: none (SYS-4). Task-aware: no.
+    def set_send_buffer_size(mut self, bytes: Int32) raises:
+        self._require_live()
+        var rc = _externs.probe_set_sndbuf(self.fd, bytes)
+        if rc != 0:
+            raise_errno(rc)
+
+    def set_recv_buffer_size(mut self, bytes: Int32) raises:
+        self._require_live()
+        var rc = _externs.probe_set_rcvbuf(self.fd, bytes)
+        if rc != 0:
+            raise_errno(rc)
+
     # Blocking (SYS-5): close(2) may block inside the kernel only under
     def close(mut self) raises:
         self._require_live()

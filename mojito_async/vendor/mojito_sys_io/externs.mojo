@@ -204,6 +204,32 @@ def probe_connect_error(fd: SockFd, out_err: FdSlot) -> Int32:
     return mjs_socket_connect_error(fd, out_err)
 
 
+# ---- issue #182 deviation externs -------------------------------------------
+#
+# Not part of the frozen upstream mojito-sys s6-socket block either (see
+# socket.mojo's module docblock + vendor/mojito-sys/mjs_socket.c's own
+# "issue #182 deviation" comment for the C-side additions these bind).
+# Same leaf discipline: raw @extern + non-raising probe_* shim only.
+
+
+@extern("mjs_socket_set_sndbuf")
+def mjs_socket_set_sndbuf(fd: SockFd, bytes: Int32) abi("C") -> Int32:
+    ...
+
+
+@extern("mjs_socket_set_rcvbuf")
+def mjs_socket_set_rcvbuf(fd: SockFd, bytes: Int32) abi("C") -> Int32:
+    ...
+
+
+def probe_set_sndbuf(fd: SockFd, bytes: Int32) -> Int32:
+    return mjs_socket_set_sndbuf(fd, bytes)
+
+
+def probe_set_rcvbuf(fd: SockFd, bytes: Int32) -> Int32:
+    return mjs_socket_set_rcvbuf(fd, bytes)
+
+
 # ---- s6-poller bindings (issue #75) ------------------------------------------
 #
 # SCALAR BOUNDARY NOTES (byval-poison class, b2):
