@@ -165,13 +165,18 @@ fi
 # never actually ADDED to this list, so every run compiled it at the
 # default optimization level instead. At default -O the SAME LICM class
 # also reaches WaitNode._next/_reason and TaskControlBlock._early (issue
-# #148's winner-marker/early-wake-latch fields, still plain non-atomic
-# storage, unlike the _state/_generation/_claim_epoch fields issue #143
-# converted to Atomic): a legitimately-stamped winner marker can be missed
-# by a stale/reordered read, surfacing as Condvar.resolve_winner's "resumed
-# with no winner marker stamped" raise. Confirmed empirically: 15/15 runs
-# RED at default -O, 30/30 runs PASS at -O 0 on an otherwise-unmodified
-# tree. `-O 0` closes the gap exactly like every driver below it.
+# #148's winner-marker/early-wake-latch fields): a legitimately-stamped
+# winner marker can be missed by a stale/reordered read, surfacing as
+# Condvar.resolve_winner's "resumed with no winner marker stamped" raise.
+# Confirmed empirically: 15/15 runs RED at default -O, 30/30 runs PASS at
+# -O 0 on an otherwise-unmodified tree. `-O 0` closes the gap exactly like
+# every driver below it.
+# Issue #190: _next/_reason/_early were converted to Atomic[...] (matching
+# issue #143's own treatment of _state/_generation/_claim_epoch), which
+# substantially improves but does NOT fully close this driver's failure at
+# default -O (residual low-frequency flake, root cause not yet isolated —
+# see issue #195, which also covers this driver's OWN plain round-
+# handshake cells named two paragraphs up). The -O 0 pin stays.
 # Issue #191: t58_stack_registry_aot's own header already documented
 # "BUILD LEVEL: -O 0, and NOT by choice... mojo build at default -O
 # CRASHES on it" since the driver's very first commit (1ce1ca4, the same

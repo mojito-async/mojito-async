@@ -14,13 +14,18 @@
 # That pin has two causes and only one of them is upstream.  The `mojo build`
 # optimizer CRASH is Modular's and is out of scope for EPIC #140.  Hoisting a
 # plain non-atomic load out of a spin loop is not a crash and not a compiler
-# bug: it is legal optimization of racy code, and the race is ours.  `_state`,
-# `_generation`, `_early`, `_claim_epoch`, `_started` and `_owner_runtime` are
-# plain `Int`/`Bool` (runtime/task_control_block.mojo:141-232) and foreign
-# threads read them unguarded all over the tree.
+# bug: it is legal optimization of racy code, and the race is ours.  Issue
+# #143 converted `_state`/`_generation`/`_claim_epoch` to `Atomic[...]`;
+# issue #190 did the same for `WaitNode._next`/`_reason` and
+# `TaskControlBlock._early`.  `_started` and `_owner_runtime` remain plain
+# `Bool`/`Int` (runtime/task_control_block.mojo) and foreign threads still
+# read them unguarded (park.mojo's `_owner_rt` reads `_owner_runtime` from
+# the waking thread on every cross-worker wake) — a candidate root cause
+# for this lane's residual flake that issue #195 tracks, alongside this
+# driver's own converted-but-still-flaky fields.
 #
-# So what ships at default `-O` is not what the suite tests, and no document
-# tells a downstream user that a default-`-O` build may lose wakeups.
+# So what ships at default `-O` is not fully proven safe yet, and this lane
+# is the regression harness that keeps that honest.
 #
 # THIS SCRIPT builds the two drivers that exercise the real cross-worker
 # handoff — t47_channel_cross_worker_aot and t38_mutex_cross_worker_aot — at
