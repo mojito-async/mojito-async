@@ -25,5 +25,17 @@
 #   2. Add a row here: <basename>\t<hash>\t<reason>
 #   3. Re-run check-vendored.sh to confirm the row is accepted.
 #
-# CURRENTLY EMPTY — all vendored files are expected to track canonical.
-# Add rows only for deliberate forks backed by an open issue or PR.
+# Rows below record INTENTIONAL divergences for the vendored spike substrate.
+# mojito-async uses the spike substrate by design until the frozen ABI
+# integration is complete (sys#164).  When that integration lands, re-vendor
+# from canonical mojito-sys/main and remove every row here.
+#
+# Files with a canonical counterpart that differ from it:
+mjs_epoll.c	30e1193e166851e712bd2e42cc869f69a131f799e683c8ae4542b8b03e390d7b	intentional spike substrate; frozen ABI integration pending sys#164
+mjs_socket.c	540cfd837a3be48cf02aaeb180c25b6f42c0712536efe265755bd266ac529d3b	intentional spike substrate; frozen ABI integration pending sys#164
+#
+# Structural sentinels: the spike substrate introduces symbols not in
+# canonical native/ (finding [2]) and the vendored header was taken whole
+# while the C was taken in slices (finding [3]).  Both are intentional and
+# are suppressed by the _spike_substrate_ sentinel below.
+_spike_substrate_	intentional	intentional spike substrate; frozen ABI integration pending sys#164
