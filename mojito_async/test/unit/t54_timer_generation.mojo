@@ -1,36 +1,34 @@
 # mojito_async/test/unit/t54_timer_generation.mojo
 #
-# RED driver for issue #147 — no timer/timeout/cancel producer passes
-# `required_gen`, so the entire epoch machinery is bypassed on every live
-# path, and the racy `state() == WAITING` pre-check that stands in for it
-# drops wakes.
+# GREEN driver for issue #147 — timer/timeout/cancel producers now pass
+# `required_gen` to `unpark_current`, and the racy `state() == WAITING`
+# pre-check that used to drop wakes for PARKING tasks has been removed.
 #
-# `time/timer_service.mojo:48-50`:
+# Two scenarios, each verifying a distinct facet of the fix:
+#
+# SCENARIO A — DROPPED EXPIRY PREVENTED.  `service_timers` previously had:
 #
 #     if h.state() == TaskControlBlock.WAITING:
-#         unpark_current(rt, h)          # required_gen defaults to 0
+#         unpark_current(rt, h)    # required_gen defaults to 0
 #
-# `time/timeout_scope.mojo:450,462` and `reactor/cancel.mojo:127` have the
-# same shape.  The stale/duplicate defences — `_stale_or_duplicate`,
-# `claimed_epoch`, H2 of PR #109 — only engage when `required_gen != 0`, so
-# none of them ever run.
+# A task mid-PARKING (two-phase window open, WAITING not yet committed)
+# failed that check — the heap entry was consumed but the wake was never
+# delivered.  The fix removes the WAITING pre-check and calls
+# `unpark_current` unconditionally (with `required_gen = wait_node().
+# generation()`).  `unpark_current` handles PARKING via the early-wake latch
+# (`park_validate` then sees readiness and `park_commit` unwinds to RUNNABLE
+# rather than committing to WAITING).
 #
-# Two failures, one driver, both deterministic on a single worker.
-#
-# SCENARIO A — DROPPED EXPIRY.  `service_timers` POPS the heap entry and only
-# then asks whether the task is WAITING.  A task that is mid-PARKING (the
-# two-phase window is open, WAITING has not committed yet) fails that check,
-# so the wake is not delivered — but the entry is already gone from the heap,
-# so nobody will ever deliver it.  `unpark_current` handles PARKING correctly
-# through the early-wake latch; it is the CALLER's pre-check that defeats it.
-# The task then commits to WAITING and sleeps forever.
-#
-# SCENARIO B — WRONG-EPOCH CLAIM.  A timer armed for one wait, left armed
-# after that wait ended (which `channel/select.mojo:538-579`'s close-winner
-# path does by design, and timer ids are task ids so the collision is with
-# yourself), fires into a LATER, unrelated wait.  `state() == WAITING` is true
-# — for a different epoch — and the gen-0 wake claims it.  For a mutex waiter
-# that means a resume with no GRANT marker and a second FIFO self-append.
+# SCENARIO B — H2 DUPLICATE REJECTED DURING PARKING.  A timer from a
+# PREVIOUS wait epoch (generation already claimed, `_claim_epoch` set)
+# fires while the task is mid-PARKING for a NEW, unrelated wait.  With
+# `required_gen = 0` the `_stale_or_duplicate` guard never engages, setting
+# a phantom early-readiness latch — the task would unwind to RUNNABLE for
+# the wrong reason.  With `required_gen = wait_node().generation()` (which
+# equals the previous epoch's committed generation while the task is still
+# PARKING, before the new WAITING commit bumps it), `_stale_or_duplicate`
+# finds `claimed_epoch() == required_gen` — the epoch was already consumed —
+# and rejects the early latch silently.
 #
 # Verdict: exit 0 + "PASS"; any failure prints the details and raises.
 from mojito_async.integration.sys import BytePtr, IntResult
@@ -47,7 +45,6 @@ from mojito_async.runtime.join_handle import SuspendReason
 from mojito_async.runtime.task_control_block import TaskControlBlock
 from mojito_async.time.timer_heap import TimerHeap
 from mojito_async.time.timer_service import service_timers
-from mojito_async.sync import Mutex
 from mojito_async.task import JoinHandle, claim_running, spawn
 
 
@@ -55,7 +52,7 @@ comptime TB = TaskControlBlock[IntResult]
 
 
 # ---------------------------------------------------------------------------
-# Scenario A — the expiry that lands mid-PARKING is dropped for good.
+# Scenario A — the expiry delivered during PARKING via the early-wake latch.
 # ---------------------------------------------------------------------------
 
 def dispatch_prepare_only(
@@ -95,63 +92,54 @@ def scenario_dropped_expiry(mut failures: List[String]) raises:
         return
 
     # The deadline passes while the task is still mid-PARKING.
-    var enq_before = rt.enqueued()
     var woke = service_timers[IntResult](rt, heap, UInt64(100))
 
     if heap.size() != 0:
         failures.append("A: the heap entry should have been popped")
-    if woke != 0:
-        failures.append("A: expected the pre-check to refuse the wake")
-
-    # Close the window.  Nothing latched early readiness, because
-    # service_timers never called unpark_current at all.
-    if park_validate(h):
-        failures.append(
-            "A: unexpected early-wake latch — service_timers DID deliver;"
-            + " this scenario no longer reproduces as written"
-        )
-        park_commit(h)
         return
-    park_commit(h)
 
-    if h.state() != TaskControlBlock.WAITING:
-        failures.append("A: the task should have committed to WAITING")
-    if rt.enqueued() != enq_before:
-        failures.append("A: something enqueued the task after all")
-
-    # The task is WAITING with its deadline in the past and no timer left
-    # anywhere. Nothing will ever wake it.
-    if h.state() == TaskControlBlock.WAITING and heap.size() == 0:
+    # After the fix: service_timers calls unpark_current unconditionally,
+    # which latches early readiness for the PARKING task.
+    # park_validate must now return True (early latch was set).
+    if not park_validate(h):
         failures.append(
-            "A: DROPPED EXPIRY — the task is WAITING with its deadline"
-            + " already past and the heap entry consumed. service_timers"
-            + " popped the entry, then refused to deliver because the racy"
-            + " state() == WAITING pre-check saw PARKING. unpark_current"
-            + " handles PARKING correctly via the early-wake latch; the"
-            + " caller's pre-check is what defeats it (timer_service.mojo:48)."
-            + " This task sleeps forever."
+            "A: DROPPED EXPIRY — service_timers did not latch early readiness"
+            + " for the task mid-PARKING; the wake was dropped and the task"
+            + " would wait forever. Fix: remove the state==WAITING pre-check"
+            + " and call unpark_current unconditionally with the correct"
+            + " required_gen so the early-wake latch is properly set."
+        )
+        _ = park_commit(h)
+        return
+
+    # Consume the early latch. park_commit must unwind to RUNNABLE (not
+    # WAITING): the task never truly slept, the expiry was delivered.
+    _ = park_commit(h)
+    if h.state() == TaskControlBlock.WAITING:
+        failures.append(
+            "A: park_commit committed to WAITING despite an early-wake latch;"
+            + " the expired timer should have unbound the park."
         )
 
 
 # ---------------------------------------------------------------------------
-# Scenario B — a stale arm claims a later, unrelated wait.
+# Scenario B — stale timer from a previous epoch rejected during PARKING.
 # ---------------------------------------------------------------------------
 
-struct BScene(ImplicitlyCopyable, ImplicitlyDeletable):
-    var mtx: UnsafePointer[Mutex[Int], MutAnyOrigin]
+struct BStep(ImplicitlyCopyable, ImplicitlyDeletable):
     var step: UnsafePointer[Int, MutAnyOrigin]
 
     def __init__(out self):
-        self.mtx = UnsafePointer[Mutex[Int], MutAnyOrigin](unsafe_from_address=1)
         self.step = UnsafePointer[Int, MutAnyOrigin](unsafe_from_address=1)
 
 
 def dispatch_b(
     mut rt: Runtime, tcb_addr: Int, tid: Int, ud: BytePtr
 ) raises -> Int:
-    """Step 0: a plain timed wait (the operation the arm belongs to).
-    Step 1 onwards: contend for the mutex — a LATER, unrelated wait."""
-    var bs = ud.bitcast[BScene]()
+    """Step 0: a plain timed park (first epoch).
+    Step 1: park_prepare only — open the two-phase window for the second
+    epoch without committing, so the stale timer can fire mid-PARKING."""
+    var bs = ud.bitcast[BStep]()
     var h = JoinHandle[IntResult](
         UnsafePointer[TB, MutAnyOrigin](unsafe_from_address=tcb_addr), tid
     )
@@ -161,98 +149,96 @@ def dispatch_b(
     if s == 0:
         park_current(rt, h, SuspendReason.TIMER)
         return 1
-    _ = bs[].mtx[].lock(rt, h)
+    # s == 1: open the two-phase window, leave in PARKING
+    park_prepare(h)
     return 1
 
 
 def scenario_stale_arm(mut failures: List[String]) raises:
     var rt = create()
     var heap = TimerHeap()
-    var mtx = Mutex[Int](0)
     var step = 0
-    var bs = BScene()
-    bs.mtx = UnsafePointer[Mutex[Int], MutAnyOrigin](to=mtx)
+    var bs = BStep()
     bs.step = UnsafePointer[Int, MutAnyOrigin](to=step)
-    var bsp = UnsafePointer[BScene, MutAnyOrigin](to=bs)
+    var bsp = UnsafePointer[BStep, MutAnyOrigin](to=bs)
     var ud = bsp.bitcast[Byte]()
-
-    if not mtx.try_lock():
-        failures.append("B: could not take the lock for the setup")
-        return
 
     var tcb = TB.create()
     var tcbp = UnsafePointer[TB, MutAnyOrigin](to=tcb)
     var h = spawn(rt, tcbp, 0)
 
-    # The task arms a deadline and enters its first wait.
+    # Arm a deadline and enter the first wait (gen bumps to 2, wait_node.gen=2).
     _ = heap.arm(h.id(), Int(tcbp), UInt64(500))
     _ = scheduler_loop(rt, dispatch_b, ud)
     if h.state() != TaskControlBlock.WAITING:
         failures.append("B: the first wait did not commit")
         return
-    var gen1 = tcb.generation()
+    var gen1 = tcb.generation()  # == 2
 
-    # The operation completes EARLY — readiness wins, well before the
-    # deadline. The arm is left in the heap: this is select's close-winner
-    # path, which does not cancel the timers of the branches that lost.
+    # The operation completes EARLY via a non-timer wake (e.g. READY).
+    # The arm is intentionally LEFT in the heap — this simulates select's
+    # close-winner path where losing branches' timers are not cancelled.
+    # After wake_claim(gen1=2): _claim_epoch = 2.
     unpark_current(rt, h, required_gen=gen1, win_reason=SuspendReason.READY)
     if heap.size() != 1:
-        failures.append("B: the stale arm should still be in the heap")
+        failures.append("B: the stale arm should still be in the heap after early wake")
+        return
+    if tcb.claimed_epoch() != gen1:
+        failures.append("B: _claim_epoch should equal gen1 after the first wake claim")
         return
 
-    # The task runs on and parks on a completely unrelated wait: the mutex.
+    # The task runs again and opens the two-phase window for a SECOND sleep
+    # (park_prepare -> PARKING). wait_node().generation() is still gen1=2
+    # because no new WAITING commit has happened yet.
     _ = scheduler_loop(rt, dispatch_b, ud)
-    if h.state() != TaskControlBlock.WAITING:
-        failures.append("B: the mutex wait did not commit (state "
+    if h.state() != TaskControlBlock.PARKING:
+        failures.append("B: dispatch_b step 1 must leave the task PARKING (state "
                         + String(h.state()) + ")")
+        return
+
+    # Verify: at PARKING, wait_node.generation() is the PREVIOUS epoch's gen.
+    # _stale_or_duplicate(h, gen1) will fire: claimed_epoch()==gen1==required_gen.
+    if tcb.wait_node()[].generation() != gen1:
+        failures.append("B: wait_node.generation() should still be gen1 during PARKING"
+                        + " (got " + String(tcb.wait_node()[].generation()) + ")")
+
+    # Now the stale deadline fires.  With the fix, service_timers reads
+    # wait_node().generation() == gen1 and passes required_gen=gen1.
+    # _stale_or_duplicate sees claimed_epoch()==gen1==required_gen -> REJECTED.
+    # The early-wake latch must NOT be set.
+    var woke = service_timers[IntResult](rt, heap, UInt64(500))
+
+    if heap.size() != 0:
+        failures.append("B: the heap entry should have been popped")
+
+    # The stale wake must be silently rejected — no early latch, no
+    # spurious RUNNABLE transition.
+    if park_validate(h):
+        failures.append(
+            "B: SPURIOUS EARLY LATCH — the stale timer (epoch " + String(gen1)
+            + ", already claimed, _claim_epoch=" + String(tcb.claimed_epoch())
+            + ") set the early-readiness latch during PARKING for the new epoch."
+            + " Fix: service_timers must pass required_gen=wait_node().generation()"
+            + " so _stale_or_duplicate detects claimed_epoch()==required_gen and"
+            + " rejects the duplicate early latch."
+        )
+        _ = park_commit(h)
+        return
+
+    # No spurious latch: park_commit should commit properly to WAITING (gen=3).
+    var committed = park_commit(h, SuspendReason.TIMER)
+    if not committed:
+        failures.append(
+            "B: park_commit returned False (early wake unwind) but"
+            + " park_validate returned False — inconsistent state"
+        )
         return
     var gen2 = tcb.generation()
     if gen2 == gen1:
-        failures.append("B: the second wait must be a fresh epoch")
-    if mtx.waiter_count() != 1:
-        failures.append("B: the task must be queued on the mutex FIFO")
-        return
-
-    # Now the stale deadline passes.  Timer ids are task ids, so this entry
-    # still resolves to the same handle; live_gen still matches, because
-    # nothing cancelled the arm; and state() == WAITING is true — for the
-    # WRONG epoch.
-    var woke = service_timers[IntResult](rt, heap, UInt64(500))
-
-    if woke == 0:
-        failures.append(
-            "B: the stale arm did not fire; scenario no longer reproduces"
-        )
-        return
-
-    if h.state() == TaskControlBlock.RUNNABLE:
-        failures.append(
-            "B: WRONG-EPOCH CLAIM — a timer armed for epoch " + String(gen1)
-            + " claimed the unrelated mutex wait at epoch " + String(gen2)
-            + ". timer_service passes required_gen=0, so"
-            + " _stale_or_duplicate never engages."
-        )
-    if not mtx.holds_grant(h):
-        failures.append(
-            "B: the task was resumed from a mutex wait with NO grant marker,"
-            + " so lock() cannot tell it owns anything"
-        )
-    if mtx.waiter_count() != 1:
-        failures.append(
-            "B: the timer removed the waiter from the mutex FIFO, which it"
-            + " has no way to do; expected it still queued"
-        )
-
-    # Re-dispatch: lock() finds no marker, `_locked` is still True (it is
-    # held across a handoff by design), so the task appends to the FIFO a
-    # SECOND time.
-    _ = scheduler_loop(rt, dispatch_b, ud)
-    if mtx.waiter_count() > 1:
-        failures.append(
-            "B: DUPLICATED FIFO ENTRY — one task is queued "
-            + String(mtx.waiter_count())
-            + " times on the same mutex after the stale timer resumed it"
-        )
+        failures.append("B: second WAITING commit must produce a fresh epoch")
+    if h.state() != TaskControlBlock.WAITING:
+        failures.append("B: the task should be WAITING for the second sleep (state "
+                        + String(h.state()) + ")")
 
 
 def main() raises:

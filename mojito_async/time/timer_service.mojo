@@ -45,8 +45,10 @@ def service_timers[R: ResultValue](
             ),
             e.id,
         )
-        if h.state() == TaskControlBlock.WAITING:
-            unpark_current(rt, h)
+        var gen = h.tcb()[].wait_node()[].generation()
+        var was_waiting = h.tcb()[].state() == TaskControlBlock.WAITING
+        unpark_current(rt, h, required_gen=gen)
+        if was_waiting and h.tcb()[].state() == TaskControlBlock.RUNNABLE:
             woke += 1
     return woke
 
