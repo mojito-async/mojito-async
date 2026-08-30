@@ -175,8 +175,12 @@ def scheduler_loop[F: def(mut Runtime, Int, Int, BytePtr) raises -> Int, R: Resu
         var have = False
         var rec = TaskRecord(0, 0)
         # # E3-OWNED: injection intake — #69 polls its inject queue HERE.
-        if rt.has_local():
-            rec = rt.pop_local()
+        # issue #144: atomic check-and-pop eliminates the TOCTOU between a
+        # separate has_local() probe and pop_local() — a thief stealing the
+        # last record in that window made the owner raise.
+        var local_opt = rt.try_pop_local()
+        if local_opt:
+            rec = local_opt.value()
             have = True
         elif rt.has_remote():
             rec = rt.pop_remote()
@@ -433,8 +437,10 @@ def fair_scheduler_loop[
         var have = False
         var rec = TaskRecord(0, 0)
         var cls = 0
-        if rt.has_local():
-            rec = rt.pop_local()
+        # issue #144: atomic check-and-pop (see scheduler_loop equivalent above).
+        var local_opt = rt.try_pop_local()
+        if local_opt:
+            rec = local_opt.value()
             have = True
             cls = CLS_LOCAL
         elif rt.has_remote():

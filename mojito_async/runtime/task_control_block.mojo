@@ -33,6 +33,14 @@
 #   - `raise` accepts only the builtin `Error`; IllegalTransitionError is
 #     carried in the message.
 
+# Issue #143: Atomic[DType.int64] from std.atomic provides acquire-load /
+# release-store semantics that prevent LICM hoisting of _state/_generation/
+# _claim_epoch reads out of foreign-thread spin loops (the LICM-class root
+# cause documented in issue #143).  Unlike @extern("C") symbols (which crash
+# the b2 JIT via modular/modular#6971 when transitively imported), Atomic
+# lowers through MLIR to native atomic IR (LDAR/STLR on arm64) — JIT-safe.
+from std.atomic import Atomic, Ordering
+
 # ---------------------------------------------------------------------------
 # Result slot constraint
 # ---------------------------------------------------------------------------
@@ -139,10 +147,10 @@ struct TCB_Prefix(ImplicitlyCopyable, ImplicitlyDeletable):
     comptime COMPLETED = Int(5)
     comptime CANCELLED = Int(6)
 
-    var _state: Int
+    var _state: Int64        # atomic acquire/release (issue #143)
     # Task generation: starts at 1; bumped on WAITING commit (PARKING->WAITING)
     # so stale wakeups from an earlier epoch are rejected (spec §25).
-    var _generation: Int
+    var _generation: Int64   # atomic acquire/release (issue #143)
     # Embedded waiter — allocation-free park/wake (spec §24).
     var _wait: WaitNode
     # Result-slot consume-once guard (the T-typed value lives in the TCB tail).
@@ -195,10 +203,10 @@ struct TCB_Prefix(ImplicitlyCopyable, ImplicitlyDeletable):
     # NEXT WAITING commit).  GUARD: read/written under the OWNER worker's
     # remote-ready queue spinlock, alongside `_early` and the claim
     # decision (issue #68 memory-ordering banner).
-    var _claim_epoch: Int
+    var _claim_epoch: Int64  # atomic acquire/release (issue #143)
     def __init__(out self):
-        self._state = TCB_Prefix.NEW
-        self._generation = 1
+        self._state = Int64(TCB_Prefix.NEW)
+        self._generation = Int64(1)
         self._wait = WaitNode()
         self._has_result = False
         self._failed = False
@@ -209,7 +217,7 @@ struct TCB_Prefix(ImplicitlyCopyable, ImplicitlyDeletable):
         self._owner_worker = 0
         self._owner_runtime = 0
         self._early = False
-        self._claim_epoch = 0
+        self._claim_epoch = Int64(0)
     # --- construction ------------------------------------------------------
 
     @staticmethod
@@ -245,24 +253,26 @@ struct TCB_Prefix(ImplicitlyCopyable, ImplicitlyDeletable):
         return False
 
     def _apply(mut self, to: Int):
-        self._state = to
+        Atomic[DType.int64].store[ordering=Ordering.RELEASE](
+            UnsafePointer[Int64, MutAnyOrigin](to=self._state), Int64(to))
         if to == TaskControlBlock.RUNNING:
             # A2.5 (issue #71): the first body entry latches STARTED (never
             # unlatches — a re-queued started task stays observable; spec
             # §14.1/§19.1, ADR-006).
             self._started = True
         if to == TaskControlBlock.WAITING:
-            self._generation += 1
-            self._wait._generation = self._generation
+            var new_gen = self._generation + Int64(1)
+            Atomic[DType.int64].store[ordering=Ordering.RELEASE](
+                UnsafePointer[Int64, MutAnyOrigin](to=self._generation), new_gen)
+            self._wait._generation = Int(new_gen)
 
     def transition(mut self, to: Int) raises:
         """Validate and perform a transition; raises
         IllegalTransitionError-as-Error for non-allowed pairs."""
-        if not TCB_Prefix._is_allowed(self._state, to):
+        if not TCB_Prefix._is_allowed(Int(self._state), to):
             var what = (
                 "IllegalTransitionError: illegal transition "
-                + String(self._state)
-                + " -> "
+                + String(Int(self._state))
                 + String(to)
             )
             var err = IllegalTransitionError(what)
@@ -277,7 +287,7 @@ struct TCB_Prefix(ImplicitlyCopyable, ImplicitlyDeletable):
         generation discipline in `wake_claim`) is the A2/EPIC#2 seam; on the
         single cooperative worker there is no interleaving inside a dispatch
         slice, so the plain check is exact for today."""
-        if self._state == from_ and TCB_Prefix._is_allowed(from_, to):
+        if self._state == Int64(from_) and TCB_Prefix._is_allowed(from_, to):
             self._apply(to)
             return True
         return False
@@ -300,21 +310,25 @@ struct TCB_Prefix(ImplicitlyCopyable, ImplicitlyDeletable):
         is a duplicate of this claim and must no-op quietly in every state
         (the generation counter alone cannot tell, since it only bumps at
         the NEXT WAITING commit)."""
-        if self._state != TaskControlBlock.WAITING:
+        if self._state != Int64(TaskControlBlock.WAITING):
             return False
-        if required_gen != 0 and self._generation != required_gen:
+        if required_gen != 0 and Int(self._generation) != required_gen:
             return False
         self._apply(TaskControlBlock.RUNNABLE)
-        self._claim_epoch = self._generation
+        Atomic[DType.int64].store[ordering=Ordering.RELEASE](
+            UnsafePointer[Int64, MutAnyOrigin](to=self._claim_epoch),
+            self._generation)
         return True
 
     # --- queries -----------------------------------------------------------
 
-    def state(self) -> Int:
-        return self._state
+    def state(mut self) -> Int:
+        return Int(Atomic[DType.int64].load[ordering=Ordering.ACQUIRE](
+            UnsafePointer[Int64, MutAnyOrigin](to=self._state)))
 
-    def generation(self) -> Int:
-        return self._generation
+    def generation(mut self) -> Int:
+        return Int(Atomic[DType.int64].load[ordering=Ordering.ACQUIRE](
+            UnsafePointer[Int64, MutAnyOrigin](to=self._generation)))
 
     def wait_node(mut self) -> UnsafePointer[WaitNode, MutAnyOrigin]:
         """The embedded node BY POINTER: callers (wait-list, cancellation)
@@ -367,25 +381,18 @@ struct TCB_Prefix(ImplicitlyCopyable, ImplicitlyDeletable):
     def clear_early_readiness(mut self):
         self._early = False
 
-    def claimed_epoch(self) -> Int:
-        """H2 (PR #109): the generation of the last consumed wake claim
-        (0 = none).  unpark_current's duplicate detector: a wake whose
-        required_gen equals this value arrives AFTER its epoch was already
-        claimed and must no-op quietly in every task state.  Guarded by the
-        OWNER's remote-ready queue spinlock (with `_early` and the claim
-        decision)."""
-        return self._claim_epoch
+    def claimed_epoch(mut self) -> Int:
+        """H2 (PR #109): the generation of the last consumed wake claim."""
+        return Int(Atomic[DType.int64].load[ordering=Ordering.ACQUIRE](
+            UnsafePointer[Int64, MutAnyOrigin](to=self._claim_epoch)))
     def is_completed(self) -> Bool:
-        """Query the A0.5 machine: COMPLETED (the run/join paths)."""
-        return self._state == TaskControlBlock.COMPLETED
+        return self._state == Int64(TaskControlBlock.COMPLETED)
 
     def is_cancelled(self) -> Bool:
-        """Query the A0.5 machine: CANCELLED (the cancellation paths)."""
-        return self._state == TaskControlBlock.CANCELLED
+        return self._state == Int64(TaskControlBlock.CANCELLED)
 
     def is_waiting(self) -> Bool:
-        """Query the A0.5 machine: WAITING (the park paths)."""
-        return self._state == TaskControlBlock.WAITING
+        return self._state == Int64(TaskControlBlock.WAITING)
 
     # --- STARTED latch consumption (A2.5 issue #71; E4 #70 shares) ---------
 
@@ -508,10 +515,10 @@ struct TaskControlBlock[T: ResultValue](ImplicitlyCopyable, ImplicitlyDeletable)
 
     # --- queries (delegated) ----------------------------------------------
 
-    def state(self) -> Int:
+    def state(mut self) -> Int:
         return self._pre.state()
 
-    def generation(self) -> Int:
+    def generation(mut self) -> Int:
         return self._pre.generation()
 
     def wait_node(mut self) -> UnsafePointer[WaitNode, MutAnyOrigin]:
@@ -562,13 +569,8 @@ struct TaskControlBlock[T: ResultValue](ImplicitlyCopyable, ImplicitlyDeletable)
     def clear_early_readiness(mut self):
         self._pre.clear_early_readiness()
 
-    def claimed_epoch(self) -> Int:
-        """H2 (PR #109): the generation of the last consumed wake claim
-        (0 = none).  unpark_current's duplicate detector: a wake whose
-        required_gen equals this value arrives AFTER its epoch was already
-        claimed and must no-op quietly in every task state.  Guarded by the
-        OWNER's remote-ready queue spinlock (with `_early` and the claim
-        decision)."""
+    def claimed_epoch(mut self) -> Int:
+        """H2 (PR #109): the generation of the last consumed wake claim."""
         return self._pre.claimed_epoch()
 
     # --- STARTED latch consumption (A2.5 issue #71; E4 #70 shares) ---------

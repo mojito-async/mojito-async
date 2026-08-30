@@ -161,10 +161,17 @@ def seam_bind_slot(
     stack: NativeStack,
     entry: BytePtr,
     ud: BytePtr,
+    pooled: Bool = False,
 ) raises:
     """Bind the ACQUIRED reservation into the slot's fiber: a fresh #49
     binding (make_fiber wires the entry/userdata scratch; the fiber OWNS the
     stack from here until destroy).  Resets the lifecycle flags.
+
+    `pooled`: when the stack was obtained from StackCache.acquire(), callers
+    MUST pass pooled=True so the fiber's destroy() skips ms_stack_free and
+    leaves lifetime management solely to the pool (issue #145 Bug 2 /
+    single-owner invariant).  Callers that allocate a fresh ms_stack_alloc
+    reservation (t16, t17, t26 and similar test drivers) leave this False.
 
     Reuse gate (frame contract): a slot whose fiber is still ALIVE is
     REJECTED loudly — the previous task must reach TERMINAL first
@@ -178,9 +185,10 @@ def seam_bind_slot(
     slot[].fiber = make_fiber(
         UnsafePointer[NativeStack, MutAnyOrigin](to=ns), entry, ud
     )
+    if pooled:
+        slot[].fiber.set_pooled()
     slot[].started = False
     slot[].finished = False
-
 
 def seam_drive(mut rt: Runtime, slot: UnsafePointer[SeamSlot, MutAnyOrigin]) raises -> DriveVerdict:
     """ONE fiber-backed dispatch slice (the drive the generic scheduler_loop
@@ -304,10 +312,11 @@ def fiber_suspend_current[R: ResultValue](
     for other RUNNABLE records either way."""
     park_prepare(h)
     if park_validate(h):
-        park_commit(h)
+        _ = park_commit(h)
         rt.push_remote(Int(h.tcb()), h.id())
         return
-    park_commit(h, reason)
+    if not park_commit(h, reason):
+        rt.push_remote(Int(h.tcb()), h.id())
 
 
 def fiber_yield_now[R: ResultValue](mut rt: Runtime, h: JoinHandle[R]) raises:
