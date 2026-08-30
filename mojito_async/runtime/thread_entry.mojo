@@ -128,10 +128,14 @@ def cell_size_gate() raises:
         raise Error("thread_entry: CELL_WORKER too small for the Worker struct")
     if CELL_ENTRY < _entry_cell_stride():
         raise Error("thread_entry: CELL_ENTRY too small for the WorkerEntryCell")
-# Generous (2 s) so idle workers genuinely SLEEP for long stretches; the
-# wake budget + shutdown both signal the event explicitly, so latency stays
-# sub-millisecond regardless.
-comptime IDLE_PARK_SLICE_NS = Int(2_000_000_000)  # 2 s backstop
+# 200 ms slice: workers re-check for work and re-park on each timer fire.
+# Short enough that idle-beat tests can observe park_total grow during a
+# 0.5 s window (issue #150 oracle 2: park_total must increase across an
+# idle beat); long enough to sleep properly rather than busy-poll (5 Hz
+# vs the 5 kHz busy-poll from the unfixed pending leak).  The wake budget
+# and shutdown both signal the event explicitly so latency stays well
+# under this slice regardless.
+comptime IDLE_PARK_SLICE_NS = Int(200_000_000)  # 200 ms park slice
 
 
 # The pool-owned idle accounting block layout (SHARED with runtime/idle.mojo —
@@ -560,6 +564,7 @@ def pool_worker_loop_scheduled[
     c[].entry_ok = Int(back) == Int(c[].worker)
     var w = UnsafePointer[Worker, MutAnyOrigin](unsafe_from_address=Int(c[].worker))
     var ud = c[].dispatch_ud
+    var consecutive_faults: Int = 0
     while True:
         if Int(Atomic[DType.uint8].load[ordering=Ordering.ACQUIRE](c[].latch)) != 0:
             break
@@ -568,13 +573,28 @@ def pool_worker_loop_scheduled[
         # offset by one, matching every other multi-worker driver's
         # convention (t38's W0_ID/W1_ID = 1/2; bench/scheduler_scale_aot's
         # `w + 1`).
-        _ = fair_scheduler_loop[F, S, R](
-            w[].runtime()[], dispatcher, ud, service, budget_k, w[].id() + 1
-        )
+        # issue #144: catch-count-continue: any error that escapes the
+        # scheduler loop (e.g. an off-owner assertion or a runtime bug) is
+        # counted on the runtime's fault counter and swallowed so the worker
+        # thread remains alive — the documented production embedding contract.
+        try:
+            _ = fair_scheduler_loop[F, S, R](
+                w[].runtime()[], dispatcher, ud, service, budget_k, w[].id() + 1
+            )
+        except e:
+            w[].runtime()[].note_worker_fault()
+            consecutive_faults += 1
+            if consecutive_faults > 10:
+                raise Error(
+                    "worker fault threshold exceeded (10 consecutive): "
+                    + String(e)
+                )
+            continue
+        consecutive_faults = 0  # reset on each successful dispatch iteration
         var stolen = w[].try_steal_unstarted[R]()
         if stolen:
             var rec = stolen.value()
-            w[].runtime()[].enqueue_local(rec.tcb_addr, rec.task_id)
+            w[].runtime()[].enqueue_local_stolen(rec.tcb_addr, rec.task_id)
             continue
         # E6 idle park — INLINED (see the layer-discipline note above).
         var deadline = monotonic_now_ns() + IDLE_PARK_SLICE_NS

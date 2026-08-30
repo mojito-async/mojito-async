@@ -45,7 +45,7 @@ comptime BytePtr = UnsafePointer[Byte, MutAnyOrigin]
 
 # Pointer to caller-provided scratch holding one BytePtr each; this is what
 # ms_stack_alloc writes *out_base / *out_top through.
-comptime OutSlots = UnsafePointer[BytePtr, MutUntrackedOrigin]
+comptime OutSlots = UnsafePointer[BytePtr, MutAnyOrigin]
 
 # sizeof(ms_ctx_t) per the v3 header (include/mojito_spike.h, issue #101
 # A2.0 M:N rework): regs[12]=x19..x30 @0, fps[8]=d8..d15 @96, sp @160,
