@@ -21,4 +21,5 @@
 t47_pool_scheduler_aot	https://github.com/mojito-async/mojito-async/issues/140	2026-08-30
 t51_default_o_repeat	https://github.com/mojito-async/mojito-async/issues/140	2026-08-30
 t58_stack_registry_aot	https://github.com/mojito-async/mojito-async/issues/140	2026-08-30
-t60_barrier_cross_worker_aot	https://github.com/mojito-async/mojito-async/issues/140	2026-08-30
+t60_barrier_cross_worker_aot	https://github.com/mojito-async/mojito-async/issues/175	2026-08-30
+t34c_duplicate_wake_aot	https://github.com/mojito-async/mojito-async/issues/176	2026-08-30
