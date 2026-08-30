@@ -149,7 +149,12 @@ from mojito_async.time.timer_heap import TimerHeap
 struct SelectBranch[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable](ImplicitlyCopyable, ImplicitlyDeletable, Movable):
     """One branch of a select call: a kind discriminant plus plain Int
     addresses.  Build with `recv_branch`/`send_branch`/`deadline_branch`
-    (module factories, #92) rather than the raw constructor."""
+    (module factories, #92) rather than the raw constructor.
+    T is a phantom type parameter — it appears in no field (all fields are
+    plain Int addresses) and imposes zero memory overhead.  Its sole purpose
+    is to make List[SelectBranch[T]] a typed surface so the Mojo type system
+    rejects List[SelectBranch[Int]] where List[SelectBranch[Msg]] is expected
+    at compile time."""
 
     comptime RECV = Int(0)
     comptime SEND = Int(1)
@@ -206,7 +211,10 @@ def send_branch[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable](
 
 def deadline_branch[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable](deadline_ticks: Int) -> SelectBranch[T]:
     """DEADLINE branch (issue #92 descriptor; real timer wiring is #91).
-    Selectable once a caller-supplied `now_ticks >= deadline_ticks`."""
+    Selectable once a caller-supplied `now_ticks >= deadline_ticks`.
+    NOTE: T cannot be inferred from the arguments (there is no Channel[T]
+    parameter here); callers must write `never[MyType]()` /
+    `deadline_branch[MyType](ticks)` explicitly."""
     return SelectBranch[T](SelectBranch[T].DEADLINE, 0, 0, deadline_ticks)
 
 
@@ -223,7 +231,10 @@ def deadline_branch[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable](
     site symmetry with `timeout_branch` and with `time/sleep.mojo`'s
     `sleep_until_current(rt, h, heap, clock, deadline)` — an ABSOLUTE
     deadline needs no `now` reading to resolve into ticks, so it is
-    otherwise unused here."""
+    otherwise unused here.
+    NOTE: T cannot be inferred from the arguments (there is no Channel[T]
+    parameter here); callers must write `never[MyType]()` /
+    `deadline_branch[MyType](ticks)` explicitly."""
     var ticks = Int(UInt64(deadline.at_ms()) * 1000000)
     return SelectBranch[T](SelectBranch[T].DEADLINE, 0, 0, ticks, Int(heap))
 
@@ -236,7 +247,10 @@ def timeout_branch[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable](
     """Real timer-integrated DEADLINE branch from a RELATIVE duration
     (issue #91): resolves `clock.now() + duration.ticks()` into an
     absolute deadline at construction time — the exact convention
-    `time/sleep.mojo#sleep_current` uses for `sleep(duration)`."""
+    `time/sleep.mojo#sleep_current` uses for `sleep(duration)`.
+    NOTE: T cannot be inferred from the arguments (there is no Channel[T]
+    parameter here); callers must write `never[MyType]()` /
+    `deadline_branch[MyType](ticks)` explicitly."""
     var ticks = Int(clock.now() + duration.ticks())
     return SelectBranch[T](SelectBranch[T].DEADLINE, 0, 0, ticks, Int(heap))
 
@@ -266,7 +280,10 @@ def never[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable]() -> SelectBran
     blockable/claimable branch" well-formedness guard even when a
     `never()` branch sits alongside a single live channel branch) but it
     can never itself become the winner — the select still completes via
-    another branch, exactly as issue #85 requires."""
+    another branch, exactly as issue #85 requires.
+    NOTE: T cannot be inferred from the arguments (there is no Channel[T]
+    parameter here); callers must write `never[MyType]()` /
+    `deadline_branch[MyType](ticks)` explicitly."""
     return SelectBranch[T](SelectBranch[T].DEADLINE, 0, 0, NEVER_TICKS)
 
 
