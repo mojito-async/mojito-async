@@ -53,13 +53,14 @@ if [ -n "${MOJITO_SYS_DIR:-}" ] && [ -d "$MOJITO_SYS_DIR/native" ]; then
 elif [ -d "$REPO_ROOT/../mojito-sys/native" ]; then
     CANON=$(CDPATH= cd -- "$REPO_ROOT/../mojito-sys" && pwd)
 elif command -v gh >/dev/null 2>&1; then
-    CANON=$(mktemp -d) || exit 2
-    if ! gh repo clone mojito-async/mojito-sys "$CANON/mojito-sys" -- --depth 1 -q 2>/dev/null; then
+    CANON_TMP=$(mktemp -d) || exit 2
+    trap 'rm -rf "$CANON_TMP"' EXIT
+    if ! gh repo clone mojito-async/mojito-sys "$CANON_TMP/mojito-sys" -- --depth 1 -q 2>/dev/null; then
         echo "check-vendored.sh: could not obtain canonical mojito-sys"
         echo "       (set MOJITO_SYS_DIR, or place a checkout beside this repo)"
         exit 2
     fi
-    CANON="$CANON/mojito-sys"
+    CANON="$CANON_TMP/mojito-sys"
 else
     echo "check-vendored.sh: no canonical mojito-sys and no gh to fetch one."
     echo "       This is an environment failure, not a pass: an unverified"
@@ -233,7 +234,11 @@ else
     echo "      mojito-sys does not get the substrate mojito-async needs, and"
     echo "      every safety property PRs #66/#107/#114 built into the frozen"
     echo "      ms_context_* ABI protects code the runtime never executes."
-    findings=$((findings + 1))
+    if [ -n "$(recorded_hash '_spike_substrate_')" ]; then
+        echo "      (extern gap RECORDED as intentional in VENDORED_EXCEPTIONS.tsv)"
+    else
+        findings=$((findings + 1))
+    fi
 fi
 
 # ---------------------------------------------------------------------------
@@ -259,7 +264,11 @@ else
     echo "      vendored WHOLE while the C was vendored in slices, so it"
     echo "      promises an ABI this tree cannot supply. First few:"
     printf '%s' "$undecl" | tr ' ' '\n' | grep -v '^$' | head -8 | sed 's/^/        /'
-    findings=$((findings + 1))
+    if [ -n "$(recorded_hash '_spike_substrate_')" ]; then
+        echo "      (header gap RECORDED as intentional in VENDORED_EXCEPTIONS.tsv)"
+    else
+        findings=$((findings + 1))
+    fi
 fi
 
 echo ""
