@@ -560,6 +560,7 @@ def pool_worker_loop_scheduled[
     c[].entry_ok = Int(back) == Int(c[].worker)
     var w = UnsafePointer[Worker, MutAnyOrigin](unsafe_from_address=Int(c[].worker))
     var ud = c[].dispatch_ud
+    var consecutive_faults: Int = 0
     while True:
         if Int(Atomic[DType.uint8].load[ordering=Ordering.ACQUIRE](c[].latch)) != 0:
             break
@@ -568,9 +569,24 @@ def pool_worker_loop_scheduled[
         # offset by one, matching every other multi-worker driver's
         # convention (t38's W0_ID/W1_ID = 1/2; bench/scheduler_scale_aot's
         # `w + 1`).
-        _ = fair_scheduler_loop[F, S, R](
-            w[].runtime()[], dispatcher, ud, service, budget_k, w[].id() + 1
-        )
+        # issue #144: catch-count-continue: any error that escapes the
+        # scheduler loop (e.g. an off-owner assertion or a runtime bug) is
+        # counted on the runtime's fault counter and swallowed so the worker
+        # thread remains alive — the documented production embedding contract.
+        try:
+            _ = fair_scheduler_loop[F, S, R](
+                w[].runtime()[], dispatcher, ud, service, budget_k, w[].id() + 1
+            )
+        except e:
+            w[].runtime()[].note_worker_fault()
+            consecutive_faults += 1
+            if consecutive_faults > 10:
+                raise Error(
+                    "worker fault threshold exceeded (10 consecutive): "
+                    + str(e)
+                )
+            continue
+        consecutive_faults = 0  # reset on each successful dispatch iteration
         var stolen = w[].try_steal_unstarted[R]()
         if stolen:
             var rec = stolen.value()
