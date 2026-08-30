@@ -25,7 +25,7 @@
 #
 # Verdict: exit 0 + "PASS"; any RED prints + raises (exit 1).
 from std.memory import stack_allocation
-from mojito_async.channel import Channel, Receiver, Sender, make_channel
+from mojito_async.channel import Channel, Receiver, RecvOutcome, SendOutcome, Sender, make_channel
 from mojito_async.integration.sys import BytePtr, IntResult
 from mojito_async.runtime.runtime import Runtime, create
 from mojito_async.runtime.scheduler import scheduler_loop, yield_now
@@ -165,8 +165,8 @@ def producer_slice(
         sc[].p_phase[] = 1
     while sc[].p_idx[] < sc[].M[]:
         var item = sc[].p_item[]
-        sc[].tx.send(rt, h, item)
-        if h.state() == TaskControlBlock.WAITING:
+        var outcome = sc[].tx.send(rt, h, item)
+        if outcome.is_parked():
             rec(sc, EV_P_PARK)
             return  # parked; re-entered on resume with the pending p_item
         rec(sc, EV_P_SENT)
@@ -188,10 +188,10 @@ def consumer_slice(
         sc[].c_phase[] = 1
     while sc[].c_count[] < sc[].c_target[]:
         var v = sc[].rx.recv(rt, h)
-        if h.state() == TaskControlBlock.WAITING:
+        if v.is_parked():
             rec(sc, EV_C_PARK)
             return
-        if not v:
+        if v.is_closed():
             _complete_ok(h, -1)
             rec(sc, EV_C_DONE)
             return
