@@ -51,16 +51,38 @@ fail_case() {
 # sandbox: a throwaway git repo carrying a copy of the gate under test
 # ---------------------------------------------------------------------------
 # $1 = known-red.tsv body, $2 = run-suite.sh body.  Echoes the sandbox path.
+#
+# The sandbox includes a deterministic `gh` stub so:
+#   - issue checks work in sandboxes without real network access
+#   - results do not depend on whether a real GitHub issue is open or closed
+#     (removing the time-bomb where a test fails the moment an issue closes)
+#   - case 4 (closed-issue-row-refused) is correctly tested: the stub returns
+#     CLOSED for issue/61 and OPEN for everything else, so the closed-issue
+#     detection path in gate.sh is genuinely exercised, not bypassed by the
+#     blocked-names check.
 make_sandbox() {
     kr=$1
     suite_body=$2
     sb=$(mktemp -d 2>/dev/null) || return 1
-    mkdir -p "$sb/precommit" || return 1
+    mkdir -p "$sb/precommit" "$sb/bin" || return 1
     cp "$GATE" "$sb/precommit/gate.sh"
     chmod +x "$sb/precommit/gate.sh"
     printf '%s\n' "$kr" > "$sb/precommit/known-red.tsv"
     printf '%s\n' "$suite_body" > "$sb/precommit/run-suite.sh"
     chmod +x "$sb/precommit/run-suite.sh"
+    # Deterministic gh stub: CLOSED for issue/61 (the canonical closed test
+    # issue); OPEN for everything else.  No network call, no time-bomb.
+    cat > "$sb/bin/gh" <<'GH_STUB'
+#!/bin/sh
+# Stub for gh api repos/OWNER/REPO/issues/NUM --jq .state
+# Returns 'closed' for issue #61 (closed test issue), 'open' otherwise.
+# Matches what `gh api ... --jq .state` actually outputs (lowercase string).
+for a in "$@"; do
+    case "$a" in */61) echo closed; exit 0 ;; esac
+done
+echo open
+GH_STUB
+    chmod +x "$sb/bin/gh"
     (
         cd "$sb" || exit 1
         git init -q .
@@ -74,7 +96,7 @@ make_sandbox() {
 }
 
 run_gate() { # $1 = sandbox; sets GATE_OUT / GATE_STATUS
-    GATE_OUT=$(cd "$1" && MOJITO_GATE_FAST=0 ./precommit/gate.sh 2>&1)
+    GATE_OUT=$(cd "$1" && PATH="$1/bin:$PATH" MOJITO_GATE_FAST=0 ./precommit/gate.sh 2>&1)
     GATE_STATUS=$?
 }
 
@@ -133,13 +155,13 @@ fi
 # Issue #61 has been closed for weeks and its row is still what disarms the
 # tripwire; a stale row has to become loud, not silent.
 # ---------------------------------------------------------------------------
-# The row is named `suite` on purpose: that is the check name today's gate
-# matches on, so the row IS honoured and the only thing left under test is
-# whether the gate notices the issue behind it is closed.
+# The row is named t99_closed_probe (not a blocked suite name) so gate.sh
+# reaches the closed-issue detection path rather than short-circuiting on the
+# name check.  The sandbox gh stub returns CLOSED for issue/61 deterministically.
 sb=$(make_sandbox \
-    "suite${TAB}https://github.com/mojito-async/mojito-async/issues/61${TAB}2026-08-28" \
+    "t99_closed_probe${TAB}https://github.com/mojito-async/mojito-async/issues/61${TAB}2026-08-28" \
     "#!/bin/sh
-printf 'VERDICT\tsuite\tRED\n'
+printf 'VERDICT\tt99_closed_probe\tRED\n'
 echo 'boom: a driver failed'
 exit 1")
 run_gate "$sb"

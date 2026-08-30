@@ -139,7 +139,9 @@ if [ -f "$KNOWN_RED" ]; then
         fi
         if [ -z "$bad" ]; then
             age=$(days_between "$rdate" "$TODAY")
-            if [ "$age" -gt "$RED_MAX_AGE_DAYS" ]; then
+            if [ "$age" -lt 0 ]; then
+                bad="date in the future (got '$rdate'): backdate is not a valid age"
+            elif [ "$age" -gt "$RED_MAX_AGE_DAYS" ]; then
                 bad="added $rdate, $age days ago (horizon $RED_MAX_AGE_DAYS): a TDD red this old is not a red, it is a defect"
             fi
         fi
@@ -226,6 +228,8 @@ run_suite_check() {
         printf '%-38s FAIL (exit %s with every driver PASS: unattributed failure)\n' suite "$st"
         printf '%s\n' "$out" | tail -n 12 | sed 's/^/    | /'
         failures=$((failures + 1))
+    elif [ "$st" -ne 0 ] && [ "$nfail" -eq 0 ] && [ "$nred" -gt 0 ]; then
+        printf 'NOTE %-34s suite exited %s with %s known-red driver(s) and 0 unlisted failures; verify no unattributed failure is hidden\n' suite "$st" "$nred"
     fi
 }
 
@@ -244,8 +248,9 @@ if [ "$failures" -ne 0 ]; then
     say "GATE FAILED ($failures issue(s))."
     say "  - Unexpected test failure? Fix the code. After the change the"
     say "    commit may proceed."
-    say "  - Intentional TDD red? Add the test name to precommit/known-red.tsv"
-    say "    with its tracking issue, and remove the row when it goes green."
+    say "  - Intentional TDD red? Add a row to precommit/known-red.tsv:"
+    say "      <driver-name><TAB><issue-url><TAB>$(date +%Y-%m-%d)"
+    say "    then remove the row once the driver goes green."
     say "  - Emergency escape hatch: git commit --no-verify (see"
     say "    precommit/README.md for why this should stay rare)."
     exit 1
