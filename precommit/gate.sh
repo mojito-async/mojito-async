@@ -9,12 +9,30 @@
 #         intentional TDD-red test with a tracking issue.
 #
 # Env:
-#   MOJITO_GATE_FAST=1  skip the suite step entirely.
-#   MOJO=</path/to/mojo> override the Mojo toolchain.
+#   MOJITO_GATE_FAST=1     skip the suite step entirely (Tier 0 only).
+#   MOJITO_GATE_TIER=<t>   force full|affected|hermetic instead of the
+#                          diff-based default below (issue #169).
+#   MOJO=</path/to/mojo>  override the Mojo toolchain.
 #
-# Host rules (same as claude/OX agents on this host):
-#   - This gate NEVER deletes or modifies anything outside the workspace; it
-#     only builds inside the repo and runs the project's own test suites.
+# issue #169: cost was the stated reason for 8 of 25 remediation commits'
+# `--no-verify`, and the warm full suite really was ~2 minutes — enough to
+# make skipping it feel reasonable under time pressure. Below FAST (0.06s,
+# Tier 0 only) and full (~2 min warm) there was no tier at all, so a
+# one-line test-only commit paid the same as a scheduler rewrite. The tier
+# is now picked from what's actually staged, UNLESS MOJITO_GATE_TIER
+# overrides it:
+#   - nothing staged (a bare invocation, or CI, which never has anything
+#     staged) -> full, unchanged from before this existed.
+#   - every staged path is doc/hermetic-safe (*.md, docs/**) -> hermetic
+#     (gate self-test only; the suite doesn't run at all).
+#   - every staged path is test-only (mojito_async/test/**,
+#     spike/colorless_runtime/tests/**, bench/**, or the known-red.tsv
+#     allow-list itself) -> affected (gate self-test, plus only the
+#     drivers/suites the diff actually touches).
+#   - anything else (runtime code, vendor/, Makefile, the gate scripts
+#     themselves, or a mix) -> full.
+# precommit/run-suite.sh does the actual tier-scoped work; this only
+# classifies and exports MOJITO_GATE_TIER/MOJITO_GATE_STAGED for it.
 set -u
 
 cd "$(git rev-parse --show-toplevel)" || exit 2
@@ -24,7 +42,51 @@ KNOWN_RED="$GATE_DIR/known-red.tsv"
 FAST="${MOJITO_GATE_FAST:-0}"
 failures=0
 
+classify_tier() {
+    staged=$(git diff --cached --name-only 2>/dev/null || true)
+    if [ -z "$staged" ]; then
+        printf '%s' "$staged"
+        echo full
+        return
+    fi
+    hermetic_only=1
+    test_only=1
+    OLDIFS=$IFS
+    IFS='
+'
+    for f in $staged; do
+        case "$f" in
+            *.md|docs/*) ;;
+            *) hermetic_only=0 ;;
+        esac
+        case "$f" in
+            mojito_async/test/*|spike/colorless_runtime/tests/*|bench/*| \
+            precommit/known-red.tsv|*.md|docs/*) ;;
+            *) test_only=0 ;;
+        esac
+    done
+    IFS=$OLDIFS
+    printf '%s\n' "$staged"
+    if [ "$hermetic_only" = 1 ]; then
+        echo hermetic
+    elif [ "$test_only" = 1 ]; then
+        echo affected
+    else
+        echo full
+    fi
+}
+
+# classify_tier prints the staged-file list (possibly empty) followed by a
+# final line naming the tier; the last line is the tier, everything before
+# it is MOJITO_GATE_STAGED.
+_classify_out=$(classify_tier)
+MOJITO_GATE_STAGED=$(printf '%s\n' "$_classify_out" | sed '$d')
+_auto_tier=$(printf '%s\n' "$_classify_out" | tail -n1)
+export MOJITO_GATE_STAGED
+export MOJITO_GATE_TIER="${MOJITO_GATE_TIER:-$_auto_tier}"
+
 say() { printf '%s\n' "$*"; }
+say "gate tier: $MOJITO_GATE_TIER"
 
 # ---------------------------------------------------------------- Tier 0 ----
 ws_errors=$(git diff --cached --check 2>&1)
