@@ -1,0 +1,29 @@
+# VENDORED_EXCEPTIONS.tsv — intentional divergences from mojito-sys/native/
+#
+# Format: THREE TAB-separated fields per row, one row per diverged file:
+#
+#   <basename>    <sha256-of-vendored-file>    <reason>
+#
+# <basename>        the filename as it appears under vendor/mojito-sys/
+#                   (e.g. native_stack.c, mojito_sys.h)
+# <sha256>          sha256sum of the VENDORED copy — NOT the canonical copy.
+#                   Computed with: shasum -a 256 <file> | awk '{print $1}'
+#                   check-vendored.sh refuses the row if the file's current
+#                   hash differs, so a re-diverged file is caught automatically.
+# <reason>          free-form prose explaining WHY this file deliberately
+#                   diverges from canonical mojito-sys; include the PR/issue
+#                   that introduced the divergence so future maintainers can
+#                   trace the decision.
+#
+# Adding a row here is the declaration that the divergence is known and
+# intentional.  It does NOT exempt the file from future drift checks: when
+# the vendored file changes (re-vendor or local patch), the hash changes, the
+# old row is rejected, and you must update the hash and reason.
+#
+# To record a new exception:
+#   1. shasum -a 256 mojito_async/vendor/mojito-sys/<basename> | awk '{print $1}'
+#   2. Add a row here: <basename>\t<hash>\t<reason>
+#   3. Re-run check-vendored.sh to confirm the row is accepted.
+#
+# CURRENTLY EMPTY — all vendored files are expected to track canonical.
+# Add rows only for deliberate forks backed by an open issue or PR.
