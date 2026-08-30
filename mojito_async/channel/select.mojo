@@ -135,8 +135,8 @@ from std.collections import List
 from mojito_async.channel.channel import Channel
 from mojito_async.runtime.runtime import Runtime
 from mojito_async.runtime.task_control_block import ResultValue
-from mojito_async.runtime.park import park_current
-from mojito_async.task import JoinHandle, SuspendReason
+from mojito_async.runtime.park import park_commit, park_prepare, park_validate
+from mojito_async.task import JoinHandle, SuspendReason, claim_running
 from mojito_async.time.clock import MonotonicClock
 from mojito_async.time.deadline import Deadline, Duration
 from mojito_async.time.timer_heap import TimerHeap
@@ -688,8 +688,38 @@ def select[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable, R: ResultValue
             "(select would park forever)"
         )
     state.winner = -1
-    if state._timer_armed:
-        park_current(rt, h, SuspendReason.TIMER)
-    else:
-        park_current(rt, h)
+    # Two-phase park (issue #148): NOT the single-phase park_current.
+    # A channel sender/receiver that arrives after the FIFO registrations
+    # above but before WAITING commits calls unpark_current on a RUNNING or
+    # PARKING task; park_current never consulted the early-wake latch, so
+    # that wake was silently dropped.  park_validate re-checks the latch and
+    # park_commit unwinds to RUNNABLE so the re-scan below claims the branch
+    # the wake signalled was ready (A0-T11 / issue #148).
+    var park_reason = SuspendReason.TIMER if state._timer_armed else SuspendReason.PARK
+    park_prepare(h)
+    if park_validate(h):
+        _ = park_commit(h)
+        claim_running(h)
+        var idx2 = rescan[T](branches, state, now_ticks)
+        if idx2 != -1:
+            var out2 = _claim_at[T](branches, idx2)
+            _unregister_others[T](branches, h.id(), idx2)
+            _cancel_armed_timer(
+                branches, state, h.id(), out2.kind == SelectBranch.RECV and out2.closed
+            )
+            state.winner = idx2
+            return out2^
+        return SelectOutcome[T]()
+    if not park_commit(h, park_reason):
+        claim_running(h)
+        var idx2 = rescan[T](branches, state, now_ticks)
+        if idx2 != -1:
+            var out2 = _claim_at[T](branches, idx2)
+            _unregister_others[T](branches, h.id(), idx2)
+            _cancel_armed_timer(
+                branches, state, h.id(), out2.kind == SelectBranch.RECV and out2.closed
+            )
+            state.winner = idx2
+            return out2^
+        return SelectOutcome[T]()
     return SelectOutcome[T]()

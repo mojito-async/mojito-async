@@ -108,16 +108,17 @@ def _cancel_with_reason(
     reason: Int,
 ) raises -> Bool:
     """Shared body for cancel_op/cancel_and_close: pre-check WAITING (see
-    module docstring's C6 section), release the op-table slot, stamp
-    `reason`, and deliver the wake.  Returns True iff THIS call found the
-    waiter still WAITING and won the race (never calls unpark_current
-    otherwise — a benign loss to a competing winner, not an error)."""
+    module docstring's C6 section), release the op-table slot, and deliver
+    the wake with `reason` as the win_reason so the stamp is written INSIDE
+    unpark_current's guard — only if the claim actually succeeds (A4.4,
+    issue #58).  Returns True iff THIS call found the waiter still WAITING
+    and won the race (never calls unpark_current otherwise — a benign loss
+    to a competing winner, not an error)."""
     var h = _reconstruct_handle(waiter_tcb, waiter_task_id)
     if h.state() != TaskControlBlock.WAITING:
         return False
     reactor.unregister(token)
-    h.tcb()[].wait_node()[].set_reason(reason)
-    unpark_current[Nil](rt, h)
+    unpark_current[Nil](rt, h, win_reason=reason)
     return True
 
 
