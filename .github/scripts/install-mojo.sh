@@ -55,12 +55,37 @@ baked=$(sed -n 's/^package_root[[:space:]]*=[[:space:]]*\(.*\)$/\1/p' "$cfg" | h
 sed "s|$baked|$PREFIX|g" "$cfg" > "$cfg.rewritten"
 mv "$cfg.rewritten" "$cfg"
 
+# MODULAR_HOME points at the directory CONTAINING modular.cfg, which is
+# share/max — not the package prefix.  The brew formula's wrapper does
+# `export MODULAR_HOME="${MODULAR_HOME:-#{opt_libexec}/share/max}"`, and
+# getting this wrong is silent: `mojo --version` still works, and then every
+# compile fails with "use of unknown declaration 'Int'" and bogus indentation
+# errors, because the driver cannot resolve the stdlib.
+HOME_DIR="$PREFIX/share/max"
+
 if [ -n "${GITHUB_ENV:-}" ]; then
-    echo "MODULAR_HOME=$PREFIX" >> "$GITHUB_ENV"
+    echo "MODULAR_HOME=$HOME_DIR" >> "$GITHUB_ENV"
 fi
 if [ -n "${GITHUB_PATH:-}" ]; then
     echo "$PREFIX/bin" >> "$GITHUB_PATH"
 fi
 
-MODULAR_HOME="$PREFIX" "$PREFIX/bin/mojo" --version
-echo "install-mojo.sh: mojo installed at $PREFIX"
+# Prove the toolchain can actually COMPILE, not merely report a version:
+# --version passes even with a broken MODULAR_HOME, which is exactly how the
+# first version of this script looked fine and produced 100 failing drivers.
+probe="$work/probe.mojo"
+cat > "$probe" <<'PROBE'
+def main():
+    print("mojo-ok", 6 * 7)
+PROBE
+MODULAR_HOME="$HOME_DIR" "$PREFIX/bin/mojo" --version
+out=$(MODULAR_HOME="$HOME_DIR" "$PREFIX/bin/mojo" run "$probe" 2>&1) || {
+    echo "install-mojo.sh: the toolchain cannot compile a hello-world:"
+    printf '%s\n' "$out" | tail -n 10
+    exit 2
+}
+case "$out" in
+    *"mojo-ok 42"*) ;;
+    *) echo "install-mojo.sh: probe produced unexpected output: $out"; exit 2 ;;
+esac
+echo "install-mojo.sh: mojo installed at $PREFIX (MODULAR_HOME=$HOME_DIR)"
