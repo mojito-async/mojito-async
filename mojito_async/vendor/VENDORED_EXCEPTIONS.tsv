@@ -60,11 +60,13 @@ _spike_substrate_	intentional	intentional spike substrate; frozen ABI integratio
 # M:N rework (issue #101) landed on PROD without a matching re-vendor of
 # SPIKE, and nothing checked the claim before finding [4] existed.  PROD
 # is authoritative (Makefile:12: the dylib links PROD's objects only;
-# $(BUILD)/spike/%.o pattern rules exist but are never referenced by any
-# target, so SPIKE's C has not actually been COMPILED by `make` for as
-# long as this OBJS wiring has looked like this — a second, smaller
-# instance of the same "the comment claims something the build graph
-# doesn't do" pattern, filed as mojito-async#180 rather than fixed here).
+# SPIKE's C has not actually been COMPILED by `make` for as long as this
+# OBJS wiring has looked like this — a second, smaller instance of the
+# same "the comment claims something the build graph doesn't do" pattern.
+# A stray $(BUILD)/spike/%.o pattern rule pair used to sit in the Makefile
+# with zero consumers, implying otherwise; mojito-async#180 removed it
+# rather than wire it into a real target, since nothing needs SPIKE's C
+# built or linked standalone).
 spike:VENDORED_AT.txt	4fb8b793a9633791f4f961221d21070d3febd410c009c4b2b222c56342a08beb	provenance/prose-only file, expected to differ per copy (different vendor dates/paths); both copies also carried their own "byte-identical, diff -r is empty" claim, which was itself false the same way the Makefile's was — corrected in both copies in the same pass as this row (issue #170)
 spike:mojito_spike.h	15c6aed2c372bfd411e7ab4ac01ef0f62a1dd64580496cc2cd896688c1e82b15	PROD's header gained ms_live_stack_count (oversubscription guard, EPIC #2/#101) that SPIKE's copy never received; SPIKE is a frozen A0 snapshot, not a live consumer of the newer stack-pool guard (issue #170)
 spike:native_stack.c	c3902e81b8d054327845ea309364ff7a7aca9d8d940d1a37ec9277f1c61d67fc	SAFETY TRIPWIRE, read before ever re-linking SPIKE's objects: PROD's copy carries issue #145's g_registry_lock mutex (Bug 1: concurrent ms_stack_alloc/free/is_live) and ABA dead-list (Bug 2); SPIKE's copy has NEITHER. This is safe today ONLY because SPIKE's compiled objects are never linked into any dylib (see the OBJS note above) — SPIKE's own mojito_spike.mojo bindings resolve their externs against the PROD-built libmojito_spike.dylib at link time. If SPIKE ever becomes independently linked again, re-vendor this file from PROD FIRST (issue #170)

@@ -12,9 +12,13 @@
 # PROD is authoritative: the dylib is built from PROD only (OBJS below),
 # and the spike harness's own Mojo bindings (mojito_spike.mojo) resolve
 # their externs against that same PROD-built libmojito_spike.dylib at link
-# time — SPIKE's own *.c/*.S are never compiled by any target here (the
-# $(BUILD)/spike/%.o pattern rules below exist but nothing depends on
-# them; #180). Objects are kept in build/prod/.
+# time — SPIKE's own *.c/*.S are never compiled by any target here. There
+# used to be $(BUILD)/spike/%.o pattern rules claiming otherwise, with zero
+# consumers anywhere in this file; #180 removed them rather than wire them
+# into a real target, since nothing needs SPIKE's C built or linked
+# standalone (see the spike:native_stack.c row in VENDORED_EXCEPTIONS.tsv —
+# that row's safety reasoning depends on SPIKE staying unlinked). Objects
+# are kept in build/prod/.
 #
 # The two trees are NOT asserted byte-identical (that claim used to stand
 # here unchecked, and had been false since #101 landed on PROD without a
@@ -69,14 +73,8 @@ all:
 $(BUILD):
 	mkdir -p $@
 
-$(BUILD)/spike $(BUILD)/prod:
+$(BUILD)/prod:
 	mkdir -p $@
-
-$(BUILD)/spike/%.o: $(SPIKE)/%.c | $(BUILD)/spike
-	$(CC) $(CFLAGS) -I$(SPIKE)/include -c $< -o $@
-
-$(BUILD)/spike/%.o: $(SPIKE)/%.S | $(BUILD)/spike
-	$(CC) -I$(SPIKE)/include -c $< -o $@
 
 $(BUILD)/prod/%.o: $(PROD)/%.c | $(BUILD)/prod
 	$(CC) $(CFLAGS) -I$(PROD)/include -c $< -o $@
