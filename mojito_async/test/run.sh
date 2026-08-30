@@ -159,7 +159,20 @@ fi
 # Issue #150: t56_idle_accounting_aot hits the same default-optimization
 # compiler crash t47_pool_scheduler_aot does, once the full WorkerPool
 # dependency graph is compiled alongside a driver.
-AOT_O0_DRIVERS="t56_idle_accounting_aot t50_park_commit_window_aot t30_worker_pool_aot t33_steal_aot t34_two_phase_aot t34b_affinity_aot t34c_duplicate_wake_aot t35_idle_sleep_aot t36_fairness_aot t41_idle_timer_wake_aot t24_rendezvous_oneshot_aot t39_reactor_aot t40_io_token_aot t41_tcp_connect_aot t42_tcp_accept_aot t42_io_cancel_deadline_aot t44_tcp_read_write_aot t45_reactor_race_aot t46_reactor_fairness_aot t47_pool_scheduler_aot t49_pool_churn_aot t47_channel_cross_worker_aot t38_mutex_cross_worker_aot t52_steal_toctou_aot"
+# Issue #175: t60_barrier_cross_worker_aot's own header already documented
+# "BUILD LEVEL: -O 0, same as t38/t47/t50/t52" (LICM eating the driver's
+# plain Int round-handshake cells, issue #143's class) — but the driver was
+# never actually ADDED to this list, so every run compiled it at the
+# default optimization level instead. At default -O the SAME LICM class
+# also reaches WaitNode._next/_reason and TaskControlBlock._early (issue
+# #148's winner-marker/early-wake-latch fields, still plain non-atomic
+# storage, unlike the _state/_generation/_claim_epoch fields issue #143
+# converted to Atomic): a legitimately-stamped winner marker can be missed
+# by a stale/reordered read, surfacing as Condvar.resolve_winner's "resumed
+# with no winner marker stamped" raise. Confirmed empirically: 15/15 runs
+# RED at default -O, 30/30 runs PASS at -O 0 on an otherwise-unmodified
+# tree. `-O 0` closes the gap exactly like every driver below it.
+AOT_O0_DRIVERS="t56_idle_accounting_aot t50_park_commit_window_aot t30_worker_pool_aot t33_steal_aot t34_two_phase_aot t34b_affinity_aot t34c_duplicate_wake_aot t35_idle_sleep_aot t36_fairness_aot t41_idle_timer_wake_aot t24_rendezvous_oneshot_aot t39_reactor_aot t40_io_token_aot t41_tcp_connect_aot t42_tcp_accept_aot t42_io_cancel_deadline_aot t44_tcp_read_write_aot t45_reactor_race_aot t46_reactor_fairness_aot t47_pool_scheduler_aot t49_pool_churn_aot t47_channel_cross_worker_aot t38_mutex_cross_worker_aot t52_steal_toctou_aot t60_barrier_cross_worker_aot"
 
 failures=0; reds=0; known_reds=0; matrix=""
 
