@@ -418,18 +418,19 @@ def park_cancellable[R: ResultValue](
 
 
 def wake_cancelled[R: ResultValue](mut rt: Runtime, h: JoinHandle[R]) raises:
-    """Push-cancel a WAITING task (issue #57): stamp the wait reason CANCEL
-    then deliver the SAME wake `unpark_current` would for readiness.
+    """Push-cancel a WAITING task (issue #57): deliver the same wake
+    `unpark_current` would for readiness, passing CANCEL as the win_reason
+    so that `unpark_current` stamps the reason INSIDE its guard — only when
+    the claim actually succeeds (A4.4, issue #58).
 
     Callers that own a primitive-specific wait queue (Mutex/Semaphore/
     Channel) MUST remove `h` from their own queue FIRST (see module header)
     — this function only performs the state transition, exactly like
     unpark_current's contract.  If readiness already claimed the wake (the
     task is no longer WAITING), unpark_current's existing no-op path fires
-    and `_reason` is left untouched — the earlier winner's stamp (or lack
-    of one) stands; this call never overwrites a settled outcome."""
-    h.tcb()[].wait_node()[].set_reason(SuspendReason.CANCEL)
-    unpark_current(rt, h)
+    and `_reason` is left untouched — the earlier winner's stamp (or lack of
+    one) stands; this call never overwrites a settled outcome."""
+    unpark_current(rt, h, win_reason=SuspendReason.CANCEL)
 
 
 def is_cancel_wake[R: ResultValue](h: JoinHandle[R]) -> Bool:
