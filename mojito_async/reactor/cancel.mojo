@@ -117,7 +117,7 @@ def _cancel_with_reason(
         return False
     reactor.unregister(token)
     h.tcb()[].wait_node()[].set_reason(reason)
-    unpark_current[Nil](rt, h)
+    unpark_current[Nil](rt, h, required_gen=h.tcb()[].wait_node()[].generation())
     return True
 
 
@@ -231,7 +231,9 @@ def service_io_deadlines[R: ResultValue](
             ),
             e.id,
         )
-        if h.state() == TaskControlBlock.WAITING:
-            unpark_current(rt, h, 0, SuspendReason.TIMER)
+        var gen = h.tcb()[].wait_node()[].generation()
+        var was_waiting = h.tcb()[].state() == TaskControlBlock.WAITING
+        unpark_current(rt, h, required_gen=gen, win_reason=SuspendReason.TIMER)
+        if was_waiting and h.tcb()[].state() == TaskControlBlock.RUNNABLE:
             woke += 1
     return woke
