@@ -18,3 +18,9 @@
 # carried a real use-after-free into main: PR #136 dismissed a reproducible
 # post-PASS SIGSEGV as covered by it, and PR #139 root-caused the SIGSEGV as
 # a genuine UAF. The row is gone and the gate is per-driver now.
+# t51_default_o_repeat documents that Mojo's AOT LICM-hoists t38's own
+# plain-Int driver cells at default -O even after the TCB _state field is
+# made atomic.  The TCB fix is correct; the remaining failure is a driver-
+# side limitation.  Remove this row when the driver cells are also atomic or
+# the upstream compiler closes the LICM gap.
+t51_default_o_repeat	https://github.com/mojito-async/mojito-async/issues/143	2026-08-30
