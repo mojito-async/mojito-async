@@ -100,11 +100,34 @@ echo open
 GH_STUB
     chmod +x "$sb/bin/gh"
     git -C "$sb" init -q . || return 1
+    # Hard safety net, not just a convenience check: verify the sandbox
+    # git considers ITSELF ($sb) really is its own repo, distinct from the
+    # real one this script lives in, before touching anything with `add` or
+    # `config`. This was added after `probe.txt` and a bogus commit author
+    # leaked into the REAL repo from this sandbox under real (non-isolated
+    # test) invocation — root cause not fully pinned down, so this check
+    # exists to turn any recurrence into a loud `return 1` here instead of
+    # a silent write to the wrong repository.
+    sb_toplevel=$(git -C "$sb" rev-parse --show-toplevel 2>/dev/null)
+    real_toplevel=$(git -C "$REPO_ROOT" rev-parse --show-toplevel 2>/dev/null)
+    if [ -z "$sb_toplevel" ] || [ "$sb_toplevel" = "$real_toplevel" ]; then
+        echo "make_sandbox: sandbox toplevel ('$sb_toplevel') is not a distinct repo from '$real_toplevel'; refusing to proceed" >&2
+        return 1
+    fi
     git -C "$sb" config --local user.email gate-selftest@example.invalid
     git -C "$sb" config --local user.name  "gate selftest"
     git -C "$sb" config --local commit.gpgsign false
     echo probe > "$sb/probe.txt"
-    git -C "$sb" add probe.txt || return 1
+    # Absolute path, not "probe.txt": a bare relative pathspec here is what
+    # was observed leaking into the real repo's index under real (hook-
+    # driven) invocation, even with `git -C "$sb"` — using $sb/probe.txt
+    # removes any ambiguity about which repo's pathspec resolution applies.
+    git -C "$sb" add "$sb/probe.txt" || return 1
+    added=$(git -C "$sb" diff --cached --name-only)
+    if [ "$added" != "probe.txt" ]; then
+        echo "make_sandbox: expected only probe.txt staged in sandbox, got: $added" >&2
+        return 1
+    fi
     printf '%s' "$sb"
 }
 
