@@ -142,7 +142,7 @@ fi
 # Issue #144: t52_steal_toctou_aot joins for the same DRIVER-side reason
 # issue #143 documents — its cross-thread counters are plain Int cells that
 # the compiler hoists out of the spin loops at default -O.
-AOT_O0_DRIVERS="t52_steal_toctou_aot t30_worker_pool_aot t33_steal_aot t34_two_phase_aot t34b_affinity_aot t34c_duplicate_wake_aot t35_idle_sleep_aot t36_fairness_aot t41_idle_timer_wake_aot t24_rendezvous_oneshot_aot t39_reactor_aot t40_io_token_aot t41_tcp_connect_aot t42_tcp_accept_aot t42_io_cancel_deadline_aot t44_tcp_read_write_aot t45_reactor_race_aot t46_reactor_fairness_aot t47_pool_scheduler_aot t49_pool_churn_aot t47_channel_cross_worker_aot t38_mutex_cross_worker_aot"
+AOT_O0_DRIVERS="t50_park_commit_window_aot t30_worker_pool_aot t33_steal_aot t34_two_phase_aot t34b_affinity_aot t34c_duplicate_wake_aot t35_idle_sleep_aot t36_fairness_aot t41_idle_timer_wake_aot t24_rendezvous_oneshot_aot t39_reactor_aot t40_io_token_aot t41_tcp_connect_aot t42_tcp_accept_aot t42_io_cancel_deadline_aot t44_tcp_read_write_aot t45_reactor_race_aot t46_reactor_fairness_aot t47_pool_scheduler_aot t49_pool_churn_aot t47_channel_cross_worker_aot t38_mutex_cross_worker_aot t52_steal_toctou_aot"
 
 failures=0; reds=0; matrix=""
 
