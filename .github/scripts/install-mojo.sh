@@ -46,6 +46,7 @@ if ! command -v zstd >/dev/null 2>&1; then
 fi
 
 work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
 echo "install-mojo.sh: fetching mojo-compiler-$VERSION from $subdir"
 curl -fsSL -o "$work/mojo.conda" \
     "https://conda.modular.com/max/$subdir/mojo-compiler-$VERSION-release.conda"
@@ -60,7 +61,7 @@ cfg="$PREFIX/share/max/modular.cfg"
 [ -f "$cfg" ] || { echo "install-mojo.sh: $cfg missing after unpack"; exit 2; }
 baked=$(sed -n 's/^package_root[[:space:]]*=[[:space:]]*\(.*\)$/\1/p' "$cfg" | head -1)
 [ -n "$baked" ] || { echo "install-mojo.sh: could not read the baked prefix from $cfg"; exit 2; }
-sed "s|$baked|$PREFIX|g" "$cfg" > "$cfg.rewritten"
+awk -v old="$baked" -v new="$PREFIX" '{ gsub(old, new); print }' "$cfg" > "$cfg.rewritten"
 mv "$cfg.rewritten" "$cfg"
 
 # MODULAR_HOME points at the directory CONTAINING modular.cfg, which is
