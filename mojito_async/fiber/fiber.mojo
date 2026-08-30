@@ -151,6 +151,13 @@ struct Fiber(Movable, ImplicitlyDeletable, FiberMotion):
     # trampoline re-entry trap (brk 0x66).
     var _completed: Bool
 
+    # Issue #145 Bug 2 (single-owner rule): when True, this fiber's stack
+    # was acquired from a StackCache pool.  Pool-owned stacks MUST be
+    # returned to the pool via pool.retire() — not munmapped by destroy().
+    # destroy() skips stack_free() for pooled cells; the pool's retire() or
+    # drain() is the sole path that returns the reservation to the OS.
+    var _is_pooled: Bool
+
     # A1.3 (issue #51): the WORKER identity this fiber is affine to once
     # started (spec §19.2 / ADR-006).  0 = not pinned.  b2 has no TLS, so
     # worker identity is threaded explicitly: the creating worker (EPIC #2's
@@ -174,6 +181,7 @@ struct Fiber(Movable, ImplicitlyDeletable, FiberMotion):
         self._suspended = False
         self._completed = False
         self._owner = 0
+        self._is_pooled = False
 
     # All-scalar ctor binding an existing reservation: `stack` (base/top from
     # ms_stack_alloc).  The block is not yet allocated (deferred to the
@@ -187,6 +195,7 @@ struct Fiber(Movable, ImplicitlyDeletable, FiberMotion):
         self._suspended = False
         self._completed = False
         self._owner = 0
+        self._is_pooled = False
 
     # -- queries -----------------------------------------------------------
 
@@ -218,6 +227,22 @@ struct Fiber(Movable, ImplicitlyDeletable, FiberMotion):
         self._completed = True
         if self._block != 0:
             self._completed_flag()[0] = 1
+
+    def set_pooled(mut self):
+        """Mark this fiber's stack as pool-owned (issue #145 Bug 2).
+
+        Once set, destroy() will NOT call stack_free() on the reservation.
+        The StackCache pool is the sole owner of the physical mapping and
+        MUST release it via pool.retire() or pool.drain().
+
+        Called by the pool-aware scheduler seam immediately after binding a
+        pool-acquired stack via make_fiber() / bind()."""
+        self._is_pooled = True
+
+    def is_pooled(self) -> Bool:
+        """True when the stack was pool-acquired and must not be munmapped
+        by destroy() (issue #145 Bug 2)."""
+        return self._is_pooled
 
     def is_started(self) -> Bool:
         """Spec §14.1 `started`: True exactly once the fiber has entered body
@@ -416,9 +441,15 @@ struct Fiber(Movable, ImplicitlyDeletable, FiberMotion):
     # heap block.  alive() guards make a second destroy() (and destroy() on
     # a never-wired fiber) a no-op.  Single-owner semantics: exactly ONE
     # destroy() per live Fiber, on the OWNING handle.
+    #
+    # Issue #145 Bug 2 (single-owner rule): pool-owned cells (_is_pooled=True)
+    # are NOT munmapped here.  The pool is the sole OS-level owner; the fiber
+    # only borrows the reservation for its lifetime.  pool.retire() / drain()
+    # are the only callers of ms_stack_free for pool cells.
     def destroy(mut self):
         if self._stack != 0:
-            stack_free(NativeStack(self.stack_base(), self.stack_top()))
+            if not self._is_pooled:
+                stack_free(NativeStack(self.stack_base(), self.stack_top()))
             self._stack = 0
             self._top = 0
             self._prepared = False
@@ -426,6 +457,7 @@ struct Fiber(Movable, ImplicitlyDeletable, FiberMotion):
             self._suspended = False
             self._completed = False
             self._owner = 0
+            self._is_pooled = False
             self._zero_flags()
         if self._block != 0:
             c_free(UnsafePointer[Byte, MutAnyOrigin](unsafe_from_address=self._block))
