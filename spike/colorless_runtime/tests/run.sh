@@ -33,7 +33,10 @@ SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 REPO_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/../../.." && pwd)
 SPIKE_DIR="$REPO_ROOT/spike/colorless_runtime"
 BINDING_DIR="$SPIKE_DIR/vendor/mojito-sys"
+# The substrate is a .dylib on Darwin and a .so elsewhere (issue #141:
+# the Linux lanes must be able to run at all).
 DYLIB="$REPO_ROOT/libmojito_spike.dylib"
+[ -f "$DYLIB" ] || DYLIB="$REPO_ROOT/libmojito_spike.so"
 BUILD_DIR="$REPO_ROOT/build"
 
 MOJO=${MOJO:-mojo}
@@ -161,6 +164,16 @@ done
 echo ""
 echo "mojito-async A0 colorless-runtime test matrix (issue #11)"
 printf '%s' "$matrix" | sed 's/^/  /'
+echo ""
+
+# --- per-driver verdict rows (issue #141) ----------------------------------
+# One machine-readable line per driver for precommit/gate.sh, which scores
+# known-red allow-listing PER DRIVER.  Before #141 the gate saw a single
+# check named `suite`, so one allow-list row covered every driver and every
+# bench in the tree at once.
+# Prefixed `spike_` so an A0 spike driver and an A1 driver that happen to
+# share a tNN_ number stay separately allow-listable.
+printf '%s' "$matrix" | awk 'NF>=2 {print "VERDICT\tspike_" $1 "\t" $2}'
 echo ""
 if [ "$failures" -ne 0 ]; then
     echo "RESULT: $failures unexpected FAILURE(S)"
