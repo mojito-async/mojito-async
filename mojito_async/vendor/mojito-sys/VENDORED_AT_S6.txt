@@ -5,8 +5,40 @@ include/mojito_sys.h}
 Source repository: github.com/mojito-async/mojito-sys
 Source tree:       native/posix/{mjs_poller.c,mjs_epoll.c,mjs_iouring.c},
                     native/include/mojito_sys.h
-Source commit:      0bfb5291b698c833b302feb35c5724d44961f6d5 (main)
-Vendored on:        2026-08-28 (A7.1 productionization, issue #75)
+Source commit:      48b4f8fd7bc04aba1ca8d8e4a20c7ec315482619 (main)
+Vendored on:        2026-08-30 (re-vendor of mjs_iouring.c ONLY, issue #168)
+
+RE-VENDOR 2026-08-30 (issue #168). mjs_iouring.c was refreshed from
+upstream `main` to pick up two fixes it predated; the other three files in
+this slice were already byte-identical to the new commit and did not
+change. mojito_sys.h in particular is UNCHANGED, so nothing here touches
+the frozen ABI and this re-vendor does not intersect mojito-sys#164.
+
+  mojito-sys#167  ioring_enter returns the NUMBER OF SQES CONSUMED.
+                  uring_submit_poll_add passed that through while its
+                  docstring promised "0 or negative errno", and
+                  mjs_iouring_create/register tested it with `!= 0`. So
+                  create armed its wake poll, read the 1 SQE back as a
+                  failure, tore down the ring it had just built and
+                  returned +1. The backend's only success configuration
+                  was unreachable, and create_completion_poller() raised
+                  a fabricated "POSIX errno 1" on every Linux host with
+                  the flag set.
+  mojito-sys#169  iouring_unmap recomputed each mapping's length from a
+                  different formula than iouring_map_rings used, so at
+                  4 KiB pages sq_ring was unmapped a page short and
+                  cq_ring two pages long, silently releasing whatever
+                  followed the cq ring. The two map-failure paths also
+                  released nothing at all, because they ran before the
+                  entry counts those formulas needed were assigned. Each
+                  mapping's exact mmap length is now stored beside its
+                  pointer and unmapped verbatim.
+
+Verified after copying by building THIS vendored file as a Linux shared
+object on a native aarch64 kernel and running mojito-sys's own s6 drivers
+against it (tests/s6/iouring_submit for #167, tests/s6/iouring_unmap for
+#169). Both report all green; before the copy the same drivers reported
+RED against this file.
 
 FILES (byte-identical to upstream `main` at the commit above; fetched via
 `gh api repos/mojito-async/mojito-sys/contents/<path>` with the raw
