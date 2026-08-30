@@ -59,10 +59,11 @@
 # #59's explicit ask: "reuse the SAME Condvar wait/notify-all path").
 from std.collections import Deque
 from mojito_async.cancellation import CancellationError
+from mojito_async.runtime.queue import SpinLock
 from mojito_async.runtime.runtime import Runtime
 from mojito_async.runtime.task_control_block import ResultValue, TaskControlBlock
-from mojito_async.task import JoinHandle
-from mojito_async.runtime.park import park_current, unpark_current
+from mojito_async.task import JoinHandle, claim_running
+from mojito_async.runtime.park import park_commit, park_prepare, park_validate, unpark_current
 from mojito_async.sync.mutex import Mutex
 
 
@@ -157,11 +158,23 @@ def release_waiter[R: ResultValue](
 # Condvar
 # ---------------------------------------------------------------------------
 
-struct Condvar(Movable):
+struct Condvar:
     """Task-aware condition variable (spec §A5).
 
-    State: `_w_tcb`/`_w_id` — FIFO of parked waiters (tcb_addr, task id),
-    identical shape to Mutex/Semaphore's own wait deques.
+    State:
+      _guard   — SpinLock serializing the waiter FIFO: on the A2 M:N
+                  scheduler a concurrent notify_one/notify_all can pop from
+                  the same Deque storage that wait()'s PHASE_INIT branch is
+                  appending to, and a producer holding the mutex can call
+                  notify_one on an empty FIFO while the consumer is between
+                  mutex.unlock() and the append — both are data races and
+                  lost wakeups respectively (issue #148).  The guard is
+                  acquired BEFORE mutex.unlock() in wait() so that a
+                  notifier that arrives after the unlock is serialized
+                  AFTER the append — no lost notify.  Same SpinLock pattern
+                  as Mutex/RWLock/Barrier (A4.1, #55/#122/#148).
+      _w_tcb/_w_id — FIFO of parked waiters (tcb_addr, task id),
+                  identical shape to Mutex/Semaphore's own wait deques.
 
     `wait` is a multi-step contract like Mutex.lock/Semaphore.acquire: the
     caller's dispatch loop re-invokes it after each park/wake edge, threading
@@ -170,10 +183,12 @@ struct Condvar(Movable):
     winner cause the caller reads back.
     """
 
+    var _guard: SpinLock
     var _w_tcb: Deque[Int]
     var _w_id: Deque[Int]
 
     def __init__(out self):
+        self._guard = SpinLock()
         self._w_tcb = Deque[Int]()
         self._w_id = Deque[Int]()
 
@@ -202,17 +217,49 @@ struct Condvar(Movable):
         re-parked on the mutex's own FIFO); the caller's dispatch loop must
         re-invoke wait() after the next park/wake edge.  Raises
         CancellationError-as-Error (AFTER re-acquiring the lock) when a
-        racing `cancel_waiter` claimed the winner marker first."""
+        racing `cancel_waiter` claimed the winner marker first.
+
+        Lost-wakeup safety (issue #148): _guard is acquired BEFORE
+        mutex.unlock() so a producer that acquires the mutex and calls
+        notify_one AFTER our unlock cannot find an empty FIFO — it blocks
+        on _guard until we have appended, then delivers the wake.  The
+        two-phase park_prepare/park_validate/park_commit kernel (NOT the
+        single-phase park_current) then closes the PARKING-window race:
+        a notifier that arrives after _guard.unlock() but before park_commit
+        sets the early-readiness latch; park_validate re-checks it before
+        park_commit decides WAITING vs. an immediate unwind (A0-T11)."""
         if cause[] == PHASE_INIT:
-            # Release the lock to ITS OWN FIFO so a producer can run, then
-            # publish this task as a condvar waiter and park it (atomic
-            # within this dispatcher slice — no lost-wakeup window on the
-            # single cooperative worker, see runtime/park.mojo's header).
+            # Acquire condvar _guard BEFORE mutex.unlock() — a producer
+            # holding the mutex and then calling notify_one must block on
+            # _guard until we have appended to the FIFO; otherwise it sees
+            # an empty FIFO between our unlock and our append (lost notify).
+            self._guard.lock()
             _ = lock.unlock[R](rt)
             self._w_tcb.append(Int(h.tcb()))
             self._w_id.append(h.id())
             cause[] = PHASE_PARKED
-            park_current(rt, h)
+            self._guard.unlock()
+            # Two-phase park (issue #148): NOT the single-phase park_current.
+            park_prepare(h)
+            if park_validate(h):
+                _ = park_commit(h)
+                claim_running(h)
+                cause[] = resolve_winner[R](h)
+                var got = lock.lock[R](rt, h)
+                if not got:
+                    return False
+                if cause[] == WINNER_CANCELLED:
+                    raise Error(CancellationError("CancellationError: Condvar.wait cancelled").message)
+                return True
+            if not park_commit(h):
+                claim_running(h)
+                cause[] = resolve_winner[R](h)
+                var got = lock.lock[R](rt, h)
+                if not got:
+                    return False
+                if cause[] == WINNER_CANCELLED:
+                    raise Error(CancellationError("CancellationError: Condvar.wait cancelled").message)
+                return True
             return False
         if cause[] == PHASE_PARKED:
             # Resumed: exactly one of notify_one/notify_all/cancel_waiter/
@@ -234,11 +281,18 @@ struct Condvar(Movable):
     def notify_one[R: ResultValue](mut self, mut rt: Runtime) raises -> Bool:
         """Wake the LONGEST-waiting task.  A signal with no waiters is
         dropped safely (returns False) — lossless per the predicate-recheck
-        protocol documented above the FIFO."""
+        protocol documented above the FIFO.
+
+        Guarded by _guard (issue #148): notify_one and wait()'s PHASE_INIT
+        append are ONE serialized pair — a notify on an empty FIFO while a
+        concurrent append is in-flight would silently drop the signal."""
+        self._guard.lock()
         if len(self._w_tcb) == 0:
+            self._guard.unlock()
             return False
         var tcb = self._w_tcb.popleft()
         var tid = self._w_id.popleft()
+        self._guard.unlock()
         notify_marker[R](rt, tcb, tid, WINNER_READY)
         return True
 
@@ -246,8 +300,7 @@ struct Condvar(Movable):
         """Wake EVERY currently-waiting task, one enqueue each (no
         duplicates — the FIFO drains to empty).  Returns the count woken."""
         var n = 0
-        while len(self._w_tcb) != 0:
-            _ = self.notify_one[R](rt)
+        while self.notify_one[R](rt):
             n += 1
         return n
 
@@ -257,19 +310,45 @@ struct Condvar(Movable):
         mut self, mut rt: Runtime, h: JoinHandle[R]
     ) raises -> Bool:
         """Claim `h`'s winner marker as CANCELLED and remove it from the
-        FIFO (called by whoever observes `h`'s CancellationToken was
-        requested — the receive-side half of #57's token integration; this
-        lane does not yet have a push notification from the token itself,
-        so the caller drives this explicitly, matching how timer_service's
-        service_timers explicitly drives expiry wakes).  Idempotent: False
-        when `h` already left the FIFO (a racing notify/timeout won)."""
-        return release_waiter[R](self._w_tcb, self._w_id, rt, h, WINNER_CANCELLED)
+        FIFO.  Idempotent: False when `h` already left the FIFO (a racing
+        notify/timeout won).
+
+        The FIFO search + removal is ONE guarded critical section (issue
+        #148): _w_tcb/_w_id are shared with notify_one/notify_all on
+        another worker."""
+        self._guard.lock()
+        var n = len(self._w_tcb)
+        var found = False
+        for _ in range(n):
+            var tcb = self._w_tcb.popleft()
+            var tid = self._w_id.popleft()
+            if tid == h.id() and not found:
+                found = True
+                notify_marker[R](rt, tcb, tid, WINNER_CANCELLED)
+            else:
+                self._w_tcb.append(tcb)
+                self._w_id.append(tid)
+        self._guard.unlock()
+        return found
 
     def timeout_waiter[R: ResultValue](
         mut self, mut rt: Runtime, h: JoinHandle[R]
     ) raises -> Bool:
-        """Claim `h`'s winner marker as TIMEOUT and remove it from the FIFO
-        (called by a caller-armed deadline's expiry, e.g. after
-        time/timer_service.service_timers reports `h`'s timer due).
-        Idempotent: False when `h` already left the FIFO."""
-        return release_waiter[R](self._w_tcb, self._w_id, rt, h, WINNER_TIMEOUT)
+        """Claim `h`'s winner marker as TIMEOUT and remove it from the FIFO.
+        Idempotent: False when `h` already left the FIFO.
+
+        Guarded by _guard (issue #148) — mirrors cancel_waiter."""
+        self._guard.lock()
+        var n = len(self._w_tcb)
+        var found = False
+        for _ in range(n):
+            var tcb = self._w_tcb.popleft()
+            var tid = self._w_id.popleft()
+            if tid == h.id() and not found:
+                found = True
+                notify_marker[R](rt, tcb, tid, WINNER_TIMEOUT)
+            else:
+                self._w_tcb.append(tcb)
+                self._w_id.append(tid)
+        self._guard.unlock()
+        return found
