@@ -509,7 +509,11 @@ def chan_send_dispatch(mut rt: Runtime, tcb_addr: Int, tid: Int, ud: BytePtr) ra
             red("chan-send: unexpected raise on first attempt: " + String(e))
         return 1
     try:
-        _ = sc[].tx.send_cancellable(rt, h, 100 + who, sc[].token[])
+        var outcome2 = sc[].tx.send_cancellable(rt, h, 100 + who, sc[].token[])
+        if outcome2.is_parked():
+            # A second park is legal (e.g. competing sender stole the slot between
+            # the wake and re-entry); return and wait for the next dispatch.
+            return 1
         var i = sc[].norder[]
         sc[].order[i] = who
         sc[].norder[] = i + 1
