@@ -5,10 +5,17 @@ name: ci
 # claim in 115 merged PRs was self-reported from the author's laptop against
 # a pre-commit gate that a stale `suite` allow-list row had disarmed.
 #
-# Three lanes:
-#   gate-selftest  the gate's own test, no toolchain, runs everywhere
-#   suite-macos    the real suite on the kqueue/arm64 host — the blocking lane
-#   suite-linux    the epoll/io_uring/x86-64 host, which has NEVER executed
+# Four lanes:
+#   gate-selftest       the gate's own test, no toolchain, runs everywhere
+#   suite-macos         the real suite on the kqueue/arm64 host — the
+#                        blocking lane
+#   suite-linux         the epoll/io_uring/x86-64 host, which has NEVER
+#                        executed
+#   suite-linux-iouring the Linux io_uring completion-poller lane (issue
+#                        #171): drives create_completion_poller() to an
+#                        actual SUCCESS with MOJITO_IO_URING=1, not merely
+#                        the "raises on a host without it" t39 already
+#                        covers.
 #
 # suite-linux is reported, not blocking, and we now know exactly where it
 # stops. It does not reach a single test: `make` fails at
@@ -28,6 +35,22 @@ name: ci
 # not only the absence of CI. mojito-sys#162 and #163 sit behind this too.
 # The lane's job is to keep that visible instead of pretending it is green;
 # flip `continue-on-error` off when the substrate builds.
+#
+# suite-linux-iouring sits behind the EXACT SAME wall: it cannot get past
+# `make` either today, for the identical reason. It is added anyway,
+# reported rather than blocking, so the lane is ready to actually start
+# proving something the moment mojito-sys#164 unblocks the Linux build —
+# mojito_async/test/linux/t61_reactor_iouring_completion_aot.mojo and its
+# runner (mojito_async/test/linux/run.sh) are already correct and already
+# guard-tested (on Darwin, where the guard is expected to trip: see that
+# driver's header for the exit-code contract). What this job cannot do
+# yet — and what no session working this repo from a macOS host can do
+# directly — is exercise the actual success path on a live Linux kernel
+# with io_uring; that verification is deferred entirely to this CI runner,
+# once it can build at all. Same maintenance note as suite-linux above:
+# flip this job's `continue-on-error` off too once `make` succeeds here --
+# a real regression in this lane must start blocking the moment it is
+# able to, not stay reported-only forever by inertia.
 
 on:
   push:
@@ -95,3 +118,33 @@ jobs:
         run: make
       - name: A1 runtime suite
         run: ./mojito_async/test/run.sh
+
+  suite-linux-iouring:
+    name: io_uring completion lane (Linux x86-64, issue #171) — reported, not blocking
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    # Same container-not-runner-image rationale as suite-linux above, and
+    # the same `make`-cannot-build-on-Linux-yet ceiling (mojito-sys#164;
+    # see this file's header comment). This job is separate from
+    # suite-linux, not a step inside it, so its own guard/verdict shows up
+    # as its own named check rather than folded into a suite it is not
+    # part of (mojito_async/test/linux/run.sh is deliberately NOT wired
+    # into mojito_async/test/run.sh or precommit/run-suite.sh — see that
+    # script's header).
+    container:
+      image: debian:bookworm
+    steps:
+      - name: Container prerequisites
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends \
+            build-essential ca-certificates curl git unzip zstd
+      - uses: actions/checkout@v4
+      - name: Install Mojo toolchain
+        run: ./.github/scripts/install-mojo.sh
+      - name: Build the vendored substrate
+        run: make
+      - name: io_uring completion-poller lane (issue #171)
+        env:
+          MOJITO_IO_URING: "1"
+        run: ./mojito_async/test/linux/run.sh
