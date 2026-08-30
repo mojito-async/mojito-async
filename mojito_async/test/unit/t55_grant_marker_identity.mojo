@@ -121,7 +121,7 @@ def main() raises:
     var handed = mtx.unlock[IntResult](rt)
     if not handed:
         failures.append("setup: unlock() did not hand off to the waiter")
-    if tcb.wait_node()[].next() != 1:
+    if tcb.wait_node()[].next() == 0:
         failures.append("setup: the mutex grant marker should be stamped")
 
     # --- re-entry: the body re-runs from the top --------------------------

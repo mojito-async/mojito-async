@@ -57,9 +57,6 @@ from mojito_async.runtime.park import (
 from mojito_async.cancellation import CancellationToken
 
 
-comptime WAITER_GRANTED = Int(1)
-
-
 def _waiter_handle[R: ResultValue](tcb_addr: Int, tid: Int) -> JoinHandle[R]:
     """Reconstruct a waiter's one-shot handle from the queued (addr, id)."""
     return JoinHandle[R](
@@ -197,8 +194,7 @@ struct Mutex[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable]:
         # only the resumed owner-task itself ever reaches this after being
         # granted (happens-before via the wake claim that resumed it), so
         # no guard is needed for this read/clear.
-        var dbg_marker = h.tcb()[].wait_node()[].next()
-        if dbg_marker == WAITER_GRANTED:
+        if h.tcb()[].wait_node()[].next() == Int(UnsafePointer[Self, MutAnyOrigin](to=self)):
             h.tcb()[].wait_node()[].set_next(0)
             return True
         # 2) fast path / 3) publish as a FIFO waiter — ONE guarded critical
@@ -254,13 +250,13 @@ struct Mutex[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable]:
         var tid = self._w_id.popleft()
         self._guard.unlock()
         var hw = _waiter_handle[R](tcb, tid)
-        hw.tcb()[].wait_node()[].set_next(WAITER_GRANTED)
+        hw.tcb()[].wait_node()[].set_next(Int(UnsafePointer[Self, MutAnyOrigin](to=self)))
         unpark_current(rt, hw)
         return True
 
-    def holds_grant[R: ResultValue](self, h: JoinHandle[R]) -> Bool:
+    def holds_grant[R: ResultValue](mut self, h: JoinHandle[R]) -> Bool:
         """Diagnostics: does `h` carry an outstanding GRANT marker?"""
-        return h.tcb()[].wait_node()[].next() == WAITER_GRANTED
+        return h.tcb()[].wait_node()[].next() == Int(UnsafePointer[Self, MutAnyOrigin](to=self))
 
     # --- token-aware acquire (A4.3, issue #57) ------------------------------
 
