@@ -17,6 +17,15 @@
 #     UNREACHABLE without the MOJITO_IO_URING flag/host support and raises
 #     a decoded error (this darwin host has neither).
 #
+# The line above is the ONLY assertion this driver makes about the
+# completion backend, and it is correct on every host this driver has
+# ever run on -- which means the one configuration that must SUCCEED
+# (Linux, real io_uring, MOJITO_IO_URING=1) has never executed here.
+# mojito_async/test/linux/t61_reactor_iouring_completion_aot.mojo (issue
+# #171) is that lane: same register/write/poll/deliver/unregister/wake
+# battery as this driver, over the completion backend, guarded so it can
+# only report success on a host that genuinely has it.
+#
 # AOT-only: imports the vendor/mojito_sys_io externs (dylib mjs_poller_*
 # symbols), so this runs via the run.sh unit AOT loop (`*_aot.mojo`,
 # modular/modular#6971 — the b2 JIT cannot resolve dylib symbols through
