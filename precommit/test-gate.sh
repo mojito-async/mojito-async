@@ -29,6 +29,34 @@
 # never deletes or modifies anything in the repository itself.
 set -u
 
+# Root cause of the probe.txt / commit-author leak (issue #169), found by
+# reproducing it directly: when this script runs as a descendant of a REAL
+# git hook, git has already exported GIT_DIR and GIT_INDEX_FILE (and, in a
+# linked worktree, GIT_DIR points at this worktree's own gitdir under the
+# main checkout's .git/worktrees/<name>/) into the hook's environment.
+# `git -C <dir>` changes cwd-based repo DISCOVERY only — it does not clear
+# these variables, and they win over `-C` for anything that resolves
+# against the index or config (`git add`, `git config --local`, ...) even
+# though `git -C <dir> rev-parse --show-toplevel` correctly reports <dir>
+# as a distinct worktree. That mismatch is exactly why the earlier
+# "sb_toplevel != real_toplevel" guard in make_sandbox did not catch it:
+# toplevel resolution and index/config resolution follow different rules
+# under these variables (the earlier "cd \"\" is a silent no-op on this
+# host's sh" hypothesis was plausible but not the actual mechanism —
+# `git -C` was used throughout even in the version that leaked, so a lost
+# `cd` was never the culprit). Verified live: with GIT_DIR/GIT_INDEX_FILE
+# set to this repo's real values, `git -C "$sb" add "$sb/probe.txt"`
+# staged probe.txt into the REAL repo's index while `git -C "$sb"
+# rev-parse --show-toplevel` still correctly printed "$sb". Unsetting
+# these once, here, before any sandbox exists, removes the ambiguity for
+# every git command this script (or anything it execs, including the
+# sandboxed precommit/gate.sh that run_gate invokes) runs from this point
+# on.
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR \
+      GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_PREFIX \
+      GIT_AUTHOR_NAME GIT_AUTHOR_EMAIL GIT_AUTHOR_DATE \
+      GIT_COMMITTER_NAME GIT_COMMITTER_EMAIL GIT_COMMITTER_DATE
+
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 REPO_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
 GATE="$SCRIPT_DIR/gate.sh"
@@ -64,8 +92,24 @@ make_sandbox() {
     kr=$1
     suite_body=$2
     sb=$(mktemp -d 2>/dev/null) || return 1
+    # Every filesystem/git operation below is anchored to $sb explicitly
+    # (an absolute path, and `git -C`, never a bare `cd`) rather than
+    # relying on a subshell's cwd. A bare `cd "$sb"` inside `( ... )` is
+    # supposed to be isolated to that subshell, and `[ -z "$sb" ]` guards
+    # downstream are supposed to catch mktemp failing outright — but this
+    # sandbox WAS observed leaking into the real repo's shared git config
+    # under concurrent gate runs this session (issue #169: several commits
+    # across this session, in both mojito-async and mojito-sys, ended up
+    # authored as "gate selftest <gate-selftest@example.invalid>" — `sh`
+    # on this host treats `cd ""` as a silent no-op success rather than an
+    # error, so any path where a sandbox var went missing under contention
+    # would fall through to whatever cwd was already current, i.e. the
+    # real repo, without any command here noticing). `git -C` removes the
+    # dependency on `cd` succeeding and on subshell cwd propagation
+    # entirely, so whatever the exact trigger was, it can't recur here.
+    [ -n "$sb" ] && [ -d "$sb" ] || return 1
     mkdir -p "$sb/precommit" "$sb/bin" || return 1
-    cp "$GATE" "$sb/precommit/gate.sh"
+    cp "$GATE" "$sb/precommit/gate.sh" || return 1
     chmod +x "$sb/precommit/gate.sh"
     printf '%s\n' "$kr" > "$sb/precommit/known-red.tsv"
     printf '%s\n' "$suite_body" > "$sb/precommit/run-suite.sh"
@@ -83,20 +127,52 @@ done
 echo open
 GH_STUB
     chmod +x "$sb/bin/gh"
-    (
-        cd "$sb" || exit 1
-        git init -q .
-        git config user.email gate-selftest@example.invalid
-        git config user.name  "gate selftest"
-        git config commit.gpgsign false
-        echo probe > probe.txt
-        git add probe.txt
-    ) >/dev/null 2>&1 || return 1
+    git -C "$sb" init -q . || return 1
+    # Defense-in-depth, now that the actual root cause (ambient
+    # GIT_DIR/GIT_INDEX_FILE inherited from a real hook invocation — see
+    # the `unset` block at the top of this file) is fixed: verify the
+    # sandbox git considers ITSELF ($sb) really is its own repo, distinct
+    # from the real one this script lives in, before touching anything
+    # with `add` or `config`. This check alone did NOT catch the leak when
+    # it was first added, because `git -C "$sb" rev-parse --show-toplevel`
+    # still correctly reports $sb even while GIT_INDEX_FILE silently
+    # redirects `add`/`config --local` to the real repo underneath it —
+    # toplevel and index/config resolution follow different rules under
+    # those variables. Kept as a second line of defense: if the `unset`
+    # above is ever removed or bypassed, this turns any recurrence into a
+    # loud `return 1` here instead of a silent write to the wrong
+    # repository.
+    sb_toplevel=$(git -C "$sb" rev-parse --show-toplevel 2>/dev/null)
+    real_toplevel=$(git -C "$REPO_ROOT" rev-parse --show-toplevel 2>/dev/null)
+    if [ -z "$sb_toplevel" ] || [ "$sb_toplevel" = "$real_toplevel" ]; then
+        echo "make_sandbox: sandbox toplevel ('$sb_toplevel') is not a distinct repo from '$real_toplevel'; refusing to proceed" >&2
+        return 1
+    fi
+    git -C "$sb" config --local user.email gate-selftest@example.invalid
+    git -C "$sb" config --local user.name  "gate selftest"
+    git -C "$sb" config --local commit.gpgsign false
+    echo probe > "$sb/probe.txt"
+    # Absolute path, not "probe.txt": a bare relative pathspec here is what
+    # was observed leaking into the real repo's index under real (hook-
+    # driven) invocation, even with `git -C "$sb"` — using $sb/probe.txt
+    # removes any ambiguity about which repo's pathspec resolution applies.
+    git -C "$sb" add "$sb/probe.txt" || return 1
+    added=$(git -C "$sb" diff --cached --name-only)
+    if [ "$added" != "probe.txt" ]; then
+        echo "make_sandbox: expected only probe.txt staged in sandbox, got: $added" >&2
+        return 1
+    fi
     printf '%s' "$sb"
 }
 
 run_gate() { # $1 = sandbox; sets GATE_OUT / GATE_STATUS
-    GATE_OUT=$(cd "$1" && PATH="$1/bin:$PATH" MOJITO_GATE_FAST=0 ./precommit/gate.sh 2>&1)
+    sb=$1
+    if [ -z "$sb" ] || [ ! -d "$sb" ]; then
+        GATE_OUT="run_gate: empty or missing sandbox path ('$sb')"
+        GATE_STATUS=2
+        return
+    fi
+    GATE_OUT=$(cd "$sb" && PATH="$sb/bin:$PATH" MOJITO_GATE_FAST=0 ./precommit/gate.sh 2>&1)
     GATE_STATUS=$?
 }
 

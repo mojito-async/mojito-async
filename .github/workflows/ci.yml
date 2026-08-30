@@ -51,6 +51,15 @@ name: ci
 # flip this job's `continue-on-error` off too once `make` succeeds here --
 # a real regression in this lane must start blocking the moment it is
 # able to, not stay reported-only forever by inertia.
+#
+# issue #169: the macOS lane's own toolchain + build/ were never cached, so
+# every run paid the full ~4 min conda download+unpack plus a from-scratch
+# vendor build (measured locally: 6m cold vs 2m warm). Combined with no
+# job-level timeout, a stuck run (one was observed in progress on main for
+# 30+ min with no verdict, run 33325081492) had no bound at all — GitHub's
+# default is 360 minutes. Both are fixed here: actions/cache keyed on the
+# install script + Makefile/vendor sources, and an explicit timeout-minutes
+# per job so a hang fails loud instead of occupying the runner for hours.
 
 on:
   push:
@@ -70,6 +79,7 @@ jobs:
   gate-selftest:
     name: gate self-test
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - name: precommit/test-gate.sh
@@ -83,21 +93,42 @@ jobs:
   suite-macos:
     name: suite (macOS arm64, kqueue)
     runs-on: macos-14
+    # Measured cold: ~6 min (toolchain fetch + full vendor rebuild). A hang
+    # is a defect, not a slow pass, so bound it well above the warm steady
+    # state (~2 min) but well below "indistinguishable from stuck".
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+      - name: Cache Mojo toolchain
+        id: cache-toolchain
+        uses: actions/cache@v4
+        with:
+          path: ~/mojo-toolchain
+          key: mojo-toolchain-${{ runner.os }}-${{ hashFiles('.github/scripts/install-mojo.sh') }}
       - name: Install Mojo toolchain
         run: ./.github/scripts/install-mojo.sh
+      - name: Cache build/ (vendored substrate objects)
+        uses: actions/cache@v4
+        with:
+          path: build
+          key: mojito-async-build-${{ runner.os }}-${{ hashFiles('Makefile', 'mojito_async/vendor/**', 'spike/colorless_runtime/vendor/**') }}
       - name: Build the vendored substrate
         run: make
       - name: Full suite through the pre-commit gate
         env:
           GH_TOKEN: ${{ github.token }}
           MOJITO_GATE_REQUIRE_ISSUE_CHECK: "1"
+          # CI never has anything staged (a checkout, not a commit-in-
+          # progress), so the tiered hook's diff-based tier selection would
+          # already default to "full" here — set it explicitly so the
+          # workflow's intent doesn't depend on that fallback (issue #169).
+          MOJITO_GATE_TIER: full
         run: ./precommit/gate.sh
 
   suite-linux:
     name: suite (Linux x86-64, epoll) — reported, not blocking
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     continue-on-error: true
     # Every Linux step runs INSIDE a container rather than on the runner
     # image, so the lane is the same environment a developer gets from
