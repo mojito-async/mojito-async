@@ -1,0 +1,97 @@
+name: ci
+
+# Issue #141. Until this file existed there was no CI in either mojito repo
+# (`gh api .../actions/workflows` returned total_count 0), so every green
+# claim in 115 merged PRs was self-reported from the author's laptop against
+# a pre-commit gate that a stale `suite` allow-list row had disarmed.
+#
+# Three lanes:
+#   gate-selftest  the gate's own test, no toolchain, runs everywhere
+#   suite-macos    the real suite on the kqueue/arm64 host — the blocking lane
+#   suite-linux    the epoll/io_uring/x86-64 host, which has NEVER executed
+#
+# suite-linux is reported, not blocking, and we now know exactly where it
+# stops. It does not reach a single test: `make` fails at
+#
+#   mojito_async/vendor/mojito-sys/aarch64_switch.S:50:
+#     #error "aarch64_switch.S targets Apple arm64 (Mach-O) only"
+#
+# The vendored context-switch assembly is Apple/Mach-O only, so the runtime
+# cannot be BUILT on Linux at all — not on x86-64, and not on Linux/arm64
+# either. Canonical mojito-sys ships ms_context_aarch64.S AND
+# ms_context_x86_64.S and builds there cleanly (92 exported symbols,
+# verified in a container). That is mojito-sys#164 with a sharper edge than
+# the issue states: the fork does not merely shed the frozen ABI's safety
+# properties, it cannot target the platforms canonical already supports.
+#
+# So "the Linux lanes have never executed anywhere" has a cause, and it is
+# not only the absence of CI. mojito-sys#162 and #163 sit behind this too.
+# The lane's job is to keep that visible instead of pretending it is green;
+# flip `continue-on-error` off when the substrate builds.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gate-selftest:
+    name: gate self-test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: precommit/test-gate.sh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # On CI an unverifiable tracking issue is a failure, not a note:
+          # the whole point of the row check is that it cannot be skipped.
+          MOJITO_GATE_REQUIRE_ISSUE_CHECK: "1"
+        run: ./precommit/test-gate.sh
+
+  suite-macos:
+    name: suite (macOS arm64, kqueue)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Mojo toolchain
+        run: ./.github/scripts/install-mojo.sh
+      - name: Build the vendored substrate
+        run: make
+      - name: Full suite through the pre-commit gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MOJITO_GATE_REQUIRE_ISSUE_CHECK: "1"
+        run: ./precommit/gate.sh
+
+  suite-linux:
+    name: suite (Linux x86-64, epoll) — reported, not blocking
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    # Every Linux step runs INSIDE a container rather than on the runner
+    # image, so the lane is the same environment a developer gets from
+    # tests/docker/run-linux-suite.sh and nothing depends on whatever
+    # ubuntu-latest happens to ship this month.
+    container:
+      image: debian:bookworm
+    steps:
+      - name: Container prerequisites
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends \
+            build-essential ca-certificates curl git unzip zstd
+      - uses: actions/checkout@v4
+      - name: Install Mojo toolchain
+        run: ./.github/scripts/install-mojo.sh
+      - name: Build the vendored substrate
+        run: make
+      - name: A1 runtime suite
+        run: ./mojito_async/test/run.sh

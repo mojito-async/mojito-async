@@ -175,11 +175,14 @@ struct Semaphore:
             # grant marker is already stamped, this waiter already popped
             # off the FIFO.  Close the window and re-claim RUNNING — this
             # call never actually suspended.
-            park_commit(h)
+            _ = park_commit(h)
             claim_running(h)
             h.tcb()[].wait_node()[].set_next(0)
             return True
-        park_commit(h)
+        if not park_commit(h):
+            claim_running(h)
+            h.tcb()[].wait_node()[].set_next(0)
+            return True
         return False
 
     def release[R: ResultValue](mut self, mut rt: Runtime, n: Int = 1) raises -> Bool:
