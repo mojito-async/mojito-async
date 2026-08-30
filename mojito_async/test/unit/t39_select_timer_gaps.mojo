@@ -8,14 +8,14 @@
 # before writing this driver confirmed that; duplicating those scenarios
 # here would just be the same test twice.  What #91's driver never touches:
 #
-#   S1  `never()` (issue #85 deliverable): a DEADLINE branch that can never
+#   S1  `never[Int]()` (issue #85 deliverable): a DEADLINE branch that can never
 #       resolve.  Alongside a channel branch that starts BLOCKED and later
-#       receives data, the selector parks (never() contributes nothing to
+#       receives data, the selector parks (never[Int]() contributes nothing to
 #       the heap — heap_addr stays 0), a producer sends, and the select
-#       completes via the CHANNEL branch — never() never wins, the select
+#       completes via the CHANNEL branch — never[Int]() never wins, the select
 #       still completes via another branch (issue #85 exit criterion).
-#   S2  `never()` alongside an ALREADY-CLOSED channel: select_fast claims
-#       the close immediately; never() never touches select_fast's fast
+#   S2  `never[Int]()` alongside an ALREADY-CLOSED channel: select_fast claims
+#       the close immediately; never[Int]() never touches select_fast's fast
 #       path at all (heap_addr == 0 means it is never even inspected past
 #       classify_branch's BLOCKED verdict).
 #   S3  CLOSE-WHILE-TIMER-PENDING (issue #85 "close + timer semantics", NOT
@@ -87,7 +87,7 @@ def _complete(h: JoinHandle[IntResult], res: Int) raises:
 
 struct Scene(ImplicitlyCopyable, ImplicitlyDeletable):
     var chan: UnsafePointer[Channel[Int], MutAnyOrigin]
-    var branches: UnsafePointer[List[SelectBranch], MutAnyOrigin]
+    var branches: UnsafePointer[List[SelectBranch[Int]], MutAnyOrigin]
     var state: UnsafePointer[SelectState, MutAnyOrigin]
     var sel_id: Int
     var winner: UnsafePointer[Int, MutAnyOrigin]
@@ -98,7 +98,7 @@ struct Scene(ImplicitlyCopyable, ImplicitlyDeletable):
 
     def __init__(out self):
         self.chan = UnsafePointer[Channel[Int], MutAnyOrigin](unsafe_from_address=1)
-        self.branches = UnsafePointer[List[SelectBranch], MutAnyOrigin](unsafe_from_address=1)
+        self.branches = UnsafePointer[List[SelectBranch[Int]], MutAnyOrigin](unsafe_from_address=1)
         self.state = UnsafePointer[SelectState, MutAnyOrigin](unsafe_from_address=1)
         self.sel_id = 0
         self.winner = UnsafePointer[Int, MutAnyOrigin](unsafe_from_address=1)
@@ -142,17 +142,17 @@ def dispatch(mut rt: Runtime, tcb_addr: Int, tid: Int, ud: BytePtr) raises -> In
 
 
 def main() raises:
-    # ---- S1: never() + a channel that later receives data -----------------
-    # ----     select still completes via the CHANNEL, never() never wins ---
+    # ---- S1: never[Int]() + a channel that later receives data -----------------
+    # ----     select still completes via the CHANNEL, never[Int]() never wins ---
     var chan1 = make_channel[Int](2)  # empty -> RECV branch BLOCKED
-    var branches1 = List[SelectBranch]()
+    var branches1 = List[SelectBranch[Int]]()
     branches1.append(recv_branch[Int](UnsafePointer[Channel[Int], MutAnyOrigin](to=chan1)))
-    branches1.append(never())
+    branches1.append(never[Int]())
     var state1 = SelectState()
     var rt1 = create()
     var sc1 = Scene()
     sc1.chan = UnsafePointer[Channel[Int], MutAnyOrigin](to=chan1)
-    sc1.branches = UnsafePointer[List[SelectBranch], MutAnyOrigin](to=branches1)
+    sc1.branches = UnsafePointer[List[SelectBranch[Int]], MutAnyOrigin](to=branches1)
     sc1.state = UnsafePointer[SelectState, MutAnyOrigin](to=state1)
     var winner1 = Int(-1)
     var timed_out1 = Int(-1)
@@ -173,7 +173,7 @@ def main() raises:
     if served1a != 1:
         red("S1: first drive must serve exactly 1 slice (the parking attempt)")
     if h1.state() != TaskControlBlock.WAITING:
-        red("S1: selector must park (RECV empty, never() unresolvable)")
+        red("S1: selector must park (RECV empty, never[Int]() unresolvable)")
     if chan1.recv_waiters_len() != 1:
         red("S1: selector must register on the RECV branch")
     if not chan1.try_send(9):
@@ -188,20 +188,20 @@ def main() raises:
     if not h1.is_completed():
         red("S1: selector must complete via the channel branch")
     if winner1 != 0:
-        red("S1: winner must be branch 0 (RECV), never() (branch 1) must never win")
+        red("S1: winner must be branch 0 (RECV), never[Int]() (branch 1) must never win")
     if timed_out1 != 0:
-        red("S1: outcome must NOT report is_timeout() (never() cannot fire)")
+        red("S1: outcome must NOT report is_timeout() (never[Int]() cannot fire)")
     if value1 != 9:
         red("S1: wrong delivered value, got " + String(value1))
     print("S1 ok")
 
-    # ---- S2: never() + an ALREADY-CLOSED channel -- select_fast claims ----
-    # ----     the close immediately; never() is never even a candidate -----
+    # ---- S2: never[Int]() + an ALREADY-CLOSED channel -- select_fast claims ----
+    # ----     the close immediately; never[Int]() is never even a candidate -----
     var chan2 = make_channel[Int](2)
     var tx2 = chan2.sender()
     tx2.close()
-    var branches2 = List[SelectBranch]()
-    branches2.append(never())
+    var branches2 = List[SelectBranch[Int]]()
+    branches2.append(never[Int]())
     branches2.append(recv_branch[Int](UnsafePointer[Channel[Int], MutAnyOrigin](to=chan2)))
     var state2 = SelectState()
     var rt2 = create()
@@ -223,14 +223,14 @@ def main() raises:
     clock_cell3[0] = 0
     var clock3 = MonotonicClock(UnsafePointer[UInt64, MutAnyOrigin](to=clock_cell3[0]))
     var chan3 = make_channel[Int](2)  # empty -> RECV branch BLOCKED
-    var branches3 = List[SelectBranch]()
+    var branches3 = List[SelectBranch[Int]]()
     branches3.append(recv_branch[Int](UnsafePointer[Channel[Int], MutAnyOrigin](to=chan3)))
-    branches3.append(deadline_branch(hp3, clock3, Deadline(1)))  # 1ms far future
+    branches3.append(deadline_branch[Int](hp3, clock3, Deadline(1)))  # 1ms far future
     var state3 = SelectState()
     var rt3 = create()
     var sc3 = Scene()
     sc3.chan = UnsafePointer[Channel[Int], MutAnyOrigin](to=chan3)
-    sc3.branches = UnsafePointer[List[SelectBranch], MutAnyOrigin](to=branches3)
+    sc3.branches = UnsafePointer[List[SelectBranch[Int]], MutAnyOrigin](to=branches3)
     sc3.state = UnsafePointer[SelectState, MutAnyOrigin](to=state3)
     var winner3 = Int(-1)
     var timed_out3 = Int(-1)
