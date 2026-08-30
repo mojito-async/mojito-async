@@ -29,6 +29,34 @@
 # never deletes or modifies anything in the repository itself.
 set -u
 
+# Root cause of the probe.txt / commit-author leak (issue #169), found by
+# reproducing it directly: when this script runs as a descendant of a REAL
+# git hook, git has already exported GIT_DIR and GIT_INDEX_FILE (and, in a
+# linked worktree, GIT_DIR points at this worktree's own gitdir under the
+# main checkout's .git/worktrees/<name>/) into the hook's environment.
+# `git -C <dir>` changes cwd-based repo DISCOVERY only — it does not clear
+# these variables, and they win over `-C` for anything that resolves
+# against the index or config (`git add`, `git config --local`, ...) even
+# though `git -C <dir> rev-parse --show-toplevel` correctly reports <dir>
+# as a distinct worktree. That mismatch is exactly why the earlier
+# "sb_toplevel != real_toplevel" guard in make_sandbox did not catch it:
+# toplevel resolution and index/config resolution follow different rules
+# under these variables (the earlier "cd \"\" is a silent no-op on this
+# host's sh" hypothesis was plausible but not the actual mechanism —
+# `git -C` was used throughout even in the version that leaked, so a lost
+# `cd` was never the culprit). Verified live: with GIT_DIR/GIT_INDEX_FILE
+# set to this repo's real values, `git -C "$sb" add "$sb/probe.txt"`
+# staged probe.txt into the REAL repo's index while `git -C "$sb"
+# rev-parse --show-toplevel` still correctly printed "$sb". Unsetting
+# these once, here, before any sandbox exists, removes the ambiguity for
+# every git command this script (or anything it execs, including the
+# sandboxed precommit/gate.sh that run_gate invokes) runs from this point
+# on.
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR \
+      GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_PREFIX \
+      GIT_AUTHOR_NAME GIT_AUTHOR_EMAIL GIT_AUTHOR_DATE \
+      GIT_COMMITTER_NAME GIT_COMMITTER_EMAIL GIT_COMMITTER_DATE
+
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 REPO_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
 GATE="$SCRIPT_DIR/gate.sh"
@@ -100,14 +128,20 @@ echo open
 GH_STUB
     chmod +x "$sb/bin/gh"
     git -C "$sb" init -q . || return 1
-    # Hard safety net, not just a convenience check: verify the sandbox
-    # git considers ITSELF ($sb) really is its own repo, distinct from the
-    # real one this script lives in, before touching anything with `add` or
-    # `config`. This was added after `probe.txt` and a bogus commit author
-    # leaked into the REAL repo from this sandbox under real (non-isolated
-    # test) invocation — root cause not fully pinned down, so this check
-    # exists to turn any recurrence into a loud `return 1` here instead of
-    # a silent write to the wrong repository.
+    # Defense-in-depth, now that the actual root cause (ambient
+    # GIT_DIR/GIT_INDEX_FILE inherited from a real hook invocation — see
+    # the `unset` block at the top of this file) is fixed: verify the
+    # sandbox git considers ITSELF ($sb) really is its own repo, distinct
+    # from the real one this script lives in, before touching anything
+    # with `add` or `config`. This check alone did NOT catch the leak when
+    # it was first added, because `git -C "$sb" rev-parse --show-toplevel`
+    # still correctly reports $sb even while GIT_INDEX_FILE silently
+    # redirects `add`/`config --local` to the real repo underneath it —
+    # toplevel and index/config resolution follow different rules under
+    # those variables. Kept as a second line of defense: if the `unset`
+    # above is ever removed or bypassed, this turns any recurrence into a
+    # loud `return 1` here instead of a silent write to the wrong
+    # repository.
     sb_toplevel=$(git -C "$sb" rev-parse --show-toplevel 2>/dev/null)
     real_toplevel=$(git -C "$REPO_ROOT" rev-parse --show-toplevel 2>/dev/null)
     if [ -z "$sb_toplevel" ] || [ "$sb_toplevel" = "$real_toplevel" ]; then
