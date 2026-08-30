@@ -64,6 +64,26 @@
 # handshake is plain Int cells and issue #143's LICM hoist eats them at
 # default `-O`.
 #
+# ISSUE #175 (resolved): this paragraph said the right thing but nobody
+# acted on it — `t60_barrier_cross_worker_aot` was never added to
+# `mojito_async/test/run.sh`'s `AOT_O0_DRIVERS` list, so every run (suite
+# and manual) compiled it at Mojo's DEFAULT optimization level instead of
+# the `-O 0` this header already called for.  At default `-O` the SAME LICM
+# class this paragraph names for the driver's OWN cells also reaches
+# `sync/condvar.mojo`'s `resolve_winner`/`notify_marker` machinery:
+# `WaitNode._next`/`_reason` and `TaskControlBlock._early` are still plain,
+# non-atomic storage (issue #143 converted `_state`/`_generation`/
+# `_claim_epoch` to `Atomic[...]`, not these) that the winner protocol
+# relies on being read fresh across a `SpinLock`-guarded critical section —
+# a reliance the optimizer does not honor at default `-O`.  The observed
+# failure was a THIRD shape neither of the two above catalogues:
+# `Condvar.resolve_winner` raising "resumed with no winner marker stamped"
+# — a legitimately-stamped marker read as stale/zero, not a Deque race or a
+# latched-but-unconsulted early wake.  Confirmed empirically: 15/15 runs RED
+# at default `-O`, 30/30 PASS at `-O 0`, unmodified library code either way.
+# Fix: `t60_barrier_cross_worker_aot` added to `AOT_O0_DRIVERS` in
+# `mojito_async/test/run.sh`, exactly like t38/t47/t50/t52 already are.
+#
 # Verdict: exit 0 + "PASS"; anything else prints RED and exits 1.
 # AOT-only (pthread externs; modular/modular#6971).
 from mojito_async.integration.sys import BytePtr, IntResult
