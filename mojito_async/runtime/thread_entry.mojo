@@ -568,9 +568,17 @@ def pool_worker_loop_scheduled[
         # offset by one, matching every other multi-worker driver's
         # convention (t38's W0_ID/W1_ID = 1/2; bench/scheduler_scale_aot's
         # `w + 1`).
-        _ = fair_scheduler_loop[F, S, R](
-            w[].runtime()[], dispatcher, ud, service, budget_k, w[].id() + 1
-        )
+        # issue #144: catch-count-continue: any error that escapes the
+        # scheduler loop (e.g. an off-owner assertion or a runtime bug) is
+        # counted on the runtime's fault counter and swallowed so the worker
+        # thread remains alive — the documented production embedding contract.
+        try:
+            _ = fair_scheduler_loop[F, S, R](
+                w[].runtime()[], dispatcher, ud, service, budget_k, w[].id() + 1
+            )
+        except e:
+            w[].runtime()[].note_worker_fault()
+            continue
         var stolen = w[].try_steal_unstarted[R]()
         if stolen:
             var rec = stolen.value()
