@@ -83,14 +83,28 @@ permissions:
 # completes, and a cancelled check looks like a healthy one in the UI"
 # failure mode #179 raised, just relocated from "queued forever" to
 # "cancelled by the next merge" now that the queueing side of it isn't
-# reproducing. Scoping cancellation to pull_request events fixes that:
-# `main` pushes now queue and run one after another in their shared group
-# instead of cancelling each other, so every merge actually gets verified
-# (possibly with a short backlog under heavy merge traffic, which is an
-# honest queued state, not a silently-discarded run). PR branches keep the
-# original behavior -- an author pushing several times in quick succession
-# still only pays for the latest state, which matters most on the 10x-cost
-# macOS lane.
+# reproducing. Scoping cancellation to pull_request events fixes the part
+# that was actually observed: a `main` run that has already STARTED no
+# longer gets killed by the next merge's push, which is what every one of
+# those 18 cancellations was (each job's own "Set up job" step completes
+# in ~1s, so by the time a second push realistically lands the prior run
+# is already executing, not merely queued).
+#
+# This is not a full FIFO guarantee, and the comment above should not be
+# read as one: GitHub's default concurrency queue depth is 1 pending run
+# per group even with cancel-in-progress: false -- if a THIRD push lands
+# while a second is already pending behind a first that's still running,
+# the second gets silently replaced by the third, same as before, just one
+# push later than it used to. `queue: max` (GA since 2026-05) removes that
+# cap, but it is documented as incompatible with any run where
+# cancel-in-progress evaluates true, and this block's cancel-in-progress is
+# a per-run expression that DOES evaluate true for pull_request runs -- so
+# adding queue: max here risks breaking every PR's CI on a config this
+# entire repo's CI depends on, for a narrow edge case (two merges landing
+# within one job's runtime AND a third landing before the first finishes)
+# that is already far rarer than the failure mode this fix targets. Left
+# as a considered, deliberately deferred follow-up rather than tested live
+# on shared infrastructure.
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
