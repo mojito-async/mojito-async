@@ -201,7 +201,15 @@ struct TCB_Prefix(ImplicitlyCopyable, ImplicitlyDeletable):
     # (E4's is_pre_start consumption, issue #70) can tell "never ran" from
     # "ran, then re-queued".  The stealability test is therefore "latched
     # False", not "state==RUNNABLE".
-    var _started: Bool
+    #
+    # Issue #195 (candidate 3): `is_started`/`is_pre_start` are read cross-
+    # thread — scheduler_loop's off-owner migration assert (scheduler.mojo)
+    # and E4's steal guard both read a task's STARTED latch from a worker
+    # that may not be the one that set it, the same "one thread's write,
+    # another thread's later read" shape #143/#190 already fixed for
+    # _state/_generation/_claim_epoch/_next/_reason/_early.  UInt8 atomic
+    # acquire/release, same UnsafePointer-cast pattern.
+    var _started: UInt8  # atomic acquire/release (issue #195, matches #143/#190)
     # Owner-affinity (A2.2, issue #68 — E2 reserves the field for E5):
     # worker id stamped at FIRST RUN by the scheduler loop.  0 = not
     # started / not pinned (matches scheduler.wake_target_worker's
@@ -230,7 +238,20 @@ struct TCB_Prefix(ImplicitlyCopyable, ImplicitlyDeletable):
     # t60_barrier_cross_worker_aot), so `_early` is Atomic[DType.uint8]
     # (0/1 latch) with explicit acquire/release ordering, read/written
     # through the same UnsafePointer-cast pattern #143 established.
-    var _owner_runtime: Int
+    #
+    # Issue #195 (candidate 3): `_owner_runtime` is stamped by the owner
+    # worker at first dispatch and read by park.mojo's `_owner_rt` on EVERY
+    # cross-worker wake — a foreign thread reading a value another thread
+    # wrote, unguarded (there is no lock to acquire yet at this point: the
+    # whole point of `_owner_rt` is resolving WHICH lock to acquire).
+    # Contrast: Fiber.owner_worker() (fiber/fiber.mojo) already pairs a
+    # RELEASE fence in set_owner() with an ACQUIRE fence in owner_worker()
+    # for the identical "cross-worker producer reads a pinned worker id"
+    # scenario; TCB_Prefix had no equivalent.  Int64 atomic acquire/release
+    # via the same UnsafePointer-cast pattern #143 established (kept
+    # consistent with this struct's OTHER fields rather than switching to
+    # fiber.mojo's standalone-fence style).
+    var _owner_runtime: Int64  # atomic acquire/release (issue #195, matches #143/#190)
     var _early: UInt8  # atomic acquire/release (issue #190, matches #143)
     # H2 (PR #109) — CLAIMED-EPOCH marker: the generation of the last
     # successful wake claim (0 = no claim consumed yet).  The WAKE leg
@@ -252,9 +273,9 @@ struct TCB_Prefix(ImplicitlyCopyable, ImplicitlyDeletable):
         self._err = ""
         self._parent = 0
         self._scope = 0
-        self._started = False
+        self._started = UInt8(0)
         self._owner_worker = 0
-        self._owner_runtime = 0
+        self._owner_runtime = Int64(0)
         self._early = UInt8(0)
         self._claim_epoch = Int64(0)
     # --- construction ------------------------------------------------------
@@ -297,8 +318,11 @@ struct TCB_Prefix(ImplicitlyCopyable, ImplicitlyDeletable):
         if to == TaskControlBlock.RUNNING:
             # A2.5 (issue #71): the first body entry latches STARTED (never
             # unlatches — a re-queued started task stays observable; spec
-            # §14.1/§19.1, ADR-006).
-            self._started = True
+            # §14.1/§19.1, ADR-006).  Atomic release store (issue #195): see
+            # is_started()/is_pre_start()'s docstrings for the cross-thread
+            # readers this latch feeds.
+            Atomic[DType.uint8].store[ordering=Ordering.RELEASE](
+                UnsafePointer[UInt8, MutAnyOrigin](to=self._started), UInt8(1))
         if to == TaskControlBlock.WAITING:
             # Issue #190: read the current generation through the atomic
             # getter, not the plain field, for the same reason wake_claim
@@ -424,15 +448,25 @@ struct TCB_Prefix(ImplicitlyCopyable, ImplicitlyDeletable):
         dispatch; A2.2 issue #68)."""
         self._owner_worker = worker_id
 
-    def owner_runtime(self) -> Int:
+    def owner_runtime(mut self) -> Int:
         """Address of the owner worker's Runtime cell (0 = none; stamped
-        with owner_worker at first dispatch — A2.5 issue #71)."""
-        return self._owner_runtime
+        with owner_worker at first dispatch — A2.5 issue #71).  Issue #195
+        (candidate 3): atomic acquire load — this is read by park.mojo's
+        `_owner_rt` from a FOREIGN thread on every cross-worker wake, before
+        any lock is even resolved (there is no guard to acquire yet — the
+        whole point of this read is deciding WHICH lock's remote-ready queue
+        owns the wake), so a plain field here is exactly the "one thread's
+        write, another thread's unguarded read" shape #143/#190 already
+        fixed for _state/_generation/_claim_epoch/_next/_reason/_early."""
+        return Int(Atomic[DType.int64].load[ordering=Ordering.ACQUIRE](
+            UnsafePointer[Int64, MutAnyOrigin](to=self._owner_runtime)))
 
     def set_owner_runtime(mut self, addr: Int):
         """Stamp the owner Runtime address (scheduler loop, first dispatch;
-        A2.5 issue #71)."""
-        self._owner_runtime = addr
+        A2.5 issue #71).  Atomic release store (issue #195) — pairs with
+        owner_runtime()'s acquire load."""
+        Atomic[DType.int64].store[ordering=Ordering.RELEASE](
+            UnsafePointer[Int64, MutAnyOrigin](to=self._owner_runtime), Int64(addr))
 
     def early_readiness(mut self) -> Bool:
         """Two-phase early-wake latch (A0-T11): True once a wake was
@@ -483,17 +517,25 @@ struct TCB_Prefix(ImplicitlyCopyable, ImplicitlyDeletable):
 
     # --- STARTED latch consumption (A2.5 issue #71; E4 #70 shares) ---------
 
-    def is_started(self) -> Bool:
+    def is_started(mut self) -> Bool:
         """Spec §14.1 `started`, TCB form: True exactly once this task has
         entered user code (latched at the first RUNNABLE -> RUNNING).
         A started task is worker-affine and NEVER stealable (spec §19.2 /
-        ADR-006), even while its yield re-enqueue leaves it RUNNABLE."""
-        return self._started
+        ADR-006), even while its yield re-enqueue leaves it RUNNABLE.
 
-    def is_pre_start(self) -> Bool:
+        Issue #195 (candidate 3): atomic acquire load — scheduler_loop's
+        off-owner migration assert (scheduler.mojo) and E4's steal guard
+        both read this latch from a worker that may not be the one that set
+        it (_apply's atomic release store on the first RUNNABLE -> RUNNING),
+        the same cross-thread shape #143/#190 already fixed for the other
+        TCB fields."""
+        return Atomic[DType.uint8].load[ordering=Ordering.ACQUIRE](
+            UnsafePointer[UInt8, MutAnyOrigin](to=self._started)) != 0
+
+    def is_pre_start(mut self) -> Bool:
         """Spec §19.1: True while the task has NEVER entered user code —
         the exact stealability predicate (NEW/RUNNABLE + never ran)."""
-        return not self._started
+        return not self.is_started()
 
     # --- result slot -------------------------------------------------------
 
@@ -633,7 +675,7 @@ struct TaskControlBlock[T: ResultValue](ImplicitlyCopyable, ImplicitlyDeletable)
         dispatch; A2.2 issue #68)."""
         self._pre.set_owner_worker(worker_id)
 
-    def owner_runtime(self) -> Int:
+    def owner_runtime(mut self) -> Int:
         """Address of the owner worker's Runtime cell (0 = none; stamped
         with owner_worker at first dispatch — A2.5 issue #71)."""
         return self._pre.owner_runtime()
@@ -662,14 +704,14 @@ struct TaskControlBlock[T: ResultValue](ImplicitlyCopyable, ImplicitlyDeletable)
 
     # --- STARTED latch consumption (A2.5 issue #71; E4 #70 shares) ---------
 
-    def is_started(self) -> Bool:
+    def is_started(mut self) -> Bool:
         """Spec §14.1 `started`, TCB form: True exactly once this task has
         entered user code (latched at the first RUNNABLE -> RUNNING).
         A started task is worker-affine and NEVER stealable (spec §19.2 /
         ADR-006), even while its yield re-enqueue leaves it RUNNABLE."""
         return self._pre.is_started()
 
-    def is_pre_start(self) -> Bool:
+    def is_pre_start(mut self) -> Bool:
         """Spec §19.1: True while the task has NEVER entered user code —
         the exact stealability predicate (NEW/RUNNABLE + never ran)."""
         return self._pre.is_pre_start()
