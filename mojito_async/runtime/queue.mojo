@@ -234,6 +234,12 @@ struct LocalDeque:
 struct RemoteReadyQueue:
     """Per-worker remote-ready queue for wakes of STARTED fibers.
 
+    API: push(rec) — any worker; pop() — owner only, FIFO (wake order);
+    is_empty()/count() — locked queries; accepted() — records accepted
+    since construction, counted under this queue's own lock (issue #203),
+    the cross-thread-safe accounting `Runtime.enqueued()` folds in
+    (mirrors `InjectQueue`'s identical `push`/`accepted()` pair).
+
     ANY worker pushes a wake (push); the OWNER worker pops (pop, FIFO —
     wake order).  A wake delivered here is popped exactly once by the
     owner; stale non-RUNNABLE records are skipped by the scheduler loop and
@@ -247,16 +253,41 @@ struct RemoteReadyQueue:
 
     var _guard: SpinLock
     var _data: Deque[TaskRecord]
+    # issue #203: accepted (enqueued) records — counted UNDER this queue's
+    # own lock, the exact same shape InjectQueue._accepted already uses
+    # (inject_queue.mojo) for the identical problem.  push_remote is the
+    # cross-thread producer path (ANY worker may push, issue #203's own
+    # title) and Runtime.push_remote used to bump a plain `Runtime`
+    # `_enqueued` field right after this push, unguarded — a lost-update
+    # race against the owner thread's own concurrent enqueue_local.  b2:
+    # atomic RMW directly on a `Runtime` field is proven to miscompile the
+    # fiber-crossing enqueue path (verified vs t26, see runtime.mojo's own
+    # comment beside `_enqueued` and issue #69's original commit), so the
+    # fix does not put an atomic on Runtime — it counts here, under the
+    # lock `push` already holds, exactly like InjectQueue's `_accepted`.
+    var _accepted: Int
 
     def __init__(out self):
         self._guard = SpinLock()
         self._data = Deque[TaskRecord]()
+        self._accepted = 0
 
     def push(mut self, rec: TaskRecord):
-        """Producer-side push: any worker may deliver a wake here."""
+        """Producer-side push: any worker may deliver a wake here.  The
+        acceptance count is bumped in the SAME critical section as the
+        append (issue #203) — free here, and the only cross-thread-safe
+        place to count a cross-thread producer's write without an atomic
+        RMW on a `Runtime` field."""
         self._guard.lock()
         self._data.append(rec)
+        self._accepted += 1
         self._guard.unlock()
+
+    def accepted(self) -> Int:
+        """Records ACCEPTED since construction (counted under this queue's
+        own lock — the cross-thread-safe enqueue accounting; Runtime.enqueued
+        folds it in, mirroring InjectQueue.accepted())."""
+        return self._accepted
 
     def pop(mut self) raises -> TaskRecord:
         """Owner pop: FIFO (wake order).  Raises on an empty queue."""
