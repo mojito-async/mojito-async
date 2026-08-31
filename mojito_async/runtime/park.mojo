@@ -184,11 +184,27 @@ def _stale_or_duplicate[R: ResultValue](
     QUIET NO-OP in every task state — never a claim, never an early latch,
     never a transition, never a raise.  Only the caller-visible state under
     the OWNER's remote-ready queue guard feeds this (the guard serializes
-    it against park_commit and all other wake legs)."""
+    it against park_commit and all other wake legs).
+
+    Issue #197: reads through `h.tcb()[]` (a pointer dereference into the
+    SHARED TCB) directly on each access, never through an intermediate
+    `var t = h.tcb()[]` copy.  A by-value copy would memcpy the whole
+    TaskControlBlock — including the `String _err` field, a heap
+    allocation on this path — onto this call's stack via a plain,
+    unordered copy that nothing orders against a concurrent writer; the
+    subsequent acquire-loads inside generation()/claimed_epoch() would
+    then be reading that STACK COPY, not the shared cell, making the
+    getters' atomicity moot (the actual point of staleness was the copy
+    itself).  Reading through the pointer keeps each load an actual
+    acquire-ordered read of the live TCB and drops the allocation cost on
+    this guard-held hot path (called once inside unpark_current's
+    latch/claim section, once at its tail)."""
     if required_gen == 0:
         return False
-    var t = h.tcb()[]
-    return t.generation() != required_gen or t.claimed_epoch() == required_gen
+    return (
+        h.tcb()[].generation() != required_gen
+        or h.tcb()[].claimed_epoch() == required_gen
+    )
 
 
 def _owner_rt[R: ResultValue](
