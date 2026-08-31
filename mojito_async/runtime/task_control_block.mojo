@@ -454,14 +454,32 @@ struct TCB_Prefix(ImplicitlyCopyable, ImplicitlyDeletable):
         """H2 (PR #109): the generation of the last consumed wake claim."""
         return Int(Atomic[DType.int64].load[ordering=Ordering.ACQUIRE](
             UnsafePointer[Int64, MutAnyOrigin](to=self._claim_epoch)))
-    def is_completed(self) -> Bool:
-        return self._state == Int64(TaskControlBlock.COMPLETED)
+    def is_completed(mut self) -> Bool:
+        """Issue #197: routed through the atomic `state()` getter, not a
+        plain `_state` read — this query IS reached cross-thread
+        (time/timeout_scope.mojo's timeout_scope_driver reads an arbitrary
+        registered owner's TCB by raw address, which may belong to a
+        different worker than the one driving the expiry pass;
+        scope.mojo's has_live_unfinished/join_all/first_error/
+        _validate_exit read erased children potentially pinned to a
+        different worker than the caller), the same LICM-class gap #143/
+        #190 closed for the other TCB fields."""
+        return self.state() == TaskControlBlock.COMPLETED
 
-    def is_cancelled(self) -> Bool:
-        return self._state == Int64(TaskControlBlock.CANCELLED)
+    def is_cancelled(mut self) -> Bool:
+        """Issue #197: routed through the atomic `state()` getter (see
+        is_completed), for API symmetry and because JoinHandle.is_cancelled
+        exposes this on the same cross-thread-reachable handle is_completed
+        is read through (scope.mojo's own `Scope.is_cancelled()` is a
+        distinct method on a distinct struct, already plain-field and out
+        of scope here — see that struct's own `_cancelled` Bool)."""
+        return self.state() == TaskControlBlock.CANCELLED
 
-    def is_waiting(self) -> Bool:
-        return self._state == Int64(TaskControlBlock.WAITING)
+    def is_waiting(mut self) -> Bool:
+        """Issue #197: routed through the atomic `state()` getter (see
+        is_completed) — read cross-thread via `h.tcb()[].is_waiting()` in
+        the stress drivers' spot-checks (t12/t13/t18_scope_storm)."""
+        return self.state() == TaskControlBlock.WAITING
 
     # --- STARTED latch consumption (A2.5 issue #71; E4 #70 shares) ---------
 
@@ -656,13 +674,13 @@ struct TaskControlBlock[T: ResultValue](ImplicitlyCopyable, ImplicitlyDeletable)
         the exact stealability predicate (NEW/RUNNABLE + never ran)."""
         return self._pre.is_pre_start()
 
-    def is_completed(self) -> Bool:
+    def is_completed(mut self) -> Bool:
         return self._pre.is_completed()
 
-    def is_cancelled(self) -> Bool:
+    def is_cancelled(mut self) -> Bool:
         return self._pre.is_cancelled()
 
-    def is_waiting(self) -> Bool:
+    def is_waiting(mut self) -> Bool:
         return self._pre.is_waiting()
 
     def has_result_pending(self) -> Bool:
