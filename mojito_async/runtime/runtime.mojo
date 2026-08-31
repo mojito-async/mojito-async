@@ -547,7 +547,12 @@ struct Runtime:
         this was previously true only for the injection half; push_remote's
         contribution used to be a plain unguarded `+=` on this same
         `_enqueued` field, racing against the owner thread's own concurrent
-        writes)."""
+        writes).
+
+        This is the FULL list of accepted-record sources: local `_enqueued`
+        + `_inject.accepted()` + `_remote.accepted()`.  A future producer-
+        facing queue must be folded in here too, or its records silently
+        stop counting toward this total."""
         return self._enqueued + self._inject.accepted() + self._remote.accepted()
 
     def _bump_enqueued(mut self):

@@ -234,6 +234,12 @@ struct LocalDeque:
 struct RemoteReadyQueue:
     """Per-worker remote-ready queue for wakes of STARTED fibers.
 
+    API: push(rec) — any worker; pop() — owner only, FIFO (wake order);
+    is_empty()/count() — locked queries; accepted() — records accepted
+    since construction, counted under this queue's own lock (issue #203),
+    the cross-thread-safe accounting `Runtime.enqueued()` folds in
+    (mirrors `InjectQueue`'s identical `push`/`accepted()` pair).
+
     ANY worker pushes a wake (push); the OWNER worker pops (pop, FIFO —
     wake order).  A wake delivered here is popped exactly once by the
     owner; stale non-RUNNABLE records are skipped by the scheduler loop and
