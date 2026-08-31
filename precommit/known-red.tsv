@@ -19,3 +19,4 @@
 # post-PASS SIGSEGV as covered by it, and PR #139 root-caused the SIGSEGV as
 # a genuine UAF. The row is gone and the gate is per-driver now.
 t51_default_o_repeat	https://github.com/mojito-async/mojito-async/issues/195	2026-08-30
+bench_timer_scale	https://github.com/mojito-async/mojito-async/issues/201	2026-08-30
