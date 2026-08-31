@@ -13,24 +13,32 @@
 # driver resolves std/compilerrt through it, so the prefix has to be
 # rewritten after unpacking exactly as the formula does.
 #
-# CI runs every Mojo lane against Modular's max-nightly channel by default,
-# same reasoning as the mojolang-nightly Homebrew formula: mojito-sys is
-# mid-migration to Mojo-first and wants to see a nightly compiler regression
-# here before it reaches anyone building against a released toolchain. Set
-# MOJO_CHANNEL=max to run a lane against the stable channel instead.
+# CI defaults to Modular's max (stable) channel. issue #181 flipped this to
+# max-nightly by default, reasoning CI should catch a nightly Mojo
+# regression before it reaches a released toolchain — issue #200 reverted
+# that default: max-nightly's newest published build turned out to be a
+# year-stale snapshot (2025-09-03, confirmed independently by
+# mojito-sys#161's own investigation and by this default silently breaking
+# every AOT build in CI, since that snapshot's `mojo build` doesn't accept
+# `-Xlinker`). A channel that isn't actually publishing nightly builds gives
+# no benefit for the real cost of a broken toolchain. Set MOJO_CHANNEL=max-
+# nightly to opt into that channel anyway (e.g. to periodically check
+# whether Modular has resumed publishing to it) — worth revisiting, not
+# abandoning outright.
 #
 # Nightly filenames roll roughly daily (mojo-compiler-<date-stamped
-# version>-release.conda), so there is no fixed version to pin the way the
-# stable formula does — MOJO_VERSION, when unset on the nightly channel,
-# resolves to whatever repodata.json currently reports as newest. Set
-# MOJO_VERSION explicitly to pin a reproducible nightly build instead. This
-# resolution runs before the issue #169 cache check below so a cache hit is
-# still keyed on the actual version, not an empty placeholder — and it still
-# costs a network round trip on a cache hit, which is the point: a nightly
-# channel should notice a newer build exists even when yesterday's is cached.
+# version>-release.conda) when the channel is actually live, so there is no
+# fixed version to pin the way the stable channel's default is — MOJO_VERSION,
+# when unset on the nightly channel, resolves to whatever repodata.json
+# currently reports as newest. Set MOJO_VERSION explicitly to pin a
+# reproducible nightly build instead. This resolution runs before the issue
+# #169 cache check below so a cache hit is still keyed on the actual
+# version, not an empty placeholder — and it still costs a network round
+# trip on a cache hit, which is the point: a nightly channel should notice a
+# newer build exists even when yesterday's is cached.
 set -eu
 
-CHANNEL=${MOJO_CHANNEL:-max-nightly}
+CHANNEL=${MOJO_CHANNEL:-max}
 case "$CHANNEL" in
     max|max-nightly) ;;
     *) echo "install-mojo.sh: unknown MOJO_CHANNEL '$CHANNEL' (want max or max-nightly)"; exit 2 ;;
