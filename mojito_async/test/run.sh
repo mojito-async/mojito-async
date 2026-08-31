@@ -60,6 +60,27 @@ fi
 # default, and always the case in CI, which has nothing staged) runs every
 # driver, unchanged from before this scoping existed.
 if [ -n "${MOJITO_TEST_FILES:-}" ]; then
+    # mojito_async/test/diagnostic/** is standalone, ungated investigation
+    # tooling (issue #195 round 5's own repro driver is the first tenant):
+    # it is deliberately NOT a driver UNIT_TESTS/STRESS_TESTS/AOT_TESTS
+    # would ever glob, the same way t51_default_o_repeat.sh below is
+    # deliberately excluded from this whole scoping pass. A diff scoped
+    # ONLY to that directory has no driver to run here and must not trip
+    # issue #169's orphaned-test-file safety net (the "nothing to scope
+    # to" exit 2 a few lines down) — strip it out BEFORE that check.
+    scoped_test_files=""
+    OLDIFS=$IFS
+    IFS='
+'
+    for f in $MOJITO_TEST_FILES; do
+        case "$f" in
+            *mojito_async/test/diagnostic/*) ;;
+            *) scoped_test_files="$scoped_test_files$f
+" ;;
+        esac
+    done
+    IFS=$OLDIFS
+
     scope_to_files() {
         list=$1
         wanted="$2"
@@ -74,14 +95,21 @@ $base
             esac
         done
     }
-    wanted_basenames=$(printf '%s\n' "$MOJITO_TEST_FILES" | xargs -n1 basename 2>/dev/null || true)
-    UNIT_TESTS=$(scope_to_files "$UNIT_TESTS" "$wanted_basenames")
-    STRESS_TESTS=$(scope_to_files "$STRESS_TESTS" "$wanted_basenames")
-    AOT_TESTS=$(scope_to_files "$AOT_TESTS" "$wanted_basenames")
-    if [ -z "$UNIT_TESTS" ] && [ -z "$STRESS_TESTS" ] && [ -z "$AOT_TESTS" ]; then
-        echo "run.sh: MOJITO_TEST_FILES named no known driver; nothing to scope to:"
-        printf '%s\n' "$MOJITO_TEST_FILES" | sed 's/^/    | /'
-        exit 2
+    if [ -n "$scoped_test_files" ]; then
+        wanted_basenames=$(printf '%s\n' "$scoped_test_files" | xargs -n1 basename 2>/dev/null || true)
+        UNIT_TESTS=$(scope_to_files "$UNIT_TESTS" "$wanted_basenames")
+        STRESS_TESTS=$(scope_to_files "$STRESS_TESTS" "$wanted_basenames")
+        AOT_TESTS=$(scope_to_files "$AOT_TESTS" "$wanted_basenames")
+        if [ -z "$UNIT_TESTS" ] && [ -z "$STRESS_TESTS" ] && [ -z "$AOT_TESTS" ]; then
+            echo "run.sh: MOJITO_TEST_FILES named no known driver; nothing to scope to:"
+            printf '%s\n' "$scoped_test_files" | sed 's/^/    | /'
+            exit 2
+        fi
+    else
+        echo "run.sh: MOJITO_TEST_FILES named only mojito_async/test/diagnostic/** paths (standalone, ungated tooling) -- nothing to run here, nothing wrong."
+        UNIT_TESTS=""
+        STRESS_TESTS=""
+        AOT_TESTS=""
     fi
 fi
 
