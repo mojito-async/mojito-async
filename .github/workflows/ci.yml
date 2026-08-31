@@ -71,9 +71,29 @@ permissions:
   contents: read
   issues: read
 
+# issue #179: cancel-in-progress used to be unconditional, which reads as
+# "a stale push shouldn't keep burning CI minutes" -- true for a PR branch,
+# whose group (refs/pull/N/merge) is unique to that PR's own churn, but
+# false for `main`. Every push to `main` shares ONE group
+# (ci-refs/heads/main), so during this sweep's multi-agent parallel-merge
+# waves each merge's own CI run was getting cancelled by the very next
+# merge's push before it ever finished: 18 of the last 19 `main` runs
+# observed while fixing this issue were `cancelled`, only 1 ran to a real
+# verdict (a failure, not even a pass). That is the exact "no lane ever
+# completes, and a cancelled check looks like a healthy one in the UI"
+# failure mode #179 raised, just relocated from "queued forever" to
+# "cancelled by the next merge" now that the queueing side of it isn't
+# reproducing. Scoping cancellation to pull_request events fixes that:
+# `main` pushes now queue and run one after another in their shared group
+# instead of cancelling each other, so every merge actually gets verified
+# (possibly with a short backlog under heavy merge traffic, which is an
+# honest queued state, not a silently-discarded run). PR branches keep the
+# original behavior -- an author pushing several times in quick succession
+# still only pays for the latest state, which matters most on the 10x-cost
+# macOS lane.
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   gate-selftest:
@@ -153,6 +173,11 @@ jobs:
   suite-linux-iouring:
     name: io_uring completion lane (Linux x86-64, issue #171) — reported, not blocking
     runs-on: ubuntu-latest
+    # issue #179: #183 gave every other job in this file a timeout-minutes
+    # but missed this one (it was added after #183 landed). Same
+    # container+install+build shape as suite-linux, plus one more test
+    # script, so it gets the same bound.
+    timeout-minutes: 15
     continue-on-error: true
     # Same container-not-runner-image rationale as suite-linux above, and
     # the same `make`-cannot-build-on-Linux-yet ceiling (mojito-sys#164;
