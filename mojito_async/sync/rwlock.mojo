@@ -64,6 +64,7 @@
 # Movable/ImplicitlyDeletable, so RWLock drops those conformances — it now
 # mirrors Mutex/Runtime/Worker, which embed the identical guard for the
 # identical reason.
+from std.atomic import Atomic, Ordering
 from std.collections import Deque
 from mojito_async.runtime.queue import SpinLock
 from mojito_async.runtime.runtime import Runtime
@@ -118,8 +119,8 @@ struct RWLock[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable]:
     """
 
     var _guard: SpinLock
-    var _readers: Int
-    var _writer_locked: Bool
+    var _readers: Int64        # atomic acquire/release (issue #195, matches #143/#190)
+    var _writer_locked: UInt8  # atomic acquire/release (issue #195, matches #143/#190)
     var _value: Self.T
     var _r_tcb: Deque[Int]
     var _r_id: Deque[Int]
@@ -128,13 +129,31 @@ struct RWLock[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable]:
 
     def __init__(out self, initial: Self.T):
         self._guard = SpinLock()
-        self._readers = 0
-        self._writer_locked = False
+        self._readers = Int64(0)
+        self._writer_locked = UInt8(0)
         self._value = initial
         self._r_tcb = Deque[Int]()
         self._r_id = Deque[Int]()
         self._w_tcb = Deque[Int]()
         self._w_id = Deque[Int]()
+
+    # --- atomic accessors (issue #195) --------------------------------------
+
+    def _load_readers(mut self) -> Int:
+        return Int(Atomic[DType.int64].load[ordering=Ordering.ACQUIRE](
+            UnsafePointer[Int64, MutAnyOrigin](to=self._readers)))
+
+    def _store_readers(mut self, v: Int):
+        Atomic[DType.int64].store[ordering=Ordering.RELEASE](
+            UnsafePointer[Int64, MutAnyOrigin](to=self._readers), Int64(v))
+
+    def _is_writer_locked_raw(mut self) -> Bool:
+        return Atomic[DType.uint8].load[ordering=Ordering.ACQUIRE](
+            UnsafePointer[UInt8, MutAnyOrigin](to=self._writer_locked)) != 0
+
+    def _set_writer_locked_raw(mut self, v: Bool):
+        Atomic[DType.uint8].store[ordering=Ordering.RELEASE](
+            UnsafePointer[UInt8, MutAnyOrigin](to=self._writer_locked), UInt8(1) if v else UInt8(0))
 
     def __moveinit__(mut self, mut existing: RWLock[Self.T]):
         """Move constructor — transfers ownership of a lock with no waiters.
@@ -168,13 +187,13 @@ struct RWLock[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable]:
 
     def is_write_locked(mut self) -> Bool:
         self._guard.lock()
-        var v = self._writer_locked
+        var v = self._is_writer_locked_raw()
         self._guard.unlock()
         return v
 
     def reader_count(mut self) -> Int:
         self._guard.lock()
-        var v = self._readers
+        var v = self._load_readers()
         self._guard.unlock()
         return v
 
@@ -202,10 +221,10 @@ struct RWLock[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable]:
         acquisition of the same class t38_mutex_cross_worker_aot caught for
         Mutex."""
         self._guard.lock()
-        if self._writer_locked or len(self._w_tcb) != 0:
+        if self._is_writer_locked_raw() or len(self._w_tcb) != 0:
             self._guard.unlock()
             return False
-        self._readers += 1
+        self._store_readers(self._load_readers() + 1)
         self._guard.unlock()
         return True
 
@@ -214,10 +233,10 @@ struct RWLock[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable]:
         writer holds nor any reader holds.  No allocation, no park;
         GUARDED check-then-set (A4 batch-review fix, see try_read)."""
         self._guard.lock()
-        if self._writer_locked or self._readers != 0:
+        if self._is_writer_locked_raw() or self._load_readers() != 0:
             self._guard.unlock()
             return False
-        self._writer_locked = True
+        self._set_writer_locked_raw(True)
         self._guard.unlock()
         return True
 
@@ -250,8 +269,8 @@ struct RWLock[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable]:
             h.tcb()[].wait_node()[].set_next(0)
             return True
         self._guard.lock()
-        if not (self._writer_locked or len(self._w_tcb) != 0):
-            self._readers += 1
+        if not (self._is_writer_locked_raw() or len(self._w_tcb) != 0):
+            self._store_readers(self._load_readers() + 1)
             self._guard.unlock()
             return True
         self._r_tcb.append(Int(h.tcb()))
@@ -295,8 +314,8 @@ struct RWLock[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable]:
             h.tcb()[].wait_node()[].set_next(0)
             return True
         self._guard.lock()
-        if not (self._writer_locked or self._readers != 0):
-            self._writer_locked = True
+        if not (self._is_writer_locked_raw() or self._load_readers() != 0):
+            self._set_writer_locked_raw(True)
             self._guard.unlock()
             return True
         self._w_tcb.append(Int(h.tcb()))
@@ -336,8 +355,8 @@ struct RWLock[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable]:
         nobody waiting).  The decrement + FIFO pop is ONE guarded critical
         section (A4 batch-review fix, mirrors Mutex.unlock)."""
         self._guard.lock()
-        self._readers -= 1
-        if self._readers > 0:
+        self._store_readers(self._load_readers() - 1)
+        if self._load_readers() > 0:
             self._guard.unlock()
             return False
         if len(self._w_tcb) == 0:
@@ -345,7 +364,7 @@ struct RWLock[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable]:
             return False
         var tcb = self._w_tcb.popleft()
         var tid = self._w_id.popleft()
-        self._writer_locked = True
+        self._set_writer_locked_raw(True)
         self._guard.unlock()
         var hw = _rw_waiter_handle[R](tcb, tid)
         hw.tcb()[].wait_node()[].set_next(Int(UnsafePointer[Self, MutAnyOrigin](to=self)))
@@ -361,11 +380,11 @@ struct RWLock[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable]:
         state flip + FIFO drain is ONE guarded critical section (A4
         batch-review fix, mirrors Mutex.unlock)."""
         self._guard.lock()
-        self._writer_locked = False
+        self._set_writer_locked_raw(False)
         if len(self._w_tcb) != 0:
             var tcb = self._w_tcb.popleft()
             var tid = self._w_id.popleft()
-            self._writer_locked = True
+            self._set_writer_locked_raw(True)
             self._guard.unlock()
             var hw = _rw_waiter_handle[R](tcb, tid)
             hw.tcb()[].wait_node()[].set_next(Int(UnsafePointer[Self, MutAnyOrigin](to=self)))
@@ -377,7 +396,7 @@ struct RWLock[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable]:
         for _ in range(n):
             kept_tcb.append(self._r_tcb.popleft())
             kept_id.append(self._r_id.popleft())
-        self._readers += n
+        self._store_readers(self._load_readers() + n)
         self._guard.unlock()
         for _ in range(n):
             var tcb = kept_tcb.popleft()

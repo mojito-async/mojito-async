@@ -41,6 +41,7 @@
 # parameterized on the caller's ResultValue R; module-level factories; the
 # slow-path waiter FIFO is a Deque of (addr,id) with no per-suspension
 # allocation on the fast path.
+from std.atomic import Atomic, Ordering
 from std.collections import Deque
 from mojito_async.runtime.queue import SpinLock
 from mojito_async.runtime.runtime import Runtime
@@ -131,17 +132,27 @@ struct Mutex[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable]:
     """
 
     var _guard: SpinLock
-    var _locked: Bool
+    var _locked: UInt8   # atomic acquire/release (issue #195, matches #143/#190)
     var _value: Self.T
     var _w_tcb: Deque[Int]
     var _w_id: Deque[Int]
 
     def __init__(out self, initial: Self.T):
         self._guard = SpinLock()
-        self._locked = False
+        self._locked = UInt8(0)
         self._value = initial
         self._w_tcb = Deque[Int]()
         self._w_id = Deque[Int]()
+
+    # --- atomic accessor (issue #195, matches TCB_Prefix._early's pattern) --
+
+    def _is_locked_raw(mut self) -> Bool:
+        return Atomic[DType.uint8].load[ordering=Ordering.ACQUIRE](
+            UnsafePointer[UInt8, MutAnyOrigin](to=self._locked)) != 0
+
+    def _set_locked_raw(mut self, v: Bool):
+        Atomic[DType.uint8].store[ordering=Ordering.RELEASE](
+            UnsafePointer[UInt8, MutAnyOrigin](to=self._locked), UInt8(1) if v else UInt8(0))
 
     def __moveinit__(mut self, mut existing: Mutex[Self.T]):
         """Move constructor — transfers ownership of a lock with no waiters.
@@ -171,7 +182,7 @@ struct Mutex[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable]:
 
     def is_locked(mut self) -> Bool:
         self._guard.lock()
-        var v = self._locked
+        var v = self._is_locked_raw()
         self._guard.unlock()
         return v
 
@@ -193,10 +204,10 @@ struct Mutex[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable]:
         cross-worker stress before this fix.  No allocation, no scheduler
         lookup, no park."""
         self._guard.lock()
-        if self._locked:
+        if self._is_locked_raw():
             self._guard.unlock()
             return False
-        self._locked = True
+        self._set_locked_raw(True)
         self._guard.unlock()
         return True
 
@@ -238,8 +249,8 @@ struct Mutex[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable]:
         # missing this waiter entirely (a genuine lost wakeup distinct from
         # the PARKING-window one below).
         self._guard.lock()
-        if not self._locked:
-            self._locked = True
+        if not self._is_locked_raw():
+            self._set_locked_raw(True)
             self._guard.unlock()
             return True
         self._w_tcb.append(Int(h.tcb()))
@@ -290,7 +301,7 @@ struct Mutex[T: Movable & ImplicitlyCopyable & ImplicitlyDeletable]:
         issue #55) — see lock()'s matching section for why."""
         self._guard.lock()
         if len(self._w_tcb) == 0:
-            self._locked = False
+            self._set_locked_raw(False)
             self._guard.unlock()
             return False
         var tcb = self._w_tcb.popleft()

@@ -44,6 +44,7 @@
 # condvar.mojo's `notify_marker`/`resolve_winner` surface directly; the
 # wait FIFO is a parallel Deque[Int] of (tcb_addr, task_id), no per-
 # suspension allocation on the fast path.
+from std.atomic import Atomic, Ordering
 from std.collections import Deque
 from mojito_async.cancellation import CancellationError
 from mojito_async.runtime.queue import SpinLock
@@ -80,7 +81,10 @@ struct Barrier:
                       from two threads is memory corruption (issue #148).
                       Same SpinLock pattern as Mutex/RWLock (A4.1, #55/#122).
       _base_target — the original N this Barrier was constructed with; every
-                      FRESH phase's working target starts here.
+                      FRESH phase's working target starts here.  Write-once
+                      (set only in __init__, never reassigned after), so it
+                      carries none of the cross-thread staleness risk below
+                      and stays plain storage.
       _target      — the CURRENT phase's working target; a cancel/timeout
                       shrinks it (see module header) without disturbing the
                       "remaining arrivals needed" invariant.
@@ -90,34 +94,73 @@ struct Barrier:
                       later phase actually required a fresh N arrivals.
       _w_tcb/_w_id — FIFO of parked waiters (tcb_addr, task id) — reused
                       verbatim shape from condvar.mojo's own wait FIFO.
+
+    Issue #195 (candidate 2, matching #143/#190's own treatment of
+    TaskControlBlock._state/_generation/_claim_epoch and WaitNode._next/
+    _reason/_early): `_target`/`_count`/`_phase` are repeatedly WRITTEN by
+    whichever worker holds `_guard` at the time and READ by a DIFFERENT
+    worker's later `_guard` acquisition — the exact "one thread's guarded
+    write, a foreign thread's later guarded read" shape #143 documents as
+    unsafe for a PLAIN field at Mojo's default `-O` (the SpinLock's mutual
+    exclusion is a correct RUNTIME guarantee; it does not by itself stop the
+    optimizer from treating a plain field as invariant across the lock/
+    unlock call boundary).  All three are Int64 storage accessed exclusively
+    through Atomic[DType.int64].load/.store with explicit acquire/release
+    ordering, same UnsafePointer-cast pattern as task_control_block.mojo.
     """
     var _guard: SpinLock
     var _base_target: Int
-    var _target: Int
-    var _count: Int
-    var _phase: Int
+    var _target: Int64   # atomic acquire/release (issue #195)
+    var _count: Int64    # atomic acquire/release (issue #195)
+    var _phase: Int64    # atomic acquire/release (issue #195)
     var _w_tcb: Deque[Int]
     var _w_id: Deque[Int]
 
     def __init__(out self, target: Int):
         self._guard = SpinLock()
         self._base_target = target
-        self._target = target
-        self._count = 0
-        self._phase = 0
+        self._target = Int64(target)
+        self._count = Int64(0)
+        self._phase = Int64(0)
         self._w_tcb = Deque[Int]()
         self._w_id = Deque[Int]()
 
+    # --- atomic accessors (issue #195) ---------------------------------------
+
+    def _load_target(mut self) -> Int:
+        return Int(Atomic[DType.int64].load[ordering=Ordering.ACQUIRE](
+            UnsafePointer[Int64, MutAnyOrigin](to=self._target)))
+
+    def _store_target(mut self, v: Int):
+        Atomic[DType.int64].store[ordering=Ordering.RELEASE](
+            UnsafePointer[Int64, MutAnyOrigin](to=self._target), Int64(v))
+
+    def _load_count(mut self) -> Int:
+        return Int(Atomic[DType.int64].load[ordering=Ordering.ACQUIRE](
+            UnsafePointer[Int64, MutAnyOrigin](to=self._count)))
+
+    def _store_count(mut self, v: Int):
+        Atomic[DType.int64].store[ordering=Ordering.RELEASE](
+            UnsafePointer[Int64, MutAnyOrigin](to=self._count), Int64(v))
+
+    def _load_phase(mut self) -> Int:
+        return Int(Atomic[DType.int64].load[ordering=Ordering.ACQUIRE](
+            UnsafePointer[Int64, MutAnyOrigin](to=self._phase)))
+
+    def _store_phase(mut self, v: Int):
+        Atomic[DType.int64].store[ordering=Ordering.RELEASE](
+            UnsafePointer[Int64, MutAnyOrigin](to=self._phase), Int64(v))
+
     # --- queries -------------------------------------------------------------
 
-    def phase(self) -> Int:
+    def phase(mut self) -> Int:
         """Monotonic phase/epoch counter; bumps on every release/reset."""
-        return self._phase
+        return self._load_phase()
 
-    def target(self) -> Int:
+    def target(mut self) -> Int:
         """The CURRENT phase's working target (may be < base_target after a
         cancel/timeout this phase; restored to base_target on release)."""
-        return self._target
+        return self._load_target()
 
     def base_target(self) -> Int:
         return self._base_target
@@ -161,21 +204,40 @@ struct Barrier:
         it before park_commit decides WAITING vs. an immediate unwind."""
         if cause[] == PHASE_INIT:
             self._guard.lock()
-            self._count += 1
-            if self._count >= self._target:
+            self._store_count(self._load_count() + 1)
+            if self._load_count() >= self._load_target():
                 # Last arrival this phase: release every OTHER waiter FIFO,
                 # reset for the next phase, and complete this call directly
                 # (the Nth arriver never parks — spec Phase A5).
-                self._count = 0
-                self._target = self._base_target
-                self._phase += 1
+                self._store_count(0)
+                self._store_target(self._base_target)
+                self._store_phase(self._load_phase() + 1)
                 cause[] = WINNER_READY
+                # Issue #195 (candidate 4, matching #173's precedent for
+                # cancel_waiter/timeout_waiter in this same file, and
+                # rwlock.mojo's unlock_write reader-drain): pop every waiter
+                # into TEMPORARY local deques while still holding _guard,
+                # then release the guard BEFORE calling notify_marker for
+                # each one.  notify_marker's unpark_current chains into an
+                # OS wake syscall; holding the FIFO lock across N of them (one
+                # per waiter, not just one) forced every concurrent wait()/
+                # cancel_waiter/timeout_waiter on another worker to spin for
+                # the cumulative syscall latency of the WHOLE release, widening
+                # the window a racing duplicate wake or a fresh arrival could
+                # land in — this was the one release path in the mutex/
+                # semaphore/rwlock/condvar/barrier family that still notified
+                # from inside its own guard.
                 var n = len(self._w_tcb)
+                var rel_tcb = Deque[Int]()
+                var rel_id = Deque[Int]()
                 for _ in range(n):
-                    var tcb = self._w_tcb.popleft()
-                    var tid = self._w_id.popleft()
-                    notify_marker[R](rt, tcb, tid, WINNER_READY)
+                    rel_tcb.append(self._w_tcb.popleft())
+                    rel_id.append(self._w_id.popleft())
                 self._guard.unlock()
+                for _ in range(n):
+                    var tcb = rel_tcb.popleft()
+                    var tid = rel_id.popleft()
+                    notify_marker[R](rt, tcb, tid, WINNER_READY)
                 return True
             self._w_tcb.append(Int(h.tcb()))
             self._w_id.append(h.id())
@@ -247,8 +309,8 @@ struct Barrier:
                 self._w_tcb.append(tcb)
                 self._w_id.append(tid)
         if found:
-            self._count -= 1
-            self._target -= 1
+            self._store_count(self._load_count() - 1)
+            self._store_target(self._load_target() - 1)
         self._guard.unlock()
         if found:
             notify_marker[R](rt, winner_tcb, winner_tid, WINNER_CANCELLED)
@@ -279,8 +341,8 @@ struct Barrier:
                 self._w_tcb.append(tcb)
                 self._w_id.append(tid)
         if found:
-            self._count -= 1
-            self._target -= 1
+            self._store_count(self._load_count() - 1)
+            self._store_target(self._load_target() - 1)
         self._guard.unlock()
         if found:
             notify_marker[R](rt, winner_tcb, winner_tid, WINNER_TIMEOUT)
@@ -299,6 +361,6 @@ struct Barrier:
                 + String(len(self._w_tcb))
                 + " waiter(s) still parked — cancel them first"
             )
-        self._count = 0
-        self._target = self._base_target
-        self._phase += 1
+        self._store_count(0)
+        self._store_target(self._base_target)
+        self._store_phase(self._load_phase() + 1)

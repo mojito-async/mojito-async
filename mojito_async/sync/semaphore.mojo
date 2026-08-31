@@ -30,6 +30,7 @@
 # Mojo 1.0.0b2 (def-only): `def` only; generic methods parameterized over the
 # caller's ResultValue R; module-level factories; slow-path FIFO is a Deque
 # of parallel addr/id/n with no fast-path allocation.
+from std.atomic import Atomic, Ordering
 from std.collections import Deque
 from mojito_async.runtime.queue import SpinLock
 from mojito_async.runtime.runtime import Runtime
@@ -99,17 +100,27 @@ struct Semaphore:
     """
 
     var _guard: SpinLock
-    var _permits: Int
+    var _permits: Int64   # atomic acquire/release (issue #195, matches #143/#190)
     var _w_tcb: Deque[Int]
     var _w_id: Deque[Int]
     var _w_n: Deque[Int]
 
     def __init__(out self, permits: Int):
         self._guard = SpinLock()
-        self._permits = permits
+        self._permits = Int64(permits)
         self._w_tcb = Deque[Int]()
         self._w_id = Deque[Int]()
         self._w_n = Deque[Int]()
+
+    # --- atomic accessor (issue #195, matches TCB_Prefix._generation) -------
+
+    def _load_permits(mut self) -> Int:
+        return Int(Atomic[DType.int64].load[ordering=Ordering.ACQUIRE](
+            UnsafePointer[Int64, MutAnyOrigin](to=self._permits)))
+
+    def _store_permits(mut self, v: Int):
+        Atomic[DType.int64].store[ordering=Ordering.RELEASE](
+            UnsafePointer[Int64, MutAnyOrigin](to=self._permits), Int64(v))
 
     def __moveinit__(mut self, mut existing: Semaphore):
         """Move constructor — transfers ownership of a semaphore with no
@@ -133,7 +144,7 @@ struct Semaphore:
 
     def available(mut self) -> Int:
         self._guard.lock()
-        var v = self._permits
+        var v = self._load_permits()
         self._guard.unlock()
         return v
 
@@ -155,10 +166,10 @@ struct Semaphore:
         both observe enough permits and both decrement, over-granting.
         """
         self._guard.lock()
-        if len(self._w_tcb) != 0 or self._permits < n:
+        if len(self._w_tcb) != 0 or self._load_permits() < n:
             self._guard.unlock()
             return False
-        self._permits -= n
+        self._store_permits(self._load_permits() - n)
         self._guard.unlock()
         return True
 
@@ -185,8 +196,8 @@ struct Semaphore:
             h.tcb()[].wait_node()[].set_next(0)
             return True
         self._guard.lock()
-        if len(self._w_tcb) == 0 and self._permits >= n:
-            self._permits -= n
+        if len(self._w_tcb) == 0 and self._load_permits() >= n:
+            self._store_permits(self._load_permits() - n)
             self._guard.unlock()
             return True
         self._w_tcb.append(Int(h.tcb()))
@@ -229,14 +240,14 @@ struct Semaphore:
         permit-count update and the FIFO peek/pop are ONE guarded critical
         section (A4.1, issue #55) — see Mutex.unlock for why."""
         self._guard.lock()
-        self._permits += n
+        self._store_permits(self._load_permits() + n)
         if len(self._w_tcb) != 0:
             var need = self._w_n[0]
-            if self._permits >= need:
+            if self._load_permits() >= need:
                 var tcb = self._w_tcb.popleft()
                 var tid = self._w_id.popleft()
                 _ = self._w_n.popleft()
-                self._permits -= need
+                self._store_permits(self._load_permits() - need)
                 self._guard.unlock()
                 var hw = _perm_waiter_handle[R](tcb, tid)
                 hw.tcb()[].wait_node()[].set_next(Int(UnsafePointer[Self, MutAnyOrigin](to=self)))
