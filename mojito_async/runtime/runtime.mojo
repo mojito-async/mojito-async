@@ -124,13 +124,20 @@ struct Runtime:
     var _tasks_started: Int
     var _tasks_completed: Int
     var _enqueued: Int
-    # Cross-thread safety (A2.3): the INJECTED path counts accepted records
-    # inside InjectQueue's own lock (push already holds it — free there,
-    # and NO atomic RMW on a Runtime field: b2 miscompiles that inside the
-    # fiber-crossing enqueue path, verified vs t26).  `enqueued()` folds
-    # local `_enqueued` (A1 paths, plain +=, worker-local) + inject
-    # `accepted()`.  External producer threads therefore never touch any
-    # Runtime scalar concurrently.
+    # Cross-thread safety (A2.3, extended by issue #203): the INJECTED path
+    # counts accepted records inside InjectQueue's own lock (push already
+    # holds it — free there), and the REMOTE-wake path counts accepted
+    # records inside RemoteReadyQueue's own lock the exact same way (issue
+    # #203 fix — push_remote used to bump this `_enqueued` field directly,
+    # unguarded, from a foreign thread).  NO atomic RMW on a Runtime field:
+    # b2 miscompiles that inside the fiber-crossing enqueue path, verified
+    # vs t26.  `enqueued()` folds local `_enqueued` (A1 paths: enqueue/
+    # enqueue_local/enqueue_local_stolen, plain +=, OWNER-THREAD-ONLY — see
+    # each call site) + inject `accepted()` + remote `accepted()`.  External
+    # producer threads (push_remote's "ANY worker may push") therefore never
+    # touch any `Runtime` scalar concurrently — they only ever touch a
+    # counter owned by, and guarded by, the queue struct they're already
+    # pushing into.
     var _skipped: Int
     var _fiber_drives: Int
     var _fiber_switches: Int
@@ -305,11 +312,19 @@ struct Runtime:
         """Deliver a wake to THIS worker's remote-ready queue (STARTED-fiber
         wakes, spec §19.2/§21).  ANY worker may push; the OWNER pops.  E5
         routes owner-affine wakes here; unpark_current already uses this as
-        the post-wake enqueue target (issue #68, #39)."""
+        the post-wake enqueue target (issue #68, #39).
+
+        issue #203: this registration is counted by `_remote.push` itself,
+        under `RemoteReadyQueue`'s own lock (mirroring how `_inject.push`
+        counts an injected record under `InjectQueue`'s own lock) —
+        `push_remote` no longer touches any `Runtime` scalar.  It used to
+        (`self._enqueued += 1` right here, unguarded), which raced against
+        the owner thread's own concurrent `enqueue_local`/`enqueue` on the
+        exact same field: a classic lost-update, since a foreign thread can
+        call this at any time (the docstring above: "ANY worker may push")."""
         if self._shutdown:
             raise Error("runtime.push_remote: runtime is shut down")
         self._remote.push(TaskRecord(tcb_addr, task_id))
-        self._enqueued += 1
         # E6/M2/#112 producer-side wake budget: a REMOTE wake is the
         # classic cross-worker producer — announce the accepted unit AND
         # signal the pool event (the woken owner may be an idle-parked
@@ -524,10 +539,16 @@ struct Runtime:
         return self._tasks_completed
 
     def enqueued(self) -> Int:
-        """Total runnable registrations: local (A1 paths) + accepted into
-        the shared injection queue (counted under the queue's own lock —
-        cross-thread-safe for external producers)."""
-        return self._enqueued + self._inject.accepted()
+        """Total runnable registrations: local (A1 paths: enqueue/
+        enqueue_local/enqueue_local_stolen, OWNER-THREAD-ONLY) + accepted
+        into the shared injection queue + accepted into the remote-ready
+        queue (both of the latter counted under their own queue's lock —
+        genuinely cross-thread-safe for external producers, issue #203:
+        this was previously true only for the injection half; push_remote's
+        contribution used to be a plain unguarded `+=` on this same
+        `_enqueued` field, racing against the owner thread's own concurrent
+        writes)."""
+        return self._enqueued + self._inject.accepted() + self._remote.accepted()
 
     def _bump_enqueued(mut self):
         self._enqueued += 1
